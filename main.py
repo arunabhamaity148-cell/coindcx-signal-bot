@@ -1,93 +1,148 @@
-# main.py (UPDATED for 100/100 helpers)
+# main.py
+"""
+Main runner for coindcx-signal-bot using helpers.py
+
+Usage:
+ - put TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in Railway environment or .env (optional)
+ - set NOTIFY_ONLY env var to "True" during testing (default True in helpers)
+ - adjust MIN_SIGNAL_SCORE / MODE_THRESHOLDS etc via env or in helpers.py
+ - run with python main.py
+"""
+
 import os
 import time
 import signal
 import logging
 from typing import List
 
-# import helpers (single merged helpers.py expected)
+# optional dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+import ccxt
 from helpers import (
-    create_exchange,
     load_coins,
-    analyze_and_emit,
+    get_exchange,
+    scan_symbol,
+    emit_signal,
+    load_cooldown_map,
+    persist_cooldown_map,
 )
 
-# config
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
+# ---------------- logging ----------------
 logger = logging.getLogger("main")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(ch)
 
-EXCHANGE_ID = os.environ.get("EXCHANGE_ID", "binance")
-COINS_FILE = os.environ.get("COINS_CSV", "coins.csv")
-LOOP_INTERVAL = float(os.environ.get("LOOP_INTERVAL", "15"))   # seconds
-MAX_COINS_PER_LOOP = int(os.environ.get("MAX_COINS_PER_LOOP", "12"))
-BALANCE_FOR_RISK = float(os.environ.get("BALANCE_FOR_RISK", "100"))  # used for position sizing
-RISK_PCT = float(os.environ.get("RISK_PCT", "1.0"))  # percent per trade
+# ---------------- config (change with env) ----------------
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "binance")
+API_KEY = os.getenv("BINANCE_API_KEY", "") or None
+API_SECRET = os.getenv("BINANCE_API_SECRET", "") or None
 
-_shutdown = False
-def _signal(sig, frame):
-    global _shutdown
-    logger.info("Shutdown signal received")
-    _shutdown = True
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")
+LOOP_SLEEP_SECONDS = int(os.getenv("LOOP_SLEEP_SECONDS", 5))  # seconds between scanning batches
+MAX_EMITS_PER_LOOP = int(os.getenv("MAX_EMITS_PER_LOOP", 3))  # safety: max signals per loop
+SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", 12))  # how many coins per scanning iteration
+MODE_ORDER = os.getenv("MODE_ORDER", "quick,mid,trend").split(",")  # modes priority
 
-signal.signal(signal.SIGINT, _signal)
-signal.signal(signal.SIGTERM, _signal)
+COOLDOWN_PERSIST_PATH = os.getenv("COOLDOWN_PERSIST_PATH", "cooldown.json")
 
-def main():
-    logger.info("Starting upgraded bot main")
-    cfg = None
-    try:
-        cfg = type("C", (), {})()
-        cfg.id = EXCHANGE_ID
-        cfg.api_key = os.environ.get("EXCHANGE_API_KEY", None)
-        cfg.api_secret = os.environ.get("EXCHANGE_API_SECRET", None)
-        cfg.enable_rate_limit = True
-        cfg.options = {}
-        ex = create_exchange(cfg)
-    except Exception as e:
-        logger.exception("Exchange init failed: %s", e)
+# graceful stop flag
+STOP = False
+
+def sigint_handler(signum, frame):
+    global STOP
+    logger.info("Signal received, stopping loops...")
+    STOP = True
+
+signal.signal(signal.SIGINT, sigint_handler)
+signal.signal(signal.SIGTERM, sigint_handler)
+
+def create_exchange():
+    logger.info("Creating exchange: %s (api set: %s)", EXCHANGE_NAME, bool(API_KEY and API_SECRET))
+    ex = get_exchange(EXCHANGE_NAME, API_KEY, API_SECRET)
+    return ex
+
+def run_main_loop():
+    # load persistent cooldowns (if any)
+    load_cooldown_map(COOLDOWN_PERSIST_PATH)
+
+    exchange = create_exchange()
+    coins = load_coins("coins.csv")
+    if not coins:
+        logger.warning("No coins loaded from coins.csv. Exiting.")
         return
 
-    coins = load_coins(COINS_FILE)
+    # normalize coin list to pairs later
+    coins = [c.strip().upper() for c in coins if c.strip()]
     logger.info("Loaded %d coins", len(coins))
 
-    loop = 0
-    while not _shutdown:
-        loop += 1
-        start = time.time()
-        logger.info("Loop #%d — scanning up to %d coins", loop, MAX_COINS_PER_LOOP)
-        to_check = coins[:MAX_COINS_PER_LOOP]
-        emitted = 0
-        for sym in to_check:
-            if _shutdown:
-                break
-            try:
-                res = analyze_and_emit(
-                    ex,
-                    sym,
-                    timeframe=os.environ.get("TIMEFRAME", "1m"),
-                    limit=int(os.environ.get("OHLCV_LIMIT", "300")),
-                    pair_suffix=os.environ.get("PAIR_SUFFIX", "/USDT"),
-                    balance_for_risk=BALANCE_FOR_RISK,
-                    risk_pct=RISK_PCT,
-                    send_telegram_flag=os.environ.get("SEND_TELEGRAM", "1") == "1"
-                )
-                if res:
-                    emitted += 1
-                    logger.info("Signal: %s %s lev=%sx score=%.2f", res['symbol'], res['mode'], res['leverage'], res['score'])
-                # small pause
-                time.sleep(0.5)
-            except Exception:
-                logger.exception("Error processing %s", sym)
-        elapsed = time.time() - start
-        sleep_for = max(1.0, LOOP_INTERVAL - elapsed)
-        logger.info("Loop done: scanned=%d emitted=%d elapsed=%.2fs sleeping=%.2fs", len(to_check), emitted, elapsed, sleep_for)
-        slept = 0.0
-        while slept < sleep_for and not _shutdown:
-            time.sleep(0.5)
-            slept += 0.5
+    loop_counter = 0
+    try:
+        while not STOP:
+            loop_counter += 1
+            logger.info("Loop #%d start - will scan up to %d coins (batch)", loop_counter, SCAN_BATCH_SIZE)
 
-    logger.info("Exiting main cleanly")
+            # slice coins per loop (rotate to avoid always start)
+            start_idx = (loop_counter - 1) * SCAN_BATCH_SIZE % max(1, len(coins))
+            batch = []
+            for i in range(SCAN_BATCH_SIZE):
+                batch.append(coins[(start_idx + i) % len(coins)])
+
+            emitted = 0
+            for symbol in batch:
+                if STOP:
+                    break
+
+                # Try each mode in MODE_ORDER. If emit, break to respect MAX_EMITS_PER_LOOP
+                for mode in MODE_ORDER:
+                    # get indicator + score dict for symbol
+                    info = scan_symbol(exchange, symbol, mode=mode, timeframe=TIMEFRAME)
+                    # info contains 'score','entry','atr', etc.
+                    # Ensure we only emit up to MAX_EMITS_PER_LOOP
+                    if info.get("score", 0) <= 0:
+                        # skip if no data / bad
+                        continue
+
+                    # Attempt to emit signal for this mode
+                    success = emit_signal(exchange, symbol, mode, info, size_quote=float(os.getenv("DEFAULT_SIZE_QUOTE", 10.0)), lev=int(os.getenv("DEFAULT_LEV", 1)))
+                    if success:
+                        emitted += 1
+                        logger.info("Emitted signal for %s mode=%s (loop emitted %d)", symbol, mode, emitted)
+                        # if we emitted, break mode loop for this symbol (no multi-mode same symbol)
+                        break
+
+                    # else continue to next mode
+                # stop if emitted too many signals this loop
+                if emitted >= MAX_EMITS_PER_LOOP:
+                    logger.info("Reached MAX_EMITS_PER_LOOP=%d; pausing scanning this loop", MAX_EMITS_PER_LOOP)
+                    break
+
+            logger.info("Loop #%d done: scanned=%d emitted=%d elapsed (sleeping %ss)", loop_counter, len(batch), emitted, LOOP_SLEEP_SECONDS)
+            # persist cooldown map periodically
+            try:
+                persist_cooldown_map(COOLDOWN_PERSIST_PATH)
+            except Exception:
+                logger.exception("Failed persisting cooldown map")
+
+            # Sleep before next loop (allow small jitter)
+            for _ in range(0, LOOP_SLEEP_SECONDS):
+                if STOP:
+                    break
+                time.sleep(1)
+
+    finally:
+        logger.info("Shutting down main loop, persisting state...")
+        try:
+            persist_cooldown_map(COOLDOWN_PERSIST_PATH)
+        except Exception:
+            logger.exception("Persist failed on shutdown")
 
 if __name__ == "__main__":
-    main()
+    run_main_loop()
