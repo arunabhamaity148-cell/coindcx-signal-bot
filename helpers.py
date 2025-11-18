@@ -1,320 +1,322 @@
-# helpers.py (PART 1)
-# Required packages: ccxt, pandas, numpy, requests
-# Make sure requirements.txt has: ccxt, pandas, numpy, requests
+# helpers.py  -- PART 1 (CORE / REQUIRED)
+# This is Part 1. After you paste this and confirm "Done",
+# I'll give Part 2 which depends on these functions/constants.
 
 import os
-import json
 import time
+import math
 import logging
-from typing import List, Optional, Tuple, Dict, Any
-from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional
 
-import ccxt
 import pandas as pd
 import numpy as np
-import requests
+import ccxt
+from dotenv import load_dotenv
 
-logger = logging.getLogger("helpers")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(ch)
+# load env
+load_dotenv()
 
+# ---------------------------
+# Basic config (customize)
+# ---------------------------
+# File where cooldowns are persisted
+COOLDOWN_FILE = os.getenv("COOLDOWN_FILE", "cooldowns.json")
 
-# -------------------------
+# Telegram defaults (set in .env)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Cooldowns (seconds) for modes
+COOLDOWNS = {
+    "QUICK": int(os.getenv("CD_QUICK", 300)),   # 5 min default
+    "MID": int(os.getenv("CD_MID", 1800)),      # 30 min
+    "TREND": int(os.getenv("CD_TREND", 3600)),  # 60 min
+}
+# block same coin for N seconds after signal (extra safety)
+SAME_COIN_BLOCK = int(os.getenv("SAME_COIN_BLOCK", 1800))  # 30 min
+
+# Weights for scoring (Part2 uses)
+WEIGHTS = {
+    "ema": float(os.getenv("W_EMA", 1.0)),
+    "rsi": float(os.getenv("W_RSI", 1.0)),
+    "macd": float(os.getenv("W_MACD", 1.0)),
+    "adx": float(os.getenv("W_ADX", 1.0)),
+    "volume": float(os.getenv("W_VOLUME", 1.0)),
+    "supertrend": float(os.getenv("W_SUPERTREND", 1.0)),
+    "vwap": float(os.getenv("W_VWAP", 1.0)),
+    "volatility": float(os.getenv("W_VOL", 1.0)),
+}
+
+# Default exchange id (binance by default)
+EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance")
+
+# Coins source file
+COINS_CSV = os.getenv("COINS_CSV", "coins.csv")
+
+# Timezone/timestamp helper
+def now_ts() -> float:
+    return time.time()
+
+# ---------------------------
+# Logger setup
+# ---------------------------
+def setup_logger(name: str = "bot", level=logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        logger.setLevel(level)
+        ch = logging.StreamHandler()
+        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+    return logger
+
+log = setup_logger("coindcx-bot")
+
+# ---------------------------
 # Exchange helper
-# -------------------------
-def create_exchange(name: str = "binance", api_key: Optional[str] = None, secret: Optional[str] = None, enable_rate_limit: bool = True):
-    """Create and return a ccxt exchange object. Pass API keys via args or env."""
-    exch_class = getattr(ccxt, name)
-    params = {"enableRateLimit": enable_rate_limit}
-    api_key = api_key or os.getenv(f"{name.upper()}_API_KEY")
-    secret = secret or os.getenv(f"{name.upper()}_API_SECRET")
-    cfg = {**params}
-    if api_key and secret:
-        cfg.update({"apiKey": api_key, "secret": secret})
+# ---------------------------
+def get_exchange(api_key: Optional[str] = None, secret: Optional[str] = None, exchange_id: str = EXCHANGE_ID, sandbox: bool=False) -> ccxt.Exchange:
+    """
+    Returns a configured ccxt exchange instance (public only if keys not provided).
+    """
+    exchange_class = getattr(ccxt, exchange_id)
+    params = {}
+    if sandbox:
+        # some exchanges have sandbox URLs (not generic)
+        params["enableRateLimit"] = True
     try:
-        ex = exch_class(cfg)
-        # set timeout a bit high
-        ex.timeout = 20000
-        logger.info(f"Created exchange: {name}")
+        ex = exchange_class({
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+            "timeout": 20000,
+        })
+        # set api keys if present in env or passed
+        key = api_key or os.getenv("EXCHANGE_API_KEY")
+        sec = secret or os.getenv("EXCHANGE_API_SECRET")
+        if key and sec:
+            ex.apiKey = key
+            ex.secret = sec
         return ex
     except Exception as e:
-        logger.exception("Failed to create exchange %s: %s", name, e)
+        log.exception(f"Failed to init exchange {exchange_id}: {e}")
         raise
 
-
-# -------------------------
+# ---------------------------
 # Coins loader
-# -------------------------
-def load_coins(path: str = "coins.csv") -> List[str]:
+# ---------------------------
+def load_coins(path: str = COINS_CSV) -> List[str]:
     """
-    Load coins from a simple CSV containing one column 'symbol' or no header lines like:
-    BTC
-    ETH
-    Or with header:
-    symbol
-    BTC
+    Simple csv loader: expects first column header 'symbol' and each row symbol like BTC or ETH.
+    Returns list of symbols (without /USDT suffix).
     """
     if not os.path.exists(path):
-        logger.warning("coins file not found: %s. Returning default ['BTC','ETH','XRP']", path)
-        return ["BTC", "ETH", "XRP"]
+        log.warning(f"coins.csv not found at {path}, returning default list")
+        return ["BTC","ETH","XRP","SOL","BNB","ADA"]
     try:
-        df = pd.read_csv(path, header=0 if pd.read_csv(path, nrows=1).columns[0].lower() == "symbol" else None)
-        if df.shape[1] == 1:
-            col = df.columns[0]
-            symbols = df[col].astype(str).str.strip().tolist()
+        df = pd.read_csv(path, header=0)
+        if "symbol" in df.columns:
+            coins = df["symbol"].dropna().astype(str).str.strip().tolist()
+            # filter empties and uppercase
+            return [c.upper() for c in coins if str(c).strip()]
         else:
-            # If header present with column name 'symbol'
-            if "symbol" in df.columns:
-                symbols = df["symbol"].astype(str).str.strip().tolist()
-            else:
-                # fallback: first column
-                symbols = df.iloc[:, 0].astype(str).str.strip().tolist()
-        # remove empties and duplicates
-        symbols = [s for s in symbols if s and str(s).upper() != "SYMBOL"]
-        symbols = list(dict.fromkeys([s.upper() for s in symbols]))
-        logger.info("Loaded %d coins from %s", len(symbols), path)
-        return symbols
+            # fallback: first column
+            coins = df.iloc[:,0].dropna().astype(str).str.strip().tolist()
+            return [c.upper() for c in coins if str(c).strip()]
     except Exception as e:
-        logger.exception("Failed load_coins: %s", e)
-        return []
+        log.exception("Failed to load coins.csv")
+        return ["BTC","ETH","XRP","SOL","BNB","ADA"]
 
-
-# -------------------------
-# OHLCV fetcher
-# -------------------------
-def get_ohlcv_sample(exchange, symbol: str, timeframe: str = "1m", limit: int = 100) -> Optional[pd.DataFrame]:
+# ---------------------------
+# OHLCV fetcher (returns pandas DataFrame)
+# ---------------------------
+def get_ohlcv_sample(exchange: ccxt.Exchange, symbol: str, timeframe: str="1m", limit: int=300, pair_suffix: str="/USDT") -> pd.DataFrame:
     """
-    Fetch OHLCV and return pandas DataFrame with columns: ts, open, high, low, close, volume
-    symbol should be like 'BTC/USDT'
+    Fetch OHLCV for symbol from exchange and return DataFrame with columns:
+    ['timestamp','open','high','low','close','volume'] indexed by timestamp (ms).
+    symbol param expected like 'BTC' -> will use 'BTC/USDT' by default.
     """
+    pair = f"{symbol}{pair_suffix}"
     try:
-        raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not raw:
-            return None
-        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        # unify symbol name for ccxt if needed
+        if hasattr(exchange, "market") and hasattr(exchange, "load_markets"):
+            try:
+                # ensure markets loaded
+                exchange.load_markets()
+            except Exception:
+                pass
+
+        ohlcv = exchange.fetch_ohlcv(pair, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df = df.set_index("timestamp")
+        # ensure numeric
+        df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].apply(pd.to_numeric, errors='coerce')
         return df
-    except ccxt.BadSymbol as e:
-        logger.warning("BadSymbol for %s: %s", symbol, e)
-        return None
+    except ccxt.BaseError as e:
+        log.error(f"ccxt error fetching {pair}: {e}")
+        raise
     except Exception as e:
-        logger.exception("Error fetch_ohlcv for %s: %s", symbol, e)
-        return None
+        log.exception(f"Error fetching ohlcv {pair}: {e}")
+        raise
 
+# ---------------------------
+# Indicators (vectorized) - simple and robust
+# ---------------------------
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
-# -------------------------
-# Indicators (pandas / numpy)
-# -------------------------
-def sma(series: pd.Series, period: int) -> float:
-    return float(series.rolling(period).mean().iloc[-1])
+def sma(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(length, min_periods=1).mean()
 
-
-def ema(series: pd.Series, period: int) -> float:
-    """Exponential moving average using pandas"""
-    return float(series.ewm(span=period, adjust=False).mean().iloc[-1])
-
-
-def rsi(series: pd.Series, period: int = 14) -> float:
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    ma_up = up.rolling(period).mean()
-    ma_down = down.rolling(period).mean()
-    rs = ma_up / (ma_down + 1e-10)
-    rsi_series = 100 - (100 / (1 + rs))
-    return float(rsi_series.iloc[-1])
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-12)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float]:
+def macd(series: pd.Series, fast: int=12, slow: int=26, signal: int=9) -> Tuple[pd.Series, pd.Series, pd.Series]:
     fast_ema = series.ewm(span=fast, adjust=False).mean()
     slow_ema = series.ewm(span=slow, adjust=False).mean()
     macd_line = fast_ema - slow_ema
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     hist = macd_line - signal_line
-    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(hist.iloc[-1])
+    return macd_line, signal_line, hist
 
-
-def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=1).mean()
+    return atr
 
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_series = tr.rolling(window=period, min_periods=1).mean()
+    plus_di = 100 * (plus_dm.rolling(period).sum() / (atr_series + 1e-12))
+    minus_di = 100 * (minus_dm.rolling(period).sum() / (atr_series + 1e-12))
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12)) * 100
+    adx = dx.rolling(window=period, min_periods=1).mean()
+    return adx.fillna(0)
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
-    tr = true_range(high, low, close)
-    return float(tr.rolling(period).mean().iloc[-1])
+def vwap(df: pd.DataFrame) -> pd.Series:
+    pv = (df["high"] + df["low"] + df["close"]) / 3 * df["volume"]
+    cumsum_pv = pv.cumsum()
+    cumsum_v = df["volume"].cumsum().replace(0, np.nan)
+    return (cumsum_pv / cumsum_v).fillna(method="ffill").fillna(df["close"])
 
-
-# ADX implementation
-def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
-    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
-    tr = true_range(high, low, close)
-    atr_series = tr.rolling(period).mean()
-    plus_di = 100 * (plus_dm.rolling(period).sum() / (atr_series + 1e-10))
-    minus_di = 100 * (minus_dm.rolling(period).sum() / (atr_series + 1e-10))
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)) * 100
-    adx_series = dx.rolling(period).mean()
-    return float(adx_series.iloc[-1])
-
-
-# -------------------------
-# Cooldown manager (persisted)
-# -------------------------
-class CooldownManager:
-    def __init__(self, filepath: str = "cooldown.json"):
-        self.filepath = filepath
-        self._data = {}
-        self._load()
-
-    def _load(self):
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r") as f:
-                    self._data = json.load(f)
-            except Exception:
-                self._data = {}
-
-    def _save(self):
-        try:
-            with open(self.filepath, "w") as f:
-                json.dump(self._data, f, default=str)
-        except Exception as e:
-            logger.exception("Cooldown save failed: %s", e)
-
-    def allowed(self, symbol: str, mode: str = "ANY") -> bool:
-        """
-        Returns True if allowed to signal for this symbol.
-        mode may be QUICK/MID/TREND/ANY
-        """
-        key = symbol.upper()
-        now = datetime.utcnow().timestamp()
-        rec = self._data.get(key)
-        if not rec:
-            return True
-        # rec: {"mode": "QUICK", "until": timestamp}
-        until = rec.get("until", 0)
-        if now >= until:
-            return True
-        return False
-
-    def mark(self, symbol: str, mode: str, ttl_seconds: int = 1800):
-        key = symbol.upper()
-        until = datetime.utcnow().timestamp() + ttl_seconds
-        self._data[key] = {"mode": mode, "until": until}
-        self._save()
-        logger.debug("Cooldown marked %s until %s", key, until)
-
-    def clear(self, symbol: str):
-        key = symbol.upper()
-        if key in self._data:
-            del self._data[key]
-            self._save()
-
-
-# -------------------------
-# Coin limiter
-# -------------------------
-class CoinLimiter:
-    def __init__(self, max_coins: int = 12):
-        self.max_coins = max_coins
-        self.active = set()  # symbols currently considered 'used' in timeframe
-
-    def allow_new(self) -> bool:
-        return len(self.active) < self.max_coins
-
-    def mark_used(self, symbol: str):
-        self.active.add(symbol.upper())
-
-    def unmark(self, symbol: str):
-        self.active.discard(symbol.upper())
-
-    def reset(self):
-        self.active.clear()
-
-
-# -------------------------
-# Telegram sender (simple requests)
-# -------------------------
-def send_telegram_signal(token: str, chat_id: str, signal: Dict[str, Any]) -> bool:
+def supertrend(df: pd.DataFrame, period: int=10, multiplier: float=3.0) -> pd.Series:
     """
-    signal: dict with fields: mode, side, entry, tp, sl, leverage, reason, danger_zone (optional), accuracy (optional)
-    This function formats a message and sends to Telegram via bot API.
+    Return boolean series: True -> bullish, False -> bearish
+    Implementation: ATR-based SuperTrend (simplified).
     """
-    if not token or not chat_id:
-        logger.warning("Telegram token/chat_id not set. Skipping telegram send.")
-        return False
-    try:
-        text_lines = []
-        mode = signal.get("mode", "QUICK")
-        side = signal.get("side", "BUY")
-        symbol = signal.get("symbol", "")
-        entry = signal.get("entry")
-        tp = signal.get("tp")
-        sl = signal.get("sl")
-        lev = signal.get("leverage", "")
-        reason = signal.get("reason", "")
-        accuracy = signal.get("accuracy", None)
-        danger = signal.get("danger_zone", None)
+    hl2 = (df["high"] + df["low"]) / 2
+    atr_s = atr(df, period)
+    upperband = hl2 + (multiplier * atr_s)
+    lowerband = hl2 - (multiplier * atr_s)
 
-        header = f"🔥 {side} SIGNAL — {mode}\nSymbol: {symbol}"
-        text_lines.append(header)
-        if entry:
-            text_lines.append(f"Entry: {entry}")
-        if tp:
-            text_lines.append(f"🎯 TP: {tp}")
-        if sl:
-            text_lines.append(f"🛑 SL: {sl}")
-        if lev:
-            text_lines.append(f"⚡ Leverage: {lev}x")
-        if reason:
-            text_lines.append(f"\n📌 Reason:\n{reason}")
-        if danger:
-            # danger can be dict {'price':..., 'note':...}
-            dz = f"\n🟧 Danger Zone: price ~ {danger.get('price')} — {danger.get('note')}"
-            text_lines.append(dz)
-        if accuracy is not None:
-            text_lines.append(f"\n📊 Accuracy: {accuracy}%")
-        # join
-        text = "\n".join(text_lines)
-        # urlencode & post
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code == 200:
-            logger.info("Telegram message sent for %s", symbol)
-            return True
+    final_upper = upperband.copy()
+    final_lower = lowerband.copy()
+    st = pd.Series(index=df.index, dtype="bool")
+
+    for i in range(len(df)):
+        if i == 0:
+            final_upper.iat[i] = upperband.iat[i]
+            final_lower.iat[i] = lowerband.iat[i]
+            st.iat[i] = True
+            continue
+        # final upper
+        if (upperband.iat[i] < final_upper.iat[i-1]) or (df["close"].iat[i-1] > final_upper.iat[i-1]):
+            final_upper.iat[i] = upperband.iat[i]
         else:
-            logger.warning("Telegram send failed: %s %s", r.status_code, r.text)
-            return False
+            final_upper.iat[i] = final_upper.iat[i-1]
+        # final lower
+        if (lowerband.iat[i] > final_lower.iat[i-1]) or (df["close"].iat[i-1] < final_lower.iat[i-1]):
+            final_lower.iat[i] = lowerband.iat[i]
+        else:
+            final_lower.iat[i] = final_lower.iat[i-1]
+        # state
+        if st.iat[i-1] and (df["close"].iat[i] <= final_upper.iat[i]):
+            st.iat[i] = True
+        elif (not st.iat[i-1]) and (df["close"].iat[i] >= final_lower.iat[i]):
+            st.iat[i] = False
+        else:
+            st.iat[i] = st.iat[i-1]
+    return st
+
+def volatility_std(series: pd.Series, window: int=20) -> pd.Series:
+    returns = series.pct_change().fillna(0)
+    return returns.rolling(window=window, min_periods=1).std()
+
+# ---------------------------
+# Small utils
+# ---------------------------
+def round_tick(price: float) -> float:
+    """Return tick rounding size for a price"""
+    if price < 1:
+        return 0.0001
+    if price < 100:
+        return 0.01
+    if price < 1000:
+        return 0.1
+    return 1.0
+
+def safe_div(a: float, b: float, default: float=0.0) -> float:
+    try:
+        return a / b if b else default
+    except Exception:
+        return default
+
+# ---------------------------
+# End of Part 1
+# ---------------------------
+if __name__ == "__main__":
+    # quick sanity self-test (without keys)
+    log.info("helpers PART1 self-test start")
+    ex = get_exchange()  # public
+    coins = load_coins()
+    log.info(f"Loaded coins: {coins[:10]}")
+    # fetch a single sample (non blocking)
+    try:
+        df = get_ohlcv_sample(ex, coins[0], timeframe="1m", limit=100)
+        log.info(f"OHLCV sample rows: {len(df)}")
+        # compute simple indicators
+        log.info(f"EMA20 last: {ema(df['close'],20).iloc[-1]:.6f}")
     except Exception as e:
-        logger.exception("Telegram send error: %s", e)
-        return False
+        log.warning("Could not fetch market sample in self-test (public mode).")
+# -------------------- helpers.py — PART 2 (FINAL) --------------------
+# Append this to the end of Part1 (which must define indicators, exchange, config, log)
+
+import time
+import json
+import threading
+import requests
+from typing import List, Dict, Any, Optional, Tuple
+
+_lock = threading.Lock()
+
 # -------------------------
-# helpers.py (PART 2)
-# Append this to the end of PART 1
+# Persistence helpers for cooldown/history
 # -------------------------
-
-import math
-from collections import deque
-
-# ---------- Configurable defaults ----------
-DEFAULT_TTL_QUICK = 60 * 5        # 5 minutes quick cooldown (example)
-DEFAULT_TTL_MID = 60 * 30         # 30 minutes mid
-DEFAULT_TTL_TREND = 60 * 60 * 4   # 4 hours trend
-SAME_COIN_BLOCK_SECONDS = 60 * 30  # 30 minutes block for same coin alerts
-HISTORY_FILE = "signal_history.json"
-LAST_SIGNALS_FILE = "last_signals.json"
-
-# ---------- Persistence helpers ----------
-def _load_json_file(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
+def _load_json_safe(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
         return {}
     try:
         with open(path, "r") as f:
@@ -322,272 +324,390 @@ def _load_json_file(path: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
-def _save_json_file(path: str, obj: Dict[str, Any]):
+def _save_json_safe(path: str, data: Dict[str, Any]):
     try:
-        with open(path, "w") as f:
-            json.dump(obj, f, default=str, indent=2)
+        tmp = path + ".tmp"
+        with _lock:
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+            # atomic replace
+            try:
+                os.replace(tmp, path)
+            except Exception:
+                # fallback
+                with open(path, "w") as f2:
+                    json.dump(data, f2, indent=2, default=str)
     except Exception as e:
-        logger.exception("Save json failed %s: %s", path, e)
+        log.exception("Failed to save json %s: %s", path, e)
 
 
-# ---------- Signal utils ----------
-def tp_sl_calc(entry: float, atr_value: Optional[float] = None, pct_tp: float = 0.3, pct_sl: float = 0.2,
-               side: str = "BUY", leverage: int = 50) -> Tuple[float, float]:
+# -------------------------
+# Cooldown storage (persistent)
+# -------------------------
+def _load_cooldown_storage(path: str = COOLDOWN_FILE) -> Dict[str, Any]:
+    data = _load_json_safe(path)
+    if not data:
+        return {"last_signal": {}, "blocks": {}, "history": []}
+    # ensure keys
+    data.setdefault("last_signal", {})
+    data.setdefault("blocks", {})
+    data.setdefault("history", [])
+    return data
+
+def _save_cooldown_storage(data: Dict[str, Any], path: str = COOLDOWN_FILE):
+    _save_json_safe(path, data)
+
+def is_in_cooldown(symbol: str, mode: str) -> bool:
+    """Return True if symbol is blocked by mode cooldown or same-coin block."""
+    data = _load_cooldown_storage()
+    now = time.time()
+    last_signals = data.get("last_signal", {})
+    last_ts = float(last_signals.get(symbol, 0))
+    cd = COOLDOWNS.get(mode, COOLDOWNS.get("QUICK", 300))
+    if last_ts and (now - last_ts) < cd:
+        return True
+    blocks = data.get("blocks", {})
+    block_until = float(blocks.get(symbol, 0))
+    if block_until and now < block_until:
+        return True
+    return False
+
+def set_cooldown(symbol: str, mode: str):
+    data = _load_cooldown_storage()
+    now = time.time()
+    data.setdefault("last_signal", {})[symbol] = now
+    # set same coin block
+    data.setdefault("blocks", {})[symbol] = now + float(SAME_COIN_BLOCK)
+    # append history (short)
+    hist = data.setdefault("history", [])
+    hist.append({"symbol": symbol, "mode": mode, "ts": now})
+    # keep recent 200 entries
+    if len(hist) > 200:
+        data["history"] = hist[-200:]
+    _save_cooldown_storage(data)
+
+
+# -------------------------
+# Scoring (wrapper around indicators) — returns dict with values + score + reasons
+# -------------------------
+def compute_signal_score(df: 'pd.DataFrame') -> Dict[str, Any]:
     """
-    Calculate TP and SL.
-    - If atr_value provided, use ATR multiples (preferred for volatile coins).
-    - Otherwise use pct_tp and pct_sl percentages.
-    Returns (tp, sl)
-    """
-    if entry is None:
-        raise ValueError("entry is required")
-    if atr_value and atr_value > 0:
-        # use ATR multiples: TP = entry +/- 3*ATR, SL = entry +/- 1*ATR (example)
-        if side.upper() == "BUY":
-            tp = entry + 3 * atr_value
-            sl = max(0.0, entry - 1 * atr_value)
-        else:
-            tp = max(0.0, entry - 3 * atr_value)
-            sl = entry + 1 * atr_value
-    else:
-        if side.upper() == "BUY":
-            tp = entry * (1 + pct_tp / 100)
-            sl = entry * (1 - pct_sl / 100)
-        else:
-            tp = entry * (1 - pct_tp / 100)
-            sl = entry * (1 + pct_sl / 100)
-    # adjust for leverage -> keep absolute price TP/SL (leverage only for position sizing)
-    return round(tp, 8), round(sl, 8)
-
-
-def danger_zone_calc(df: pd.DataFrame, threshold_atr_mult: float = 2.0) -> Optional[Dict[str, Any]]:
-    """
-    Build a simple danger-zone dict using ATR amplitude: if current ATR * mult > recent price range => danger.
-    Returns: {"price": last_close, "note": "..."} or None
+    Build composite score using EMAs, RSI, MACD hist, ADX, VWAP, SuperTrend, Volume spike, Volatility.
+    Returns dict with fields: score(float), reasons(list), and indicator values for debug.
     """
     try:
-        last = df.iloc[-1]
-        atr_val = atr(df["high"], df["low"], df["close"], period=14)
-        range_ = last["high"] - last["low"]
-        if atr_val * threshold_atr_mult > range_:
-            return {"price": float(last["close"]), "note": f"High ATR ({atr_val:.4f}) vs range {range_:.4f}"}
-        return None
-    except Exception:
-        return None
-
-
-def estimate_accuracy_and_regime(df: pd.DataFrame) -> Tuple[int, str]:
-    """
-    Very simple accuracy/regime estimator:
-    - regime = 'bull' if EMA(50) > EMA(200) else 'bear'
-    - accuracy score (0-100) based on volatility + trend strength heuristics (rough)
-    """
-    try:
-        close = df["close"]
-        ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
-        ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
-        regime = "bull" if ema50 > ema200 else "bear"
-        # volatility = ATR / price
-        atr_val = atr(df["high"], df["low"], df["close"], period=14)
-        vol = atr_val / (close.iloc[-1] + 1e-10)
-        # trend_strength via MACD hist magnitude normalized
-        _, _, macdh = macd(close, 12, 26, 9)
-        macd_score = min(1.0, abs(macdh) / (abs(close.iloc[-1]) + 1e-10))
-        # combine into score
-        score = max(20, min(95, int((1 - vol) * 60 + macd_score * 40)))
-        return score, regime
-    except Exception:
-        return 50, "unknown"
-
-
-# ---------- Full evaluator ----------
-class SignalEvaluator:
-    def __init__(self, exchange, telegram_token: Optional[str] = None, telegram_chat: Optional[str] = None,
-                 cooldown: Optional[CooldownManager] = None, limiter: Optional[CoinLimiter] = None):
-        self.exchange = exchange
-        self.telegram_token = telegram_token or os.getenv("TELEGRAM_TOKEN")
-        self.telegram_chat = telegram_chat or os.getenv("TELEGRAM_CHAT_ID")
-        self.cooldown = cooldown or CooldownManager()
-        self.limiter = limiter or CoinLimiter(max_coins=12)
-        self._last_signals = _load_json_file(LAST_SIGNALS_FILE)
-        self._history = _load_json_file(HISTORY_FILE)
-
-    def _save_last_signal(self, sig: Dict[str, Any]):
-        key = f"{sig.get('symbol')}_{sig.get('mode')}"
-        self._last_signals[key] = {**sig, "ts": datetime.utcnow().isoformat()}
-        _save_json_file(LAST_SIGNALS_FILE, self._last_signals)
-
-    def _append_history(self, sig: Dict[str, Any]):
-        arr = self._history.get("signals", [])
-        arr.append({**sig, "ts": datetime.utcnow().isoformat()})
-        # keep only recent 1000
-        if len(arr) > 1000:
-            arr = arr[-1000:]
-        self._history["signals"] = arr
-        _save_json_file(HISTORY_FILE, self._history)
-
-    def _blocked_by_recent(self, symbol: str) -> bool:
-        """Block same coin within SAME_COIN_BLOCK_SECONDS"""
-        now = datetime.utcnow().timestamp()
-        key = symbol.upper()
-        rec = self._last_signals.get(key)
-        if not rec:
-            return False
-        last_ts = rec.get("timestamp") or datetime.fromisoformat(rec.get("ts")).timestamp() if rec.get("ts") else 0
-        return (now - last_ts) < SAME_COIN_BLOCK_SECONDS
-
-    def evaluate_symbol_all_modes(self, base_symbol: str, quote: str = "USDT", timeframe: str = "1m") -> Optional[Dict[str, Any]]:
-        """
-        Evaluate symbol and possibly return a full signal dict.
-        Modes: QUICK, MID, TREND
-        This is a basic rule-based example — tune thresholds to your strategy.
-        """
-        symbol_pair = f"{base_symbol}/{quote}"
-        df = get_ohlcv_sample(self.exchange, symbol_pair, timeframe=timeframe, limit=300)
-        if df is None or df.empty:
-            logger.debug("No ohlcv for %s", symbol_pair)
-            return None
+        close = df['close']
+        vol = df['volume']
 
         # basic indicators
-        close = df["close"]
-        last_close = float(close.iloc[-1])
-        ema9 = ema(close, 9)
-        ema21 = ema(close, 21)
-        rsi14 = rsi(close, 14)
-        macd_line, macd_signal, macd_hist = macd(close, 12, 26, 9)
-        atr_val = atr(df["high"], df["low"], df["close"], period=14)
-        adx_val = adx(df["high"], df["low"], df["close"], period=14)
+        ema20 = float(ema(close, 20).iloc[-1])
+        ema50 = float(ema(close, 50).iloc[-1])
+        ema200 = float(ema(close, 200).iloc[-1])
+        ema_trend = (ema20 - ema50) / (abs(ema50) + 1e-12)
 
-        # regime & accuracy
-        accuracy, regime = estimate_accuracy_and_regime(df)
+        rsi_val = float(rsi(close, 14).iloc[-1])
 
-        # quick rule (scalping): ema9 > ema21, rsi between 40-70, small adx threshold
-        if ema9 > ema21 and rsi14 > 40 and macd_hist > 0 and adx_val > 15:
-            mode = "QUICK"
-            side = "BUY"
-            entry = last_close
-            tp, sl = tp_sl_calc(entry, atr_value=atr_val, side=side)
-            danger = danger_zone_calc(df)
-            # check cooldowns and same coin block
-            if not self.cooldown.allowed(base_symbol, mode):
-                logger.info("Cooldown blocks %s for mode %s", base_symbol, mode)
-                return None
-            if self._blocked_by_recent(base_symbol):
-                logger.info("Same coin block active for %s", base_symbol)
-                return None
-            # build signal
-            sig = {
-                "mode": mode,
-                "symbol": symbol_pair,
-                "side": side,
-                "entry": round(entry, 8),
-                "tp": tp,
-                "sl": sl,
-                "leverage": 50,
-                "reason": f"EMA9({ema9:.2f})>EMA21({ema21:.2f}), RSI14={rsi14:.1f}, MACDh={macd_hist:.6f}, ADX={adx_val:.2f}",
-                "accuracy": accuracy,
-                "regime": regime,
-                "danger_zone": danger,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            # mark cooldowns & save
-            self.cooldown.mark(base_symbol, mode, ttl_seconds=DEFAULT_TTL_QUICK)
-            self._save_last_signal(sig)
-            self._append_history(sig)
-            # send telegram
-            send_telegram_signal(self.telegram_token, self.telegram_chat, sig)
-            logger.info("SIGNAL SENT for %s", symbol_pair)
-            return sig
+        macd_line, macd_signal, macd_hist = macd(close)
+        macd_h = float(macd_hist.iloc[-1])
 
-        # mid rule: trend confirmation on higher timeframe (use EMA cross + ADX strong)
-        # (demonstrative; user should extend with multi-timeframe)
-        if ema21 > ema9 and adx_val > 25 and abs(macd_hist) > 0.5:
-            mode = "MID"
-            side = "SELL" if macd_hist < 0 else "BUY"
-            entry = last_close
-            tp, sl = tp_sl_calc(entry, atr_value=atr_val, side=side)
-            danger = danger_zone_calc(df)
-            if not self.cooldown.allowed(base_symbol, mode):
-                return None
-            if self._blocked_by_recent(base_symbol):
-                return None
-            sig = {
-                "mode": mode,
-                "symbol": symbol_pair,
-                "side": side,
-                "entry": round(entry, 8),
-                "tp": tp,
-                "sl": sl,
-                "leverage": 20,
-                "reason": f"MID rule ADX {adx_val:.2f}, MACDh {macd_hist:.4f}",
-                "accuracy": max(50, accuracy - 5),
-                "regime": regime,
-                "danger_zone": danger,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            self.cooldown.mark(base_symbol, mode, ttl_seconds=DEFAULT_TTL_MID)
-            self._save_last_signal(sig)
-            self._append_history(sig)
-            send_telegram_signal(self.telegram_token, self.telegram_chat, sig)
-            logger.info("MID SIGNAL SENT for %s", symbol_pair)
-            return sig
+        adx_val = float(adx(df, 14).iloc[-1])
 
-        # trend rule: longer timeframe confirmation (user can call evaluate on higher tf)
-        # Example: require ema50 > ema200 and ADX > 30
-        # We'll compute coarse ema50/200 from close (works but prefer higher tf)
-        ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
-        ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
-        if ema50 > ema200 and adx_val > 30:
-            mode = "TREND"
-            side = "BUY"
-            entry = last_close
-            tp, sl = tp_sl_calc(entry, atr_value=atr_val, side=side, pct_tp=1.0, pct_sl=0.5)
-            danger = danger_zone_calc(df)
-            if not self.cooldown.allowed(base_symbol, mode):
-                return None
-            if self._blocked_by_recent(base_symbol):
-                return None
-            sig = {
-                "mode": mode,
-                "symbol": symbol_pair,
-                "side": side,
-                "entry": round(entry, 8),
-                "tp": tp,
-                "sl": sl,
-                "leverage": 10,
-                "reason": f"TREND rule EMA50>{ema200:.2f} ADX{adx_val:.2f}",
-                "accuracy": max(60, accuracy),
-                "regime": regime,
-                "danger_zone": danger,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            self.cooldown.mark(base_symbol, mode, ttl_seconds=DEFAULT_TTL_TREND)
-            self._save_last_signal(sig)
-            self._append_history(sig)
-            send_telegram_signal(self.telegram_token, self.telegram_chat, sig)
-            logger.info("TREND SIGNAL SENT for %s", symbol_pair)
-            return sig
+        atr_val = float(atr(df, 14).iloc[-1])
 
-        # no signal
+        vwap_val = float(vwap(df).iloc[-1])
+
+        vol_std = float(volatility_std(close, 20).iloc[-1])
+
+        st = supertrend(df, period=10, multiplier=3)
+        st_bull = bool(st.iloc[-1])
+
+        # compute score using WEIGHTS (from Part1)
+        score = 0.0
+        reasons: List[str] = []
+
+        # EMA
+        if ema_trend > 0:
+            score += min(ema_trend * 100 * WEIGHTS.get("ema", 1.0), 30)
+            reasons.append("EMA_up")
+        else:
+            score += max(ema_trend * 100 * WEIGHTS.get("ema", 1.0), -30)
+            reasons.append("EMA_down")
+
+        # RSI
+        if rsi_val < 30:
+            score += 15 * WEIGHTS.get("rsi", 1.0)
+            reasons.append("RSI_oversold")
+        elif rsi_val < 45:
+            score += 6 * WEIGHTS.get("rsi", 1.0)
+        elif rsi_val > 70:
+            score -= 12 * WEIGHTS.get("rsi", 1.0)
+            reasons.append("RSI_overbought")
+
+        # MACD
+        score += (10 if macd_h > 0 else -8) * WEIGHTS.get("macd", 1.0)
+        if macd_h > 0:
+            reasons.append("MACD_pos")
+
+        # ADX
+        if adx_val > 25:
+            score += 8 * WEIGHTS.get("adx", 1.0)
+            reasons.append("ADX_strong")
+
+        # Volume spike
+        try:
+            median_vol = vol.tail(100).median()
+            vol_spike = bool(vol.iloc[-1] > (median_vol * 1.8 if median_vol > 0 else 0))
+        except Exception:
+            vol_spike = False
+        if vol_spike:
+            score += 10 * WEIGHTS.get("volume", 1.0)
+            reasons.append("Volume_spike")
+
+        # SuperTrend
+        score += (18 if st_bull else -15) * WEIGHTS.get("supertrend", 1.0)
+        if st_bull:
+            reasons.append("Supertrend_bull")
+
+        # VWAP alignment
+        if close.iloc[-1] > vwap_val:
+            score += 3 * WEIGHTS.get("vwap", 1.0)
+        else:
+            score -= 2 * WEIGHTS.get("vwap", 1.0)
+
+        # Volatility penalty
+        if vol_std > 0.06:
+            score -= 12 * WEIGHTS.get("volatility", 1.0)
+            reasons.append("High_vol")
+
+        # clamp and normalize small negative to 0 floor for easier thresholds
+        score = max(min(score, 100.0), -100.0)
+
+        return {
+            "ema20": ema20, "ema50": ema50, "ema200": ema200,
+            "ema_trend": ema_trend, "rsi": rsi_val, "macd_hist": macd_h,
+            "adx": adx_val, "atr": atr_val, "vwap": vwap_val,
+            "volatility": vol_std, "supertrend": st_bull,
+            "vol_spike": vol_spike,
+            "score": float(score),
+            "reasons": reasons
+        }
+    except Exception:
+        log.exception("compute_signal_score error")
+        raise
+
+
+# -------------------------
+# Mode & leverage decision
+# -------------------------
+def decide_mode_and_leverage(score: float) -> Tuple[str, int]:
+    """
+    Return (mode, leverage)
+    """
+    if score >= 85:
+        return "TREND", 50
+    if score >= 70:
+        return "MID", 25
+    if score >= 45:
+        return "QUICK", 10
+    return "NO_TRADE", 1
+
+
+# -------------------------
+# TP / SL calculation
+# -------------------------
+def compute_tp_sl(df: 'pd.DataFrame', mode: str, score: float) -> Dict[str, Any]:
+    last = float(df['close'].iloc[-1])
+    atr_val = float(atr(df, 14).iloc[-1] or 0.0)
+    vol = float(volatility_std(df['close'], 20).iloc[-1] or 0.0)
+
+    if mode == "TREND":
+        tp_pct = 0.008 + (vol * 0.6) + (score / 1000.0)
+        sl_pct = 0.004 + (atr_val / (last + 1e-10))
+    elif mode == "MID":
+        tp_pct = 0.005 + (vol * 0.45) + (score / 1500.0)
+        sl_pct = 0.003 + (atr_val / (last + 1e-10))
+    elif mode == "QUICK":
+        tp_pct = 0.0025 + (vol * 0.3) + (score / 3000.0)
+        sl_pct = 0.0012 + (atr_val / (last + 1e-10))
+    else:
+        return {"entry": last, "tp": None, "sl": None, "leverage": 1, "mode": mode}
+
+    tp = last * (1 + tp_pct)
+    sl = last * (1 - sl_pct)
+
+    tick = round_tick(last)
+    tp = round(tp / tick) * tick
+    sl = round(sl / tick) * tick
+
+    _, leverage = decide_mode_and_leverage(score)
+    return {"entry": last, "tp": float(tp), "sl": float(sl), "leverage": leverage, "mode": mode}
+
+
+# -------------------------
+# Danger zone helper (ATR-based)
+# -------------------------
+def compute_danger_zone(df: 'pd.DataFrame', mult: float = 1.5) -> Optional[str]:
+    try:
+        last = float(df['close'].iloc[-1])
+        atr_val = float(atr(df, 14).iloc[-1] or 0.0)
+        low = last - mult * atr_val
+        high = last + mult * atr_val
+        return f"{round(low, 8)} — {round(high, 8)} (ATR={atr_val:.8f})"
+    except Exception:
         return None
 
 
-# ---------- Small example runner ----------
-if __name__ == "__main__":
-    # quick local test (requires API key or public market access)
-    ex = create_exchange("binance")
-    cd = CooldownManager()
-    cl = CoinLimiter(max_coins=8)
-    ev = SignalEvaluator(ex, telegram_token=None, telegram_chat=None, cooldown=cd, limiter=cl)
+# -------------------------
+# Telegram: format & send
+# -------------------------
+def format_telegram_message(payload: Dict[str, Any]) -> str:
+    symbol = payload.get("symbol")
+    entry = payload.get("entry")
+    tp = payload.get("tp")
+    sl = payload.get("sl")
+    mode = payload.get("mode")
+    leverage = payload.get("leverage")
+    score = payload.get("score")
+    reasons = payload.get("reasons", [])
+    danger = payload.get("danger_zone")
 
-    coins = load_coins("coins.csv")[:6]
-    for c in coins:
+    lines = []
+    lines.append(f"🔥 *{mode} SIGNAL* — *{symbol}/USDT*")
+    lines.append(f"*Entry:* `{entry}`")
+    lines.append(f"*TP:* `{tp}`    *SL:* `{sl}`")
+    lines.append(f"*Leverage:* `{leverage}x`")
+    lines.append(f"*Score:* `{score:.1f}`")
+    if reasons:
+        lines.append(f"*Reason:* {', '.join(reasons)}")
+    if danger:
+        lines.append(f"*Danger Zone:* `{danger}`")
+    # quick code block with TP/SL for copy
+    lines.append("\n```")
+    lines.append(f"TP:{tp}\nSL:{sl}")
+    lines.append("```")
+    return "\n".join(lines)
+
+def send_telegram_payload(payload: Dict[str, Any], token: Optional[str] = None, chat_id: Optional[str] = None) -> bool:
+    text = format_telegram_message(payload)
+    tkn = token or TELEGRAM_TOKEN
+    cid = chat_id or TELEGRAM_CHAT_ID
+    if not tkn or not cid:
+        log.warning("Telegram token/chat_id not set. Skipping send.")
+        return False
+    url = f"https://api.telegram.org/bot{tkn}/sendMessage"
+    body = {"chat_id": cid, "text": text, "parse_mode": "Markdown"}
+    try:
+        r = requests.post(url, json=body, timeout=10)
+        if r.status_code == 200:
+            log.info("Telegram sent for %s", payload.get("symbol"))
+            return True
+        else:
+            log.error("Telegram error %s %s", r.status_code, r.text)
+            return False
+    except Exception:
+        log.exception("Telegram post failed")
+        return False
+
+
+# -------------------------
+# High-level evaluate + emit
+# -------------------------
+def evaluate_symbol_and_emit(exchange: 'ccxt.Exchange', symbol: str, timeframe: str = "1m", limit: int = 300, pair_suffix: str = "/USDT", send_telegram_flag: bool = True) -> Optional[Dict[str, Any]]:
+    """
+    Evaluate one symbol: compute indicators, score, decide mode & tp/sl, check cooldowns, emit telegram, set cooldown.
+    Returns payload dict if emitted, else None.
+    """
+    try:
+        df = get_ohlcv_sample(exchange, symbol, timeframe=timeframe, limit=limit, pair_suffix=pair_suffix)
+    except Exception as e:
+        log.error("OHLCV fetch failed for %s: %s", symbol, e)
+        return None
+
+    try:
+        info = compute_signal_score(df)
+    except Exception:
+        log.exception("Scoring failed for %s", symbol)
+        return None
+
+    score = info.get("score", 0.0)
+    mode, _ = decide_mode_and_leverage(score)
+    if mode == "NO_TRADE":
+        log.debug("No trade for %s (score %.2f)", symbol, score)
+        return None
+
+    if is_in_cooldown(symbol, mode):
+        log.debug("Cooldown active %s mode %s", symbol, mode)
+        return None
+
+    tp_sl = compute_tp_sl(df, mode, score)
+    danger = compute_danger_zone(df)
+
+    payload = {
+        "symbol": symbol,
+        "entry": tp_sl["entry"],
+        "tp": tp_sl["tp"],
+        "sl": tp_sl["sl"],
+        "mode": mode,
+        "leverage": tp_sl["leverage"],
+        "score": score,
+        "reasons": info.get("reasons", []),
+        "indicators": info,
+        "danger_zone": danger,
+        "timestamp": time.time()
+    }
+
+    # send telegram (if configured)
+    telegram_ok = False
+    if send_telegram_flag:
+        telegram_ok = send_telegram_payload(payload)
+    # persist cooldown & history even on dry-run if you want — here we set only if sent
+    if telegram_ok:
+        set_cooldown(symbol, mode)
+    else:
+        # still set soft cooldown to avoid spam if not sent
+        # set shorter soft cooldown (e.g., 1/3 of mode cd)
+        soft = max(60, int(COOLDOWNS.get(mode, 300) / 3))
+        data = _load_cooldown_storage()
+        now = time.time()
+        data.setdefault("last_signal", {})[symbol] = now
+        data.setdefault("blocks", {})[symbol] = now + soft
+        _save_cooldown_storage(data)
+    payload["telegram_ok"] = telegram_ok
+    log.info("Evaluate result for %s: mode=%s score=%.2f sent=%s", symbol, mode, score, telegram_ok)
+    return payload
+
+
+def run_scan_and_emit(exchange: 'ccxt.Exchange', symbols: List[str], timeframe: str = "1m", limit: int = 300, pair_suffix: str = "/USDT", send_telegram_flag: bool = True, max_emit: int = 3) -> List[Dict[str, Any]]:
+    """
+    Scan list of symbols and emit signals (respecting cooldowns). Returns list of payloads emitted or attempted.
+    max_emit limits how many signals will be emitted in one run (safety).
+    """
+    emitted = []
+    for s in symbols:
+        if len(emitted) >= max_emit:
+            log.info("Reached max_emit=%d, stopping scan", max_emit)
+            break
         try:
-            sig = ev.evaluate_symbol_all_modes(c, quote="USDT", timeframe="1m")
-            if sig:
-                print("SIGNAL:", sig)
-            else:
-                print("No signal for", c)
-            time.sleep(1)  # avoid rate limit in quick loop
-        except Exception as e:
-            print("Error for", c, e)
+            res = evaluate_symbol_and_emit(exchange, s, timeframe=timeframe, limit=limit, pair_suffix=pair_suffix, send_telegram_flag=send_telegram_flag)
+            if res:
+                emitted.append(res)
+                # small safety sleep between emits
+                time.sleep(0.5)
+        except Exception:
+            log.exception("run_scan_and_emit error for %s", s)
+    return emitted
+
+
+# -------------------------
+# Quick self-test runner (dry-run)
+# -------------------------
+if __name__ == "__main__":
+    log.info("helpers PART2 quick dry-run test start")
+    try:
+        ex = get_exchange()
+        coins = load_coins()
+        sample = coins[:8]
+        out = run_scan_and_emit(ex, sample, send_telegram_flag=False, max_emit=5)
+        log.info("Dry-run emitted (count) %d", len(out))
+    except Exception:
+        log.exception("helpers PART2 quick test failed")
