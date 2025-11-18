@@ -1,37 +1,46 @@
+# helpers.py
+import csv
 import ccxt
-import pandas as pd
 import time
-import datetime as dt
+
+DEFAULT_EXCHANGE = 'binance'
+
+def load_coins(path='coins.csv'):
+    coins = []
+    try:
+        with open(path, newline='') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row:
+                    continue
+                symbol = row[0].strip()
+                if symbol:
+                    coins.append(symbol)
+    except FileNotFoundError:
+        # file may be missing in quick test
+        return []
+    return coins
 
 
-def fetch_ohlcv(exchange, symbol, timeframe="1m", limit=200):
-    for _ in range(5):
-        try:
-            data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
-            df["time"] = pd.to_datetime(df["time"], unit="ms")
-            return df
-        except Exception:
-            time.sleep(1)
-    return None
+def get_exchange(name=DEFAULT_EXCHANGE):
+    # create a public ccxt exchange instance
+    exchange_class = getattr(ccxt, name)
+    ex = exchange_class({'enableRateLimit': True})
+    return ex
 
 
-def ema(df, period):
-    return df["close"].ewm(span=period, adjust=False).mean()
+def get_ohlcv_sample(symbol, timeframe='1m', limit=1, exchange_name=DEFAULT_EXCHANGE):
+    ex = get_exchange(exchange_name)
+    # ensure symbol uses exchange format (e.g., BTC/USDT)
+    if '/' not in symbol and symbol.endswith('USDT'):
+        pair = symbol[:-4] + '/USDT'
+    elif '/' not in symbol:
+        pair = symbol + '/USDT'
+    else:
+        pair = symbol
 
-
-def check_signal(df):
-    df["ema20"] = ema(df, 20)
-    df["ema50"] = ema(df, 50)
-    df["ema200"] = ema(df, 200)
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    if last["ema20"] > last["ema50"] > last["ema200"] and prev["ema20"] <= prev["ema50"]:
-        return "BUY"
-
-    if last["ema20"] < last["ema50"] < last["ema200"] and prev["ema20"] >= prev["ema50"]:
-        return "SELL"
-
-    return None
+    # fetch ohlcv (public endpoint)
+    ohlcv = ex.fetch_ohlcv(pair, timeframe=timeframe, limit=limit)
+    if not ohlcv:
+        raise ValueError('No OHLCV returned')
+    return ohlcv[0]
