@@ -1,72 +1,55 @@
 import time
-import pandas as pd
-
-from helpers_part1 import (
-    load_symbols,
+import logging
+from helpers import (
     get_exchange,
+    load_symbols,
     fetch_ohlcv_safe,
-)
-
-from helpers_part2 import (
     evaluate_signal,
+    build_message
 )
 
-from helpers_part3 import (
-    send_signal,
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(message)s")
 
+# Telegram
+import requests
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
 
-MODES = {
-    "quick": 20,
-    "mid": 60,
-    "trend": 180
-}
-
-
-def run_mode(mode_name):
-
-    print(f"\n=== Running Mode: {mode_name.upper()} ===")
-
-    symbols = load_symbols()
-    ex = get_exchange()
-
-    for sym in symbols:
-
-        print(f"\n[Checking] {sym} ({mode_name})")
-
-        raw = fetch_ohlcv_safe(ex, sym, timeframe="1m", limit=200)
-
-        if raw is None:
-            print("[SKIP] No data returned")
-            continue
-
-        df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
-
-        data = evaluate_signal(df, side="BUY")
-
-        if data is None:
-            print("[NO SIGNAL]")
-            continue
-
-        if data["accuracy"] < 60:
-            print(f"[SKIP] Low Accuracy {data['accuracy']}%")
-            continue
-
-        send_signal(sym, mode_name, "BUY", data)
-
-        time.sleep(1)
-
-    print(f"=== END {mode_name.upper()} MODE ===\n")
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        data = {"chat_id": CHAT_ID, "text": msg}
+        requests.post(url, data=data)
+    except Exception as e:
+        logging.error(f"Telegram error: {e}")
 
 
 def main():
-    print("\n🚀 SIGNAL ENGINE STARTED\n")
+    logging.info("Starting coindcx-signal-bot (MINIMAL ULTRA-STABLE VERSION)")
+
+    exchange = get_exchange()
+    symbols = load_symbols()
+
+    logging.info(f"Loaded coins: {symbols}")
 
     while True:
-        for mode_name, delay in MODES.items():
-            run_mode(mode_name)
-            print(f"⏳ Sleeping {delay}s...\n")
-            time.sleep(delay)
+        for symbol in symbols:
+            logging.info(f"Checking: {symbol}")
+
+            ohlcv = fetch_ohlcv_safe(exchange, symbol)
+
+            if ohlcv:
+                signal = evaluate_signal(symbol, ohlcv)
+
+                if signal:
+                    msg = build_message(signal)
+                    send_telegram(msg)
+                    logging.info(f"SIGNAL SENT FOR {symbol}")
+
+            time.sleep(2)
+
+        logging.info("Loop finished. Sleeping 5 seconds…")
+        time.sleep(5)
 
 
 if __name__ == "__main__":
