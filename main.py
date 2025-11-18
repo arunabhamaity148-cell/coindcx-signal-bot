@@ -1,34 +1,27 @@
-# main.py
 import time
-import logging
-import ccxt
-from helpers import load_coins, get_ohlcv_sample
+from helpers import load_symbols, get_ohlcv_sample
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 def main():
-    logger.info("Starting coindcx-signal-bot (minimal)")
+    print("INFO: Bot starting (minimal version)…")
 
-    # load coins from csv (helpers handles path)
-    coins = load_coins('coins.csv')
-    logger.info(f"Loaded {len(coins)} coins, sample: {coins[:5]}")
+    symbols = load_symbols()
+    print("Loaded coins:", symbols)
 
-    # simple example: fetch 1 recent candle for first coin on gate or binance
-    if coins:
-        symbol = coins[0]
-        try:
-            candle = get_ohlcv_sample(symbol)
-            logger.info(f"Sample OHLCV for {symbol}: {candle}")
-        except Exception as e:
-            logger.exception("Error fetching sample OHLCV")
+    # sample fetch
+    for s in symbols:
+        print("\nChecking:", s)
+        candle = get_ohlcv_sample(s)
 
-    # keep process alive (if you want a long-running worker)
-    try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        logger.info("Shutting down")
+        if candle is None:
+            print("ERROR: No data for", s)
+        else:
+            print("Last Candle:", candle)
 
-if __name__ == '__main__':
+        time.sleep(1)
+
+    print("INFO: Bot loop finished.")
+
+
+if __name__ == "__main__":
     main()
