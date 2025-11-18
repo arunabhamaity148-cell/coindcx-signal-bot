@@ -1,40 +1,34 @@
-import ccxt
-import pandas as pd
+# main.py
 import time
-from helpers import fetch_ohlcv, check_signal
-import telegram
+import logging
+import ccxt
+from helpers import load_coins, get_ohlcv_sample
 
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-bot = telegram.Bot(token=BOT_TOKEN)
+def main():
+    logger.info("Starting coindcx-signal-bot (minimal)")
 
-exchange = ccxt.binance()
+    # load coins from csv (helpers handles path)
+    coins = load_coins('coins.csv')
+    logger.info(f"Loaded {len(coins)} coins, sample: {coins[:5]}")
 
-def send(msg):
-    bot.sendMessage(chat_id=CHAT_ID, text=msg)
+    # simple example: fetch 1 recent candle for first coin on gate or binance
+    if coins:
+        symbol = coins[0]
+        try:
+            candle = get_ohlcv_sample(symbol)
+            logger.info(f"Sample OHLCV for {symbol}: {candle}")
+        except Exception as e:
+            logger.exception("Error fetching sample OHLCV")
 
-def load_symbols():
-    df = pd.read_csv("coins.csv")
-    return df["symbol"].tolist()
-
-symbols = load_symbols()
-
-send("🚀 Bot Started Successfully!")
-
-while True:
+    # keep process alive (if you want a long-running worker)
     try:
-        for symbol in symbols:
-            df = fetch_ohlcv(exchange, symbol)
-            if df is None:
-                continue
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("Shutting down")
 
-            signal = check_signal(df)
-            if signal:
-                send(f"{signal} Signal detected on {symbol}")
-
-        time.sleep(10)
-
-    except Exception as e:
-        send(f"Error: {e}")
-        time.sleep(5)
+if __name__ == '__main__':
+    main()
