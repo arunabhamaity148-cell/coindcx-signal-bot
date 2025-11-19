@@ -1,165 +1,185 @@
-# main.py — BUY+SELL ready runner (paste into repo)
-from __future__ import annotations
+# main.py
+# Orchestrator for ArunBot
+# - Uses helpers.py (sync analyze_symbol_sync + async CooldownManager)
+# - Copy-paste into repo and run: python main.py
+# - Ensure helpers.py, requirements installed and .env / Railway secrets set.
+
 import os
+import sys
 import time
-import signal
+import asyncio
 import logging
-import csv
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
-# optional dotenv
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-# import helpers (expects the helpers.py you pasted earlier)
 from helpers import (
-    create_exchange_instance,
-    load_cooldown_map,
-    persist_cooldown_map,
-    scan_and_maybe_emit,
-    resolve_symbol_if_needed,
+    get_exchange,
+    analyze_symbol_sync,
+    format_signal_message,
+    send_telegram_message,
+    init_cooldown_manager,
+    cooldown_key_for,
+    preview_signal_log,
+    SCAN_BATCH_SIZE,
+    LOOP_SLEEP_SECONDS,
+    MAX_EMITS_PER_LOOP,
+    NOTIFY_ONLY,
 )
 
-# ---------------- logging ----------------
-logger = logging.getLogger("main")
-logger.setLevel(os.getenv("MAIN_LOG_LEVEL", "INFO"))
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    logger.addHandler(ch)
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+LOG = logging.getLogger("main")
 
-# ---------------- config (env / defaults) ----------------
-EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "binance")
-API_KEY = os.getenv("EXCHANGE_API_KEY", "") or None
-API_SECRET = os.getenv("EXCHANGE_API_SECRET", "") or None
+# Thread pool for blocking calls (ccxt sync fetch + telegram send)
+EXECUTOR = ThreadPoolExecutor(max_workers=6)
 
-COINS_CSV = os.getenv("COINS_CSV", "coins.csv")
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "20"))
-LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "5"))
-MAX_EMITS_PER_LOOP = int(os.getenv("MAX_EMITS_PER_LOOP", "3"))
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")
-
-MODES = os.getenv("MODES", "quick,mid,trend").split(",")  # order of priority
-SIDES = ["buy", "sell"]
-
-COOLDOWN_PERSIST_PATH = os.getenv("COOLDOWN_PERSIST_PATH", "cooldown.json")
-
-# graceful stop
-STOP = False
-def _signal_handler(sig, frame):
-    global STOP
-    STOP = True
-    logger.info("Shutdown signal received")
-
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
-
-# ---------------- load coins ----------------
+# Load coins.csv
 def load_coins(path: str = "coins.csv") -> List[str]:
-    out: List[str] = []
+    coins = []
     try:
-        with open(path, newline='') as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-            for row in reader:
-                if not row: continue
-                sym = row[0].strip()
-                if not sym: continue
-                out.append(sym.upper())
-    except FileNotFoundError:
-        logger.error("coins.csv not found at %s", path)
-    except Exception:
-        logger.exception("load_coins failed")
-    return out
-
-# ---------------- main loop ----------------
-def main():
-    global STOP
-    # load persisted cooldowns
-    try:
-        load_cooldown_map(COOLDOWN_PERSIST_PATH)
-    except Exception:
-        logger.debug("No cooldown map loaded / error ignored")
-
-    # create exchange
-    try:
-        ex = create_exchange_instance(EXCHANGE_NAME, API_KEY, API_SECRET)
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                if s.lower().startswith("symbol"):
+                    continue
+                coins.append(s)
     except Exception as e:
-        logger.exception("Failed to create exchange instance: %s", e)
-        return
+        LOG.warning("Failed to read coins.csv: %s", e)
+    return coins
 
-    coins = load_coins(COINS_CSV)
+async def send_telegram_async(msg: str, preview: bool = False) -> bool:
+    # send_telegram_message is synchronous in helpers; run in executor
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(EXECUTOR, send_telegram_message, msg, preview)
+
+async def analyze_and_maybe_emit(ex, coin: str, cd_mgr, emitted_counter: dict):
+    """
+    - Run the synchronous analyzer in threadpool
+    - Check cooldown via cd_mgr (async)
+    - If ok, set cooldown and emit (log + telegram)
+    """
+    loop = asyncio.get_running_loop()
+    sig = await loop.run_in_executor(EXECUTOR, analyze_symbol_sync, ex, coin)
+    if not sig:
+        return False
+
+    pair = sig.get("pair") or coin
+    mode = sig.get("mode", "MID")
+    key = cooldown_key_for(sig, mode)
+
+    # Check cooldown: if cooled, skip
+    is_blocked = await cd_mgr.is_cooled(key)
+    if is_blocked:
+        LOG.info("Cooldown active for %s (%s) — skipping", pair, mode)
+        return False
+
+    # Try set cooldown (atomic with Redis if available)
+    ok = await cd_mgr.set_cooldown(key, mode)
+    if not ok:
+        LOG.info("Failed to set cooldown for %s — skipping", pair)
+        return False
+
+    # Emit signal: preview in logs + Telegram
+    preview_signal_log(sig)
+    msg = format_signal_message(sig)
+    # send telegram (async wrapper)
+    await send_telegram_async(msg, preview=NOTIFY_ONLY)
+    LOG.info("EMIT -> %s | mode=%s | score=%.1f", pair, mode, sig.get("score", 0.0))
+
+    emitted_counter["count"] += 1
+    return True
+
+async def worker_loop(coins: List[str]):
     if not coins:
-        logger.error("No coins loaded. Put coin list in %s (first column symbol). Exiting.", COINS_CSV)
+        LOG.error("No coins loaded. Ensure coins.csv present.")
         return
 
-    logger.info("Loaded %d coins. Scan batch=%d sleep=%ss max_emits=%d", len(coins), SCAN_BATCH_SIZE, LOOP_SLEEP_SECONDS, MAX_EMITS_PER_LOOP)
-
-    loop_count = 0
+    LOG.info("Starting main loop (scan batch size=%s, max emits per loop=%s)", SCAN_BATCH_SIZE, MAX_EMITS_PER_LOOP)
+    ex = None
     try:
-        while not STOP:
-            loop_count += 1
-            start_idx = ((loop_count - 1) * SCAN_BATCH_SIZE) % max(1, len(coins))
-            batch = [coins[(start_idx + i) % len(coins)] for i in range(SCAN_BATCH_SIZE)]
-            emitted = 0
-            logger.info("Loop %d: scanning %d coins (start_idx=%d)", loop_count, len(batch), start_idx)
+        ex = get_exchange(api_keys=False)
+    except Exception as e:
+        LOG.warning("Exchange init failed, continuing — will attempt fetches later: %s", e)
+        ex = None
 
-            for symbol in batch:
-                if STOP:
-                    break
-                # try modes in order, and each mode try both sides
-                for mode in MODES:
-                    mode = mode.strip().lower()
-                    emitted_in_symbol = False
-                    for side in SIDES:
-                        if STOP:
-                            break
-                        try:
-                            # optional: resolve symbol for exchange if needed (not strictly required by scan function)
-                            # pair = resolve_symbol_if_needed(ex, symbol)
-                            ok = scan_and_maybe_emit(ex, symbol, mode=mode, side=side, timeframe=TIMEFRAME)
-                            if ok:
-                                emitted += 1
-                                emitted_in_symbol = True
-                                logger.info("Emitted signal for %s %s mode=%s (loop emitted=%d)", symbol, side, mode, emitted)
-                                # break sides loop once emitted for this symbol and mode
-                                break
-                        except Exception:
-                            logger.exception("Error scanning %s %s %s", symbol, mode, side)
-                    if emitted_in_symbol:
-                        # don't check further modes for this symbol to avoid spam — move to next symbol
-                        break
-                    if emitted >= MAX_EMITS_PER_LOOP:
-                        break
-                if emitted >= MAX_EMITS_PER_LOOP:
-                    logger.info("Reached MAX_EMITS_PER_LOOP=%d; pausing scanning this loop", MAX_EMITS_PER_LOOP)
-                    break
+    # init cooldown manager
+    cd_mgr = await init_cooldown_manager()
 
-            # persist cooldowns periodically
+    start_idx = 0
+    loop_idx = 0
+
+    # main loop
+    while True:
+        loop_idx += 1
+        emitted_counter = {"count": 0}
+        LOG.info("Main loop #%d — scanning batch start_idx=%d", loop_idx, start_idx)
+
+        # refresh exchange instance periodically to avoid stale connections
+        if ex is None:
             try:
-                persist_cooldown_map(COOLDOWN_PERSIST_PATH)
-            except Exception:
-                logger.exception("Failed to persist cooldown map")
+                ex = get_exchange(api_keys=False)
+            except Exception as e:
+                LOG.warning("Exchange init failed in loop: %s", e)
+                ex = None
 
-            logger.info("Loop %d done: scanned=%d emitted=%d sleeping=%ss", loop_count, len(batch), emitted, LOOP_SLEEP_SECONDS)
+        batch = coins[start_idx: start_idx + SCAN_BATCH_SIZE]
+        if not batch:
+            # wrap around
+            start_idx = 0
+            batch = coins[0:SCAN_BATCH_SIZE]
 
-            # sleep small intervals for responsive shutdown
-            slept = 0.0
-            while slept < LOOP_SLEEP_SECONDS and not STOP:
-                time.sleep(0.5)
-                slept += 0.5
+        # analyze coins in batch concurrently but limit concurrency to executor size
+        tasks = []
+        for coin in batch:
+            if emitted_counter["count"] >= MAX_EMITS_PER_LOOP:
+                LOG.info("Max emits reached this loop (%d)", MAX_EMITS_PER_LOOP)
+                break
+            # schedule analyze+emit
+            task = asyncio.create_task(analyze_and_maybe_emit(ex, coin, cd_mgr, emitted_counter))
+            tasks.append(task)
+            # small gap to avoid burst
+            await asyncio.sleep(0.05)
 
-    except Exception:
-        logger.exception("Fatal error in main loop")
+        # wait for tasks to finish or time out
+        if tasks:
+            try:
+                await asyncio.gather(*tasks)
+            except Exception as e:
+                LOG.exception("Error during gather: %s", e)
+
+        # advance start index
+        start_idx = (start_idx + SCAN_BATCH_SIZE) % max(1, len(coins))
+        LOG.info("Loop #%d complete — scanned=%d emitted=%d — sleeping %ss", loop_idx, len(batch), emitted_counter["count"], LOOP_SLEEP_SECONDS)
+        await asyncio.sleep(LOOP_SLEEP_SECONDS)
+
+async def main():
+    # load coins
+    coins = load_coins("coins.csv")
+    LOG.info("Loaded %d coins from coins.csv", len(coins))
+
+    # sanity: if few coins and we expect many, warn
+    if len(coins) < 10:
+        LOG.warning("Less than 10 coins loaded; consider adding more to coins.csv")
+
+    # run worker loop
+    try:
+        await worker_loop(coins)
+    except asyncio.CancelledError:
+        LOG.info("Main cancelled")
+    except Exception as e:
+        LOG.exception("Fatal error in main: %s", e)
     finally:
-        logger.info("Shutting down main, persisting cooldown map")
-        try:
-            persist_cooldown_map(COOLDOWN_PERSIST_PATH)
-        except Exception:
-            logger.exception("Persist on shutdown failed")
+        LOG.info("Shutting down executor")
+        EXECUTOR.shutdown(wait=False)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        LOG.info("Interrupted by user — exiting")
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
