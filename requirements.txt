@@ -1,7 +1,6 @@
-ccxt
+aiohttp
 pandas
 numpy
-redis
-requests
 python-dotenv
-aiohttp
+fastapi
+uvicorn
