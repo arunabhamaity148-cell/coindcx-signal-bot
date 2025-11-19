@@ -1,7 +1,7 @@
-# ============================================
-# helpers.py — FINAL PRO SETUP (PART 1/4)
-# Core, Exchange, Fetch, Indicators
-# ============================================
+# ============================
+# helpers.py — FINAL CLEAN v3
+# ArunBot PRO (Redis-free)
+# ============================
 
 from __future__ import annotations
 import os, time, json, math, logging, requests
@@ -9,312 +9,324 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
-
 try:
     import ccxt
 except Exception:
     ccxt = None
 
-# -----------------------------
-# ENV CONFIG
-# -----------------------------
+
+# --------------------------
+# ENV + CONFIG
+# --------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 NOTIFY_ONLY = os.getenv("NOTIFY_ONLY", "True").lower() in ("1","true","yes")
 
-EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "binance")
-QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
+EXCHANGE_NAME  = os.getenv("EXCHANGE_NAME", "binance")
+QUOTE_ASSET    = os.getenv("QUOTE_ASSET", "USDT")
 
 SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "20"))
 LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "5"))
 MAX_EMITS_PER_LOOP = int(os.getenv("MAX_EMITS_PER_LOOP", "1"))
 
+# Score thresholds
 MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "85"))
 THRESH_QUICK = float(os.getenv("THRESH_QUICK", "92"))
-THRESH_MID = float(os.getenv("THRESH_MID", "85"))
+THRESH_MID   = float(os.getenv("THRESH_MID", "85"))
 THRESH_TREND = float(os.getenv("THRESH_TREND", "72"))
 
+# Filters
 MIN_24H_VOLUME = float(os.getenv("MIN_24H_VOLUME", "250000"))
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.004"))
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.004"))   # 0.4%
 
+# Cooldowns
 COOLDOWN_JSON = os.getenv("COOLDOWN_PERSIST_PATH", "cooldown.json")
+TTL_QUICK = int(os.getenv("COOLDOWN_QUICK_S", "1800"))
+TTL_MID   = int(os.getenv("COOLDOWN_MID_S", "1800"))
+TTL_TREND = int(os.getenv("COOLDOWN_TREND_S", "3600"))
 
-# same coin cooldown (all 30 mins except trend)
-TTL_QUICK = 1800
-TTL_MID = 1800
-TTL_TREND = 3600
-
+# Indicators
 EMA_FAST = 20
 EMA_SLOW = 50
 EMA_LONG = 200
 
+
+# --------------------------
+# LOGGER
+# --------------------------
 LOG = logging.getLogger("helpers")
 if not LOG.handlers:
     h = logging.StreamHandler()
     h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     LOG.addHandler(h)
-LOG.setLevel("INFO")
+LOG.setLevel(os.getenv("HELPERS_LOG_LEVEL", "INFO"))
 
-# -----------------------------
-# LOCAL JSON COOLDOWN
-# -----------------------------
+
+# --------------------------
+# Cooldown Manager (LOCAL JSON)
+# --------------------------
 class CooldownManager:
     def __init__(self):
-        self.map = {}
-        self._load()
+        self._local_map: Dict[str, int] = {}
+        self._load_local()
+        LOG.info("CooldownManager: using local JSON fallback (%s)", COOLDOWN_JSON)
 
-    def _load(self):
+    def _load_local(self):
         try:
             with open(COOLDOWN_JSON, "r") as f:
-                self.map = {k:int(v) for k,v in json.load(f).items()}
+                data = json.load(f)
+            self._local_map = {k: int(v) for k, v in data.items()}
         except Exception:
-            self.map = {}
+            self._local_map = {}
 
-    def _save(self):
+    def _save_local(self):
         try:
-            with open(COOLDOWN_JSON + ".tmp","w") as f:
-                json.dump(self.map, f)
+            with open(COOLDOWN_JSON + ".tmp", "w") as f:
+                json.dump(self._local_map, f)
             os.replace(COOLDOWN_JSON + ".tmp", COOLDOWN_JSON)
-        except:
-            pass
+        except Exception as e:
+            LOG.warning("CooldownManager save failed: %s", e)
 
-    def ttl_for_mode(self, mode: str) -> int:
-        if mode == "QUICK": return TTL_QUICK
-        if mode == "MID": return TTL_MID
+    def _ttl_for_mode(self, mode: str) -> int:
+        m = mode.lower()
+        if m == "quick": return TTL_QUICK
+        if m == "mid":   return TTL_MID
         return TTL_TREND
 
-    def set(self, pair: str, mode: str):
-        ttl = self.ttl_for_mode(mode)
+    def set_cooldown(self, key: str, mode: str) -> bool:
+        ttl = self._ttl_for_mode(mode)
         now = int(time.time())
-        self.map[pair] = now + ttl
-        self._save()
+        expires = self._local_map.get(key, 0)
+        if expires <= now:
+            self._local_map[key] = now + ttl
+            self._save_local()
+            return True
+        return False
 
-    def cooled(self, pair: str) -> bool:
+    def is_cooled(self, key: str) -> bool:
         now = int(time.time())
-        exp = self.map.get(pair, 0)
+        exp = self._local_map.get(key, 0)
         if exp <= now:
-            if pair in self.map:
-                self.map.pop(pair); self._save()
+            if key in self._local_map:
+                self._local_map.pop(key, None)
+                self._save_local()
             return False
         return True
 
-_cd = CooldownManager()
+
+_cd_mgr = CooldownManager()
+
 
 def cooldown_key_for(pair: str, mode: str) -> str:
     return f"{pair.upper()}::{mode.upper()}"
-
 # -----------------------------
-# EXCHANGE
+# Exchange helpers
 # -----------------------------
-def get_exchange() -> "ccxt.Exchange":
+def get_exchange(api_keys: bool = False) -> "ccxt.Exchange":
     if ccxt is None:
-        raise RuntimeError("ccxt missing")
-
+        raise RuntimeError("ccxt not installed")
+    ex_name = EXCHANGE_NAME.lower()
     try:
-        ex_cls = getattr(ccxt, EXCHANGE_NAME, ccxt.binance)
+        ex_cls = getattr(ccxt, ex_name, ccxt.binance)
         ex = ex_cls({'enableRateLimit': True})
-    except:
+    except Exception:
         ex = ccxt.binance({'enableRateLimit': True})
-
     try:
         ex.load_markets()
-    except:
-        pass
-
+    except Exception:
+        LOG.debug("exchange.load_markets failed/ignored")
     return ex
 
-def normalize_symbol(s: str) -> str:
-    s = s.upper().strip()
+def normalize_symbol(sym: str) -> str:
+    s = sym.strip().upper()
     if "/" not in s:
         s = f"{s}/{QUOTE_ASSET}"
     return s
 
 # -----------------------------
-# OHLCV FETCH
+# OHLCV fetch + df helper
 # -----------------------------
-def df_from_ohlcv(ohlcv):
+def df_from_ohlcv(ohlcv) -> Optional[pd.DataFrame]:
     if not ohlcv:
         return None
-    df = pd.DataFrame(ohlcv, columns=[
-        "ts","open","high","low","close","volume"
-    ])
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     df.set_index("ts", inplace=True)
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df.dropna(inplace=True)
-    return df if not df.empty else None
+    if df.empty:
+        return None
+    return df
 
-def fetch_ohlcv(ex, symbol, tf="1m", limit=200):
+def fetch_ohlcv_sync(ex: "ccxt.Exchange", symbol: str, timeframe: str="1m", limit: int=200, retries:int=3):
     symbol = normalize_symbol(symbol)
-    last = None
-    for i in range(3):
+    last_exc = None
+    for attempt in range(retries):
         try:
-            data = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-            time.sleep(0.2)
+            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            time.sleep(0.25)
             return df_from_ohlcv(data)
         except Exception as e:
-            last = e
-            time.sleep(0.3*(i+1))
-    LOG.debug(f"OHLCV failed {symbol}: {last}")
+            last_exc = e
+            time.sleep(0.35 * (attempt+1))
+    LOG.debug("fetch_ohlcv failed for %s: %s", symbol, last_exc)
     return None
 
 # -----------------------------
-# INDICATORS
+# Indicators
 # -----------------------------
-def ema(series, span):
+def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-def rsi(series, length=14):
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0).ewm(alpha=1/length, adjust=False).mean()
     down = -delta.clip(upper=0).ewm(alpha=1/length, adjust=False).mean()
     rs = up/(down+1e-12)
     return 100 - (100/(1+rs))
 
-def atr(df, length=14):
-    high, low, close = df["high"], df["low"], df["close"]
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high = df["high"]; low = df["low"]; close = df["close"]
     prev = close.shift(1)
     tr = pd.concat([
-        (high-low),
-        (high-prev).abs(),
-        (low-prev).abs()
+        high - low,
+        (high - prev).abs(),
+        (low - prev).abs()
     ], axis=1).max(axis=1)
     return tr.rolling(length, min_periods=1).mean().bfill()
-# ============================================
-# helpers.py — FINAL PRO SETUP (PART 2/4)
-# Liquidity, Orderbook, Spread, SR Filter, Gainers
-# ============================================
 
 # -----------------------------
-# ORDERBOOK
+# Orderbook / Spread / Liquidity
 # -----------------------------
-def fetch_orderbook_safe(ex, symbol, limit=50):
+def fetch_orderbook_safe(ex: "ccxt.Exchange", symbol: str, limit: int = 50):
     try:
         ob = ex.fetch_order_book(normalize_symbol(symbol), limit=limit)
         time.sleep(0.15)
         return ob or {}
-    except:
+    except Exception:
         return {}
 
-def orderbook_imbalance(ob, depth=12) -> float:
-    bids = ob.get('bids', [])
-    asks = ob.get('asks', [])
-    bid_vol = sum(float(b[1]) for b in bids[:depth]) if bids else 0.0
-    ask_vol = sum(float(a[1]) for a in asks[:depth]) if asks else 0.0
+def orderbook_imbalance_from_ob(ob: dict, depth_levels:int=12) -> float:
+    bids = ob.get("bids", []); asks = ob.get("asks", [])
+    bid_vol = sum(float(x[1]) for x in bids[:depth_levels]) if bids else 0.0
+    ask_vol = sum(float(x[1]) for x in asks[:depth_levels]) if asks else 0.0
     total = bid_vol + ask_vol + 1e-12
     return (bid_vol - ask_vol) / total
 
-# -----------------------------
-# LIQUIDITY SCORE (PRO)
-# -----------------------------
-def liquidity_score(ob) -> float:
+def liquidity_score(ob: dict) -> float:
     bids = ob.get("bids", [])
     asks = ob.get("asks", [])
+    top = (sum(float(x[1]) for x in bids[:5]) + sum(float(x[1]) for x in asks[:5])) / 2.0 if (bids or asks) else 0.0
+    deeper = (sum(float(x[1]) for x in bids[:20]) + sum(float(x[1]) for x in asks[:20])) / 2.0 if (bids or asks) else 1.0
+    return round(min(1.0, top / (deeper + 1e-12)), 3)
 
-    top5 = (
-        sum(float(b[1]) for b in bids[:5]) +
-        sum(float(a[1]) for a in asks[:5])
-    ) / 2 if (bids or asks) else 0
-
-    deep20 = (
-        sum(float(b[1]) for b in bids[:20]) +
-        sum(float(a[1]) for a in asks[:20])
-    ) / 2 if (bids or asks) else 1
-
-    if deep20 == 0:
-        return 0.0
-
-    score = min(1.0, top5 / (deep20 + 1e-12))
-    return round(score, 3)
-
-# -----------------------------
-# SPREAD CALC
-# -----------------------------
-def calc_spread(ob):
+def calc_spread_from_ob(ob: dict) -> float:
     try:
-        bid = float(ob['bids'][0][0])
-        ask = float(ob['asks'][0][0])
-        return abs(ask - bid) / ask
-    except:
-        return 999.0
+        bid = float(ob["bids"][0][0])
+        ask = float(ob["asks"][0][0])
+        return abs(ask - bid)/ask
+    except Exception:
+        return 999
+# -----------------------------
+# SUPPORT / RESISTANCE (Fake Signal Blocker)
+# -----------------------------
+def find_sr_levels(df: pd.DataFrame, lookback: int = 60, sensitivity: float = 0.003):
+    """
+    খুব simple কিন্তু powerful S/R detection:
+    - recent highs → resistance
+    - recent lows → support
+    """
+    if df is None or df.empty:
+        return None, None
+
+    closes = df['close'].iloc[-lookback:]
+    highs = df['high'].iloc[-lookback:]
+    lows  = df['low'].iloc[-lookback:]
+
+    resistance = highs.max()
+    support    = lows.min()
+
+    return float(support), float(resistance)
+
+
+def sr_filter(entry: float, support: float, resistance: float) -> bool:
+    """
+    Fake breakout avoid:
+    - Entry যদি resistance-এর খুব কাছে → BUY avoid
+    - Entry যদি support-এর খুব কাছে → SELL avoid
+    """
+    if support is None or resistance is None:
+        return True   # allow
+
+    zone = (resistance - support) * 0.06  # 6% of range
+
+    near_res = abs(entry - resistance) < zone
+    near_sup = abs(entry - support) < zone
+
+    # BUY হলে resistance-এর কাছে হওয়া যাবে না
+    # SELL হলে support-এর কাছে হওয়া যাবে না
+    return not (near_res or near_sup)
+
 
 # -----------------------------
-# S/R FAKE SIGNAL FILTER
-# Reject signals touching local levels
+# GAINERS / LIQUIDITY FILTER
 # -----------------------------
-def sr_rejection_filter(df):
-    close = df['close']
-    high = df['high']
-    low = df['low']
-
-    recent_high = high.rolling(25).max().iloc[-2]
-    recent_low = low.rolling(25).min().iloc[-2]
-
-    last_close = close.iloc[-1]
-
-    # too close to resistance → risky for BUY
-    if abs(last_close - recent_high) / last_close < 0.0025:
-        return False, "near_resistance"
-
-    # too close to support → risky for SELL
-    if abs(last_close - recent_low) / last_close < 0.0025:
-        return False, "near_support"
-
-    return True, ""
-
-# -----------------------------
-# TOP GAINERS / STRONG TREND FILTER
-# Skip dying / flat coins
-# -----------------------------
-def top_gainer_filter(df1m):
+def is_top_volume_or_gainer(symbol: str, ex: "ccxt.Exchange", top_n: int = 25) -> bool:
+    """
+    এই ফিল্টার ensure করে high-quality coin আগে scan হয়।
+    Low volume coin direct skip হবে।
+    """
     try:
-        close = df1m['close']
-        pct = (close.iloc[-1] - close.iloc[-6]) / close.iloc[-6]  # last 6 min momentum
-        if pct > 0.004:     # strong pump → ok
-            return True
-        if pct < -0.004:    # dump → skip
-            return False
-        return True
-    except:
-        return True
-# ============================================
-# helpers.py — FINAL PRO SETUP (PART 3/4)
-# Scoring + Direction + TP/SL + Mode Logic
-# ============================================
+        tickers = ex.fetch_tickers()
+        # শুধু USDT pair
+        usdt_pairs = {k: v for k, v in tickers.items() if k.endswith("/USDT")}
+        
+        # volume অনুযায়ী সাজাও
+        sorted_vol = sorted(usdt_pairs.items(), key=lambda x: x[1].get("quoteVolume", 0), reverse=True)
+        top_list = [p[0] for p in sorted_vol[:top_n]]
+
+        return symbol in top_list
+    except Exception:
+        return True  # fallback allow
+
 
 # -----------------------------
-# SCORING ENGINE (MTF + Liquidity + Volume + OBI)
+# MAIN SCORING SYSTEM
 # -----------------------------
-def compute_score(df1, df5, ob, spread):
-    reasons = []
-    score = 40.0
+def compute_score_and_reasons(df_1m, df_5m, ob, spread) -> Tuple[float, List[str]]:
+    reasons: List[str] = []
+    if df_1m is None or df_1m.empty:
+        return 0.0, ["insufficient_data"]
 
-    # ===== EMA =====
-    e20_1 = ema(df1['close'], EMA_FAST).iloc[-1]
-    e50_1 = ema(df1['close'], EMA_SLOW).iloc[-1]
-    e20_5 = ema(df5['close'], EMA_FAST).iloc[-1] if df5 is not None else e20_1
-    e50_5 = ema(df5['close'], EMA_SLOW).iloc[-1] if df5 is not None else e50_1
+    close1 = df_1m['close']
+    score = 40.0  # base
+
+    # ---------- 1. MTF EMA ----------
+    e20_1 = ema(close1, 20).iloc[-1]
+    e50_1 = ema(close1, 50).iloc[-1]
+    e20_5 = ema(df_5m['close'], 20).iloc[-1] if df_5m is not None else e20_1
+    e50_5 = ema(df_5m['close'], 50).iloc[-1] if df_5m is not None else e50_1
 
     if e20_1 > e50_1:
         score += 10; reasons.append("EMA20>50_1m")
     else:
-        reasons.append("EMA20<50_1m")
+        reasons.append("EMA20<=50_1m")
 
     if e20_5 > e50_5:
         score += 8; reasons.append("EMA20>50_5m")
     else:
-        reasons.append("EMA20<50_5m")
+        reasons.append("EMA20<=50_5m")
 
-    # ===== MACD =====
-    macd_val = (ema(df1['close'], 12) - ema(df1['close'], 26)).iloc[-1]
+    # ---------- 2. MACD ----------
+    macd_val = (ema(close1, 12) - ema(close1, 26)).iloc[-1]
     if macd_val > 0:
         score += 10; reasons.append("MACD_pos")
     else:
         reasons.append("MACD_neg")
 
-    # ===== RSI =====
-    r = float(rsi(df1['close']).iloc[-1])
+    # ---------- 3. RSI ----------
+    r = float(rsi(close1).iloc[-1])
     if 40 < r < 70:
         score += 6; reasons.append("RSI_ok")
     elif r <= 40:
@@ -322,147 +334,127 @@ def compute_score(df1, df5, ob, spread):
     else:
         score += 1; reasons.append("RSI_high")
 
-    # ===== Volume Spike =====
-    vol = df1['volume']
-    vol_avg = vol.rolling(20).mean().iloc[-1]
+    # ---------- 4. Volume Spike ----------
+    vol = df_1m['volume']
+    vol_avg = vol.rolling(20).mean().iloc[-1] or 1
     if vol.iloc[-1] > vol_avg * 1.6:
-        score += 12; reasons.append("VOL_spike")
+        score += 12; reasons.append("Vol_spike")
     else:
-        reasons.append("VOL_ok")
+        reasons.append("Vol_ok")
 
-    # ===== OBI =====
-    obi = orderbook_imbalance(ob)
-    if obi > 0.55:
+    # ---------- 5. Orderbook Imbalance ----------
+    ob_imb = orderbook_imbalance_from_ob(ob)
+    if ob_imb > 0.55:
         score += 6; reasons.append("OB_buy_pressure")
-    elif obi < -0.55:
+    elif ob_imb < -0.55:
         score += 6; reasons.append("OB_sell_pressure")
 
-    # ===== Liquidity =====
+    # ---------- 6. Liquidity ----------
     liq = liquidity_score(ob)
     if liq > 0.55:
         score += 8; reasons.append("Liquidity_ok")
     else:
         reasons.append("Liquidity_low")
 
-    # ===== Spread =====
+    # ---------- 7. Spread ----------
     if spread <= MAX_SPREAD_PCT:
         score += 6; reasons.append("Spread_ok")
     else:
         reasons.append("Spread_high")
 
-    score = max(0, min(score, 100))
+    score = min(100, max(0, score))
     return round(score, 1), reasons
 
 
 # -----------------------------
-# BUY/SELL DIRECTION ENGINE
+# SIGNAL BUILDER (BUY + SELL)
 # -----------------------------
-def detect_direction(df1, ob):
-    e20 = ema(df1['close'], EMA_FAST).iloc[-1]
-    e50 = ema(df1['close'], EMA_SLOW).iloc[-1]
-    obi = orderbook_imbalance(ob)
+def build_signal_from_df(symbol, df_1m, df_5m, ob, score, reasons):
+    last = df_1m.iloc[-1]
+    entry = float(last['close'])
+    atr_val = float(atr(df_1m).iloc[-1])
 
-    # SELL super strong when EMA down + OBI negative
-    if e20 < e50 or obi < -0.45:
-        return "SELL"
-    return "BUY"
+    e20 = ema(df_1m['close'], 20).iloc[-1]
+    e50 = ema(df_1m['close'], 50).iloc[-1]
+    ob_imb = orderbook_imbalance_from_ob(ob)
 
+    direction = "BUY"
+    if e20 < e50 or ob_imb < -0.45:
+        direction = "SELL"
 
-# -----------------------------
-# MODE: QUICK | MID | TREND
-# -----------------------------
-def detect_mode(score):
-    if score >= THRESH_QUICK:
-        return "QUICK"
-    if score >= THRESH_MID:
-        return "MID"
-    return "TREND"
+    # classification
+    if score >= THRESH_QUICK: mode = "QUICK"
+    elif score >= THRESH_MID: mode = "MID"
+    else: mode = "TREND"
 
-
-# -----------------------------
-# TP / SL via ATR (Symmetric BUY/SELL)
-# -----------------------------
-def build_signal(symbol, df1, df5, ob, score, reasons):
-    entry = float(df1['close'].iloc[-1])
-    atr_val = float(atr(df1).iloc[-1])
-
-    direction = detect_direction(df1, ob)
-    mode = detect_mode(score)
-
-    # TP SL multipliers
+    # SL/TP dynamic
     if mode == "QUICK":
-        tp_m = 1.5
-        sl_m = 1.0
+        tp_off = atr_val * 1.5
+        sl_off = atr_val * 1.0
     elif mode == "TREND":
-        tp_m = 3.0
-        sl_m = 2.0
+        tp_off = atr_val * 3.0
+        sl_off = atr_val * 2.0
     else:
-        tp_m = 2.0
-        sl_m = 1.4
+        tp_off = atr_val * 2.0
+        sl_off = atr_val * 1.4
 
     if direction == "BUY":
-        tp = entry + atr_val * tp_m
-        sl = entry - atr_val * sl_m
+        tp = entry + tp_off
+        sl = entry - sl_off
     else:
-        tp = entry - atr_val * tp_m
-        sl = entry + atr_val * sl_m
+        tp = entry - tp_off
+        sl = entry + sl_off
 
-    # suggested leverage
-    lev = "50x" if mode == "QUICK" else ("25x" if mode == "MID" else "20x")
+    lev = "25x" if mode=="MID" else ("50x" if mode=="QUICK" else "20x")
 
-    danger = (
-        round(entry - atr_val * 1.1, 8),
-        round(entry + atr_val * 1.1, 8)
-    )
+    # S/R
+    support, resistance = find_sr_levels(df_1m)
+    danger = (round(support or 0, 6), round(resistance or 0, 6))
 
     return {
         "pair": normalize_symbol(symbol),
-        "direction": direction,
         "mode": mode,
         "score": score,
-        "entry": round(entry, 8),
-        "tp": round(tp, 8),
-        "sl": round(sl, 8),
-        "atr": round(atr_val, 8),
-        "lev": lev,
-        "danger": danger,
+        "entry": round(entry,6),
+        "tp": round(tp,6),
+        "sl": round(sl,6),
+        "atr": round(atr_val,6),
+        "direction": direction,
         "reasons": reasons,
+        "danger": danger,
+        "lev_suggest": lev,
         "ts": int(time.time())
     }
-# ============================================
-# helpers.py — FINAL PRO SETUP (PART 4/4)
-# Telegram + Analyzer + Final Scanner Logic
-# ============================================
-
 # -----------------------------
-# TELEGRAM FORMATTER
+# FORMATTER (Emoji + HTML)
 # -----------------------------
-def format_signal_message(sig):
-    mode_emoji = "⚡" if sig["mode"]=="QUICK" else ("🔥" if sig["mode"]=="MID" else "🚀")
-    dir_emoji = "🟢BUY" if sig["direction"]=="BUY" else "🔴SELL"
+def format_signal_message(sig: Dict[str,Any]) -> str:
+    em = "🔥" if sig["mode"] == "MID" else ("⚡" if sig["mode"] == "QUICK" else "🚀")
+    dir_emoji = "⬆️" if sig["direction"] == "BUY" else "⬇️"
 
-    dz_low, dz_high = sig["danger"]
-    reason = ", ".join(sig["reasons"])
+    support, resistance = sig.get("danger", (0, 0))
+    reason = ", ".join(sig.get("reasons", []))
 
     return (
-        f"{mode_emoji} <b>{dir_emoji} — {sig['mode']}</b>\n"
+        f"{em} <b>{dir_emoji} {sig['direction']} SIGNAL — {sig['mode']}</b>\n"
         f"Pair: <b>{sig['pair']}</b>\n"
         f"Entry: <code>{sig['entry']}</code>\n"
-        f"TP: <code>{sig['tp']}</code> | SL: <code>{sig['sl']}</code>\n"
-        f"Leverage: <b>{sig['lev']}</b>\n"
-        f"Score: <b>{sig['score']}</b> | ATR: {sig['atr']}\n"
-        f"⚠️ Danger Zone: <code>{dz_low}</code> → <code>{dz_high}</code>\n"
+        f"TP: <code>{sig['tp']}</code>   SL: <code>{sig['sl']}</code>\n"
+        f"Leverage: <b>{sig['lev_suggest']}</b>\n"
+        f"Score: <b>{sig['score']}</b>\n"
+        f"ATR: {sig['atr']}\n"
+        f"⚠️ S/R Zone: <code>{support}</code> - <code>{resistance}</code>\n"
         f"Reason: {reason}\n"
-        f"⏰ {pd.to_datetime(sig['ts'], unit='s').strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        f"Time: {pd.to_datetime(sig['ts'], unit='s').strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
 
 # -----------------------------
-# TELEGRAM SEND
+# TELEGRAM SENDER
 # -----------------------------
-def send_telegram_message(msg):
+def send_telegram_message(msg: str) -> bool:
     if NOTIFY_ONLY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        LOG.info("\n--- TELEGRAM PREVIEW (NOT SENT) ---\n" + msg)
+        LOG.info("Telegram preview (NOT SENT):\n%s", msg)
         return True
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -472,6 +464,7 @@ def send_telegram_message(msg):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
+
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
@@ -479,80 +472,72 @@ def send_telegram_message(msg):
         LOG.warning("Telegram send failed: %s %s", r.status_code, r.text)
         return False
     except Exception as e:
-        LOG.warning("Telegram exception: %s", e)
+        LOG.warning("Telegram send exception: %s", e)
         return False
 
 
 # -----------------------------
-# FINAL ANALYZER
+# FINAL analyze_coin() WRAPPER
 # -----------------------------
-def analyze_coin(ex, symbol):
-    norm = normalize_symbol(symbol)
+def analyze_coin(ex: "ccxt.Exchange", symbol: str) -> Optional[Dict[str,Any]]:
+    try:
+        symbol = normalize_symbol(symbol)
 
-    # EXISTS?
-    if norm not in ex.markets:
+        # ----------------- 1) Top Volume / Gainers Filter -----------------
+        if not is_top_volume_or_gainer(symbol, ex, top_n=25):
+            LOG.debug("%s skip: not in top volume/gainers list", symbol)
+            return None
+
+        # ----------------- 2) Fetch OHLCV -----------------
+        df1 = fetch_ohlcv_sync(ex, symbol, timeframe="1m", limit=200)
+        df5 = fetch_ohlcv_sync(ex, symbol, timeframe="5m", limit=200)
+
+        if df1 is None or df1.empty:
+            return None
+
+        # ----------------- 3) Volume Filter -----------------
+        last_vol = float(df1["volume"].iloc[-1])
+        if last_vol < MIN_24H_VOLUME:
+            LOG.debug("%s skip: low volume %.1f", symbol, last_vol)
+            return None
+
+        # ----------------- 4) Orderbook + Spread -----------------
+        ob = fetch_orderbook_safe(ex, symbol, limit=50)
+        spread = calc_spread_from_ob(ob)
+        if spread > MAX_SPREAD_PCT:
+            LOG.debug("%s skip: spread %.6f > %.6f", symbol, spread, MAX_SPREAD_PCT)
+            return None
+
+        # ----------------- 5) Scoring -----------------
+        score, reasons = compute_score_and_reasons(df1, df5, ob, spread)
+        if score < MIN_SIGNAL_SCORE:
+            LOG.debug("%s skip: score %.1f < %.1f", symbol, score, MIN_SIGNAL_SCORE)
+            return None
+
+        # ----------------- 6) Build Signal -----------------
+        sig = build_signal_from_df(symbol, df1, df5, ob, score, reasons)
+
+        # ----------------- 7) S/R FILTER -----------------
+        support, resistance = find_sr_levels(df1)
+        sig["danger"] = (support, resistance)
+
+        if not sr_filter(sig["entry"], support, resistance):
+            LOG.debug("%s skip: S/R fake zone blocked", symbol)
+            return None
+
+        # ----------------- 8) Cooldown Check -----------------
+        key = cooldown_key_for(sig["pair"], sig["mode"])
+        if _cd_mgr.is_cooled(key):
+            LOG.debug("%s skip: cooldown active for mode=%s", sig['pair'], sig["mode"])
+            return None
+
+        ok = _cd_mgr.set_cooldown(key, sig["mode"])
+        if not ok:
+            LOG.debug("%s skip: cooldown refusal", symbol)
+            return None
+
+        return sig
+
+    except Exception as e:
+        LOG.exception("analyze_coin error %s: %s", symbol, e)
         return None
-
-    # Fetch OHLCV
-    df1 = fetch_ohlcv_sync(ex, norm, "1m", 200)
-    df5 = fetch_ohlcv_sync(ex, norm, "5m", 200)
-
-    if df1 is None or df1.empty:
-        return None
-
-    # Volume filter
-    last_vol = float(df1['volume'].iloc[-1])
-    if last_vol < MIN_24H_VOLUME:
-        return None
-
-    # Orderbook + spread
-    ob = fetch_orderbook_safe(ex, norm, 50)
-    spread = calc_spread(ob)
-    if spread > MAX_SPREAD_PCT:
-        return None
-
-    # S/R Filter
-    ok_sr, reason_sr = sr_rejection_filter(df1)
-    if not ok_sr:
-        LOG.debug(f"{symbol} rejected by SR ({reason_sr})")
-        return None
-
-    # Top Gainer Filter (momentum check)
-    if not top_gainer_filter(df1):
-        LOG.debug(f"{symbol} rejected by momentum")
-        return None
-
-    # SCORE
-    score, reasons = compute_score(df1, df5, ob, spread)
-    if score < MIN_SIGNAL_SCORE:
-        return None
-
-    # BUILD SIGNAL
-    sig = build_signal(symbol, df1, df5, ob, score, reasons)
-
-    # COOL DOWN CHECK
-    key = cooldown_key_for(sig["pair"], sig["mode"])
-    if _cd_mgr.is_cooled(key):
-        return None
-
-    # SET COOLDOWN
-    _cd_mgr.set_cooldown(key, sig["mode"])
-
-    return sig
-
-
-# -----------------------------
-# FINAL SCAN LOOP (used by main.py)
-# -----------------------------
-def scan_batch(ex, batch_symbols):
-    emits = 0
-    for sym in batch_symbols:
-        sig = analyze_coin(ex, sym)
-        if sig:
-            msg = format_signal_message(sig)
-            send_telegram_message(msg)
-            LOG.info(f"EMIT {sig['pair']} | {sig['direction']} | {sig['mode']} | score={sig['score']}")
-            emits += 1
-            if emits >= MAX_EMITS_PER_LOOP:
-                break
-    return emits
