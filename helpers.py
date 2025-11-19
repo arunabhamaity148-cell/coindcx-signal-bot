@@ -1,478 +1,550 @@
-# helpers.py — FULL PATCH (BUY + SELL support, PRO, single file)
+# helpers.py
+# ArunBot - helpers (Redis cooldown, indicators, scoring, signal builder, telegram)
+# Copy-paste করে helpers.py নামে save করো।
+# Author: ChatGPT for Arun
+# Note: Requires ccxt, pandas, numpy, redis (asyncio), requests, python-dotenv
+
 from __future__ import annotations
 import os
 import time
 import json
 import math
-import threading
 import logging
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+import asyncio
+from typing import Optional, Tuple, Dict, List, Any
+
 import pandas as pd
 import numpy as np
 
-# optional imports
+# external libs
 try:
     import ccxt
 except Exception:
     ccxt = None
 
-import requests
-
-# dotenv optional
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    import redis.asyncio as aioredis
 except Exception:
-    pass
+    aioredis = None
 
-# ---------------- logging ----------------
-logger = logging.getLogger("helpers")
-logger.setLevel(os.getenv("HELPERS_LOG_LEVEL", "INFO"))
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    logger.addHandler(ch)
+import requests
+from dotenv import load_dotenv
+load_dotenv()
 
-# ---------------- config / env ----------------
+# ------------------------------
+# Logging
+# ------------------------------
+LOG = logging.getLogger("helpers")
+if not LOG.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    LOG.addHandler(h)
+LOG.setLevel(os.getenv("HELPERS_LOG_LEVEL", "INFO"))
+
+# ------------------------------
+# Config (env defaults)
+# ------------------------------
 NOTIFY_ONLY = os.getenv("NOTIFY_ONLY", "True").lower() in ("1", "true", "yes")
 AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "False").lower() in ("1", "true", "yes")
-
 SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "20"))
 LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "5"))
 OHLCV_MAX_RETRIES = int(os.getenv("OHLCV_MAX_RETRIES", "3"))
 OHLCV_RETRY_DELAY = float(os.getenv("OHLCV_RETRY_DELAY", "0.8"))
 RATE_LIMIT_PAUSE = float(os.getenv("RATE_LIMIT_PAUSE", "0.6"))
-MAX_EMITS_PER_LOOP = int(os.getenv("MAX_EMITS_PER_LOOP", "3"))
-TIMEFRAME_DEFAULT = os.getenv("TIMEFRAME", "1m")
+MAX_EMITS_PER_LOOP = int(os.getenv("MAX_EMITS_PER_LOOP", "1"))
 
-MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "70"))
-MODE_THRESHOLDS = {
-    "quick": float(os.getenv("THRESH_QUICK", "80")),
-    "mid": float(os.getenv("THRESH_MID", "68")),
-    "trend": float(os.getenv("THRESH_TREND", "55")),
-}
+MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "85"))
+THRESH_QUICK = float(os.getenv("THRESH_QUICK", "92"))
+THRESH_MID = float(os.getenv("THRESH_MID", "85"))
+THRESH_TREND = float(os.getenv("THRESH_TREND", "72"))
 
-MIN_24H_VOLUME = float(os.getenv("MIN_24H_VOLUME", "150000"))
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.5"))  # percent
-SAME_COIN_BLOCK = int(os.getenv("SAME_COIN_BLOCK", "1800"))  # default 30 min
+MIN_24H_VOLUME = float(os.getenv("MIN_24H_VOLUME", "250000"))
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.4"))
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "binance")
+QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
 
-COOLDOWN_PERSIST_PATH = os.getenv("COOLDOWN_PERSIST_PATH", "cooldown.json")
-BACKTEST_DB = os.getenv("BACKTEST_DB", "backtest_history.json")
-TRADE_LOG = os.getenv("TRADE_LOG", "trade_log.json")
+COOLDOWN_JSON = os.getenv("COOLDOWN_PERSIST_PATH", "cooldown.json")
+REDIS_URL = os.getenv("REDIS_URL", "")
 
-WEIGHTS = {
-    "ema": float(os.getenv("W_EMA", "25")),
-    "macd": float(os.getenv("W_MACD", "20")),
-    "rsi": float(os.getenv("W_RSI", "15")),
-    "atr_vol": float(os.getenv("W_ATR_VOL", "15")),
-    "adx_trend": float(os.getenv("W_ADX", "15")),
-    "volume": float(os.getenv("W_VOLUME", "10")),
-}
+# Cooldown TTLs (seconds)
+TTL_QUICK = int(os.getenv("COOLDOWN_QUICK_S", "1800"))   # 30 min
+TTL_MID   = int(os.getenv("COOLDOWN_MID_S", "900"))      # 15 min
+TTL_TREND = int(os.getenv("COOLDOWN_TREND_S", "3600"))   # 60 min
 
-# ---------------- internal state ----------------
-_COOLDOWN_LOCK = threading.Lock()
-_COOLDOWN_MAP: Dict[Tuple[str, str], float] = {}
-_BACKTEST_LOCK = threading.Lock()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "") or os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") or os.getenv("CHAT_ID", "")
 
-# ---------------- utilities ----------------
-def now_ts() -> float:
-    return time.time()
+# ------------------------------
+# Cooldown Manager (Redis async + JSON fallback)
+# ------------------------------
+class CooldownManager:
+    """
+    Async cooldown manager. Use Redis if REDIS_URL provided and aioredis available,
+    otherwise use local JSON file (COOLDOWN_JSON).
+    Methods are async to allow Redis usage.
+    Key convention: f"{symbol}::{mode}" e.g. "BTC/USDT::QUICK"
+    """
 
-def safe_write_atomic(path: str, data: Any):
-    try:
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        os.replace(tmp, path)
-    except Exception:
-        logger.exception("safe_write_atomic failed for %s", path)
+    def __init__(self):
+        self.use_redis = aioredis is not None and bool(REDIS_URL)
+        self.redis = None
+        self._local_map: Dict[str, int] = {}
+        if not self.use_redis:
+            self._load_local()
+            LOG.info("CooldownManager: using local JSON fallback (%s)", COOLDOWN_JSON)
+        else:
+            LOG.info("CooldownManager: configured to use Redis (REDIS_URL present)")
 
-def safe_load_json(path: str):
-    try:
-        if not os.path.exists(path):
-            return None
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        logger.exception("safe_load_json failed for %s", path)
-        return None
+    async def init(self):
+        if self.use_redis:
+            try:
+                self.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+                await self.redis.ping()
+                LOG.info("CooldownManager: connected to Redis")
+            except Exception as e:
+                LOG.warning("CooldownManager: Redis init failed, falling back to local JSON: %s", e)
+                self.use_redis = False
+                self._load_local()
 
-# ---------------- exchange factory ----------------
-def create_exchange_instance(name: str = "binance", api_key: Optional[str] = None, api_secret: Optional[str] = None):
+    def _load_local(self):
+        try:
+            with open(COOLDOWN_JSON, "r") as f:
+                data = json.load(f)
+                self._local_map = {k: int(v) for k, v in data.items()}
+        except FileNotFoundError:
+            self._local_map = {}
+        except Exception as e:
+            LOG.warning("CooldownManager: failed to load local json: %s", e)
+            self._local_map = {}
+
+    def _save_local(self):
+        try:
+            with open(COOLDOWN_JSON + ".tmp", "w") as f:
+                json.dump(self._local_map, f)
+            os.replace(COOLDOWN_JSON + ".tmp", COOLDOWN_JSON)
+        except Exception as e:
+            LOG.warning("CooldownManager: failed to save local json: %s", e)
+
+    def _ttl_for_mode(self, mode: str) -> int:
+        m = mode.lower()
+        if m == "quick":
+            return TTL_QUICK
+        if m == "mid":
+            return TTL_MID
+        return TTL_TREND
+
+    async def set_cooldown(self, key: str, mode: str) -> bool:
+        """
+        Try to set cooldown. Returns True if set (i.e. no active cooldown existed).
+        """
+        ttl = self._ttl_for_mode(mode)
+        if self.use_redis and self.redis:
+            try:
+                # NX = set only if not exists
+                ok = await self.redis.set(name=key, value="1", ex=ttl, nx=True)
+                return bool(ok)
+            except Exception as e:
+                LOG.warning("CooldownManager: Redis set failed, fallback local: %s", e)
+                self.use_redis = False
+
+        # local fallback
+        now = int(time.time())
+        exp = self._local_map.get(key, 0)
+        if exp <= now:
+            self._local_map[key] = now + ttl
+            self._save_local()
+            return True
+        return False
+
+    async def is_cooled(self, key: str) -> bool:
+        """
+        Return True if key is currently in cooldown (blocked).
+        """
+        if self.use_redis and self.redis:
+            try:
+                ttl = await self.redis.ttl(key)
+                return bool(ttl and int(ttl) > 0)
+            except Exception as e:
+                LOG.warning("CooldownManager: Redis ttl failed, fallback local: %s", e)
+                self.use_redis = False
+
+        now = int(time.time())
+        exp = self._local_map.get(key)
+        if not exp:
+            return False
+        if exp <= now:
+            # expired -> remove
+            self._local_map.pop(key, None)
+            self._save_local()
+            return False
+        return True
+
+    async def clear(self, key: str):
+        if self.use_redis and self.redis:
+            try:
+                await self.redis.delete(key)
+                return
+            except Exception as e:
+                LOG.warning("CooldownManager: Redis delete failed: %s", e)
+                self.use_redis = False
+        self._local_map.pop(key, None)
+        self._save_local()
+
+# singleton cooldown manager (to import from main)
+_cd_manager: Optional[CooldownManager] = None
+
+async def init_cooldown_manager() -> CooldownManager:
+    global _cd_manager
+    if _cd_manager is None:
+        _cd_manager = CooldownManager()
+        await _cd_manager.init()
+    return _cd_manager
+
+# ------------------------------
+# Exchange factory & helpers
+# ------------------------------
+def get_exchange(api_keys: bool = False) -> ccxt.Exchange:
+    """
+    Returns ccxt exchange instance.
+    If api_keys True or env has keys, sets apiKey/secret.
+    """
     if ccxt is None:
         raise RuntimeError("ccxt not installed. pip install ccxt")
-    ex_cls = getattr(ccxt, name, None) or getattr(ccxt, name.lower(), None)
-    if ex_cls is None:
-        raise RuntimeError(f"Exchange '{name}' not found in ccxt")
-    opts = {"enableRateLimit": True}
-    ex = ex_cls(opts)
-    if api_key:
-        ex.apiKey = api_key
-    if api_secret:
-        ex.secret = api_secret
-    try:
-        ex.options = ex.options or {}
-        ex.options["adjustForTimeDifference"] = True
-    except Exception:
-        pass
+
+    ex_name = EXCHANGE_NAME.lower()
+    if ex_name == "binance":
+        ex = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+    else:
+        ex_cls = getattr(ccxt, ex_name, None)
+        if ex_cls is None:
+            ex = ccxt.binance({'enableRateLimit': True})
+        else:
+            ex = ex_cls({'enableRateLimit': True})
+    if api_keys or (os.getenv("EXCHANGE_API_KEY") and os.getenv("EXCHANGE_API_SECRET")):
+        try:
+            ex.apiKey = os.getenv("EXCHANGE_API_KEY")
+            ex.secret = os.getenv("EXCHANGE_API_SECRET")
+        except Exception:
+            LOG.debug("Exchange API keys not set or failed to assign")
     try:
         ex.load_markets()
     except Exception:
-        logger.debug("load_markets skipped/failed")
-    logger.info("Exchange created: %s api_set=%s", name, bool(api_key and api_secret))
+        LOG.debug("Exchange.load_markets() failed/skipped")
     return ex
 
-# ---------------- OHLCV fetch with retry & rate limit pause ----------------
-def fetch_ohlcv_with_retry(exchange, pair: str, timeframe: str = TIMEFRAME_DEFAULT, limit: int = 240):
-    # normalize pair
-    pair = pair if "/" in pair else f"{pair}/USDT"
-    last_exc = None
-    for attempt in range(1, OHLCV_MAX_RETRIES + 1):
-        try:
-            data = exchange.fetch_ohlcv(pair, timeframe=timeframe, limit=limit)
-            time.sleep(RATE_LIMIT_PAUSE)
-            return data
-        except Exception as e:
-            last_exc = e
-            logger.debug("fetch_ohlcv attempt %d failed for %s: %s", attempt, pair, e)
-            time.sleep(OHLCV_RETRY_DELAY * attempt)
-    logger.error("fetch_ohlcv failed for %s after %d attempts: %s", pair, OHLCV_MAX_RETRIES, last_exc)
-    return None
+def normalize_symbol(sym: str) -> str:
+    s = sym.strip().upper()
+    if "/" not in s:
+        s = f"{s}/{QUOTE_ASSET}"
+    return s
 
-# ---------------- DataFrame builder ----------------
-def ohlcv_to_df(ohlcv):
+# ------------------------------
+# OHLCV fetch with retry
+# ------------------------------
+def df_from_ohlcv(ohlcv) -> Optional[pd.DataFrame]:
     if not ohlcv:
         return None
-    df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].apply(pd.to_numeric, errors='coerce')
-    df = df.dropna()
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+    df.set_index('ts', inplace=True)
+    for c in ["open","high","low","close","vol"]:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    df.dropna(inplace=True)
     return df
 
-# ---------------- Indicators ----------------
-def ema(series: pd.Series, span: int):
+def fetch_ohlcv_with_retry_sync(ex: ccxt.Exchange, symbol: str, timeframe: str = "1m", limit: int = 200) -> Optional[pd.DataFrame]:
+    symbol = normalize_symbol(symbol)
+    last_exc = None
+    for attempt in range(OHLCV_MAX_RETRIES):
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            time.sleep(RATE_LIMIT_PAUSE)
+            return df_from_ohlcv(data)
+        except ccxt.BaseError as e:
+            last_exc = e
+            LOG.debug("fetch_ohlcv attempt %d failed for %s: %s", attempt+1, symbol, e)
+            time.sleep(OHLCV_RETRY_DELAY * (attempt+1))
+        except Exception as e:
+            last_exc = e
+            LOG.debug("fetch_ohlcv attempt %d failed for %s: %s", attempt+1, symbol, e)
+            time.sleep(OHLCV_RETRY_DELAY * (attempt+1))
+    LOG.warning("fetch_ohlcv failed for %s after %d attempts: %s", symbol, OHLCV_MAX_RETRIES, last_exc)
+    return None
+
+# ------------------------------
+# Indicators
+# ------------------------------
+def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-def rsi(series: pd.Series, period: int = 14):
+def sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = ma_up / (ma_down + 1e-12)
+    up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    down = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / (down + 1e-12)
     return 100 - (100 / (1 + rs))
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    fast_ema = ema(series, fast)
-    slow_ema = ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+def macd(series: pd.Series, fast=12, slow=26, sig=9):
+    efast = ema(series, fast)
+    eslow = ema(series, slow)
+    macd_line = efast - eslow
+    sig_line = macd_line.ewm(span=sig, adjust=False).mean()
+    hist = macd_line - sig_line
+    return macd_line, sig_line, hist
 
-def true_range(df: pd.DataFrame):
-    prev = df['close'].shift(1)
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - prev).abs()
-    tr3 = (df['low'] - prev).abs()
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high = df['high']; low = df['low']; close = df['close']
+    prev = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev).abs()
+    tr3 = (low - prev).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
+    return tr.rolling(length).mean().fillna(method="backfill")
 
-def atr(df: pd.DataFrame, period: int = 14):
-    tr = true_range(df)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
-
-def _dx_plus_minus(df: pd.DataFrame, n: int = 14):
-    up = df['high'].diff()
-    down = -df['low'].diff()
-    plus_dm = up.where((up > down) & (up > 0), 0.0)
-    minus_dm = down.where((down > up) & (down > 0), 0.0)
-    tr = pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - df['close'].shift()).abs(),
-        (df['low'] - df['close'].shift()).abs()
-    ], axis=1).max(axis=1)
-    atr_ = tr.ewm(alpha=1/n, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(alpha=1/n, adjust=False).mean() / (atr_ + 1e-12))
-    minus_di = 100 * (minus_dm.ewm(alpha=1/n, adjust=False).mean() / (atr_ + 1e-12))
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-12)
-    adx_series = dx.ewm(alpha=1/n, adjust=False).mean()
-    return plus_di.fillna(0), minus_di.fillna(0), adx_series.fillna(0)
-
-def vwap(df: pd.DataFrame):
-    tp = (df['high'] + df['low'] + df['close']) / 3.0
-    pv = (tp * df['volume']).cumsum()
-    denom = df['volume'].cumsum().replace(0, np.nan)
-    return (pv / denom).ffill().fillna(df['close'])
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    close = df['close']
-    df['ema9'] = ema(close, 9)
-    df['ema20'] = ema(close, 20)
-    df['ema50'] = ema(close, 50)
-    df['ema200'] = ema(close, 200)
-    df['rsi14'] = rsi(close, 14)
-    macd_line, macd_signal, hist = macd(close)
-    df['macd'] = macd_line
-    df['macd_signal'] = macd_signal
-    df['macd_hist'] = hist
-    df['atr14'] = atr(df, 14)
-    plus, minus, adx_series = _dx_plus_minus(df, 14)
-    df['plus_di'] = plus
-    df['minus_di'] = minus
-    df['adx14'] = adx_series
-    df['vwap'] = vwap(df)
-    df['vol_ma20'] = df['volume'].rolling(20, min_periods=1).mean()
-    df['vol_rel'] = df['volume'] / df['vol_ma20'].replace(0,1)
-    df['candle_body'] = (df['close'] - df['open']).abs()
-    return df
-
-# ---------------- scoring ----------------
-def compute_signal_score(df: pd.DataFrame) -> Dict[str, Any]:
-    if df is None or len(df) < 40:
-        return {"score": 0.0, "reasons": [], "entry": None, "atr": 0.0, "vol_rel": 0.0, "adx": 0.0}
-    latest = df.iloc[-1]
-    score = 0.0
+# ------------------------------
+# Score engine
+# ------------------------------
+def compute_score(df: pd.DataFrame) -> Tuple[float, List[str]]:
+    """
+    return (score 0-100, reasons[])
+    """
     reasons: List[str] = []
-    # EMA contribution
-    if latest['ema20'] > latest['ema50']:
-        score += WEIGHTS['ema']; reasons.append("EMA_up")
+    if df is None or len(df) < 30:
+        return 0.0, ["insufficient_data"]
+
+    close = df['close']
+    score = 40.0  # base
+
+    # EMA trend
+    ema21 = ema(close, 21).iloc[-1]
+    ema50 = ema(close, 50).iloc[-1]
+    if ema21 > ema50:
+        score += 12; reasons.append("EMA_up")
     else:
-        score -= WEIGHTS['ema'] / 2; reasons.append("EMA_down")
-    # MACD
-    if latest['macd_hist'] > 0:
-        score += WEIGHTS['macd']; reasons.append("MACD_pos")
+        score -= 8; reasons.append("EMA_down")
+
+    # MACD hist
+    _, _, hist = macd(close)
+    if hist.iloc[-1] > 0:
+        score += 10; reasons.append("MACD_pos")
     else:
-        score -= WEIGHTS['macd'] / 2; reasons.append("MACD_neg")
+        reasons.append("MACD_neg")
+
     # RSI
-    r = float(latest['rsi14'])
-    if 30 <= r <= 60:
-        score += WEIGHTS['rsi']
-    elif r < 30:
-        score += WEIGHTS['rsi'] * 0.6; reasons.append("RSI_oversold")
+    r = float(rsi(close).iloc[-1])
+    if 30 < r < 70:
+        score += 6; reasons.append("RSI_ok")
+    elif r <= 30:
+        score += 3; reasons.append("RSI_oversold")
     else:
-        score -= WEIGHTS['rsi'] * 0.6; reasons.append("RSI_overbought")
-    # ATR ratio
-    atrv = float(latest['atr14']) if 'atr14' in latest else 0.0
-    atr_ratio = atrv / max(1.0, float(latest['close']))
-    if atr_ratio < 0.02:
-        score += WEIGHTS['atr_vol']
-    elif atr_ratio < 0.04:
-        score += WEIGHTS['atr_vol'] * 0.6
+        score -= 6; reasons.append("RSI_overbought")
+
+    # volume
+    vol = df['vol']
+    vol_avg = vol.rolling(20, min_periods=1).mean().iloc[-1] or 1.0
+    vol_ratio = float(vol.iloc[-1]) / (vol_avg + 1e-12)
+    if vol_ratio > 1.8:
+        score += 10; reasons.append("Vol_spike")
     else:
-        score -= WEIGHTS['atr_vol'] * 0.6; reasons.append("High_ATR")
-    # ADX
-    if float(latest.get('adx14', 0.0)) > 25:
-        score += WEIGHTS['adx_trend']; reasons.append("ADX_strong")
-    # Volume
-    vol_rel = float(latest.get('vol_rel', 0.0))
-    if vol_rel > 1.5:
-        score += WEIGHTS['volume']; reasons.append("Vol_spike")
-    # Normalize to 0-100
-    max_possible = sum(WEIGHTS.values()) + 10.0
-    score = max(0.0, min(100.0, (score / max_possible) * 100.0))
-    entry = float(latest['close'])
-    return {"score": round(score, 1), "reasons": reasons, "entry": entry, "atr": atrv, "vol_rel": vol_rel, "adx": float(latest.get('adx14', 0.0))}
+        reasons.append("Vol_ok")
 
-# ---------------- adaptive TP/SL ----------------
-def adaptive_tp_sl(entry: float, atr_val: float, mode: str, score: float) -> Tuple[float, float]:
-    # returns (tp, sl) for BUY where tp > entry, sl < entry
-    if atr_val <= 0:
-        atr_val = max(1e-8, entry * 0.001)
-    mode = mode.lower()
-    if mode == "trend":
-        tp_mul, sl_mul = 1.6, 1.0
-    elif mode == "mid":
-        tp_mul, sl_mul = 1.1, 1.8
-    else:
-        tp_mul, sl_mul = 0.9, 1.6
-    score_factor = max(0.8, min(1.4, 1.0 + (score - 60) / 300.0))
-    tp = entry + tp_mul * score_factor * atr_val
-    sl = entry - sl_mul / score_factor * atr_val
-    return round(tp, 8), round(sl, 8)
+    # ATR normalized penalty
+    last_atr = float(atr(df).iloc[-1] if not atr(df).empty else 0.0)
+    close_now = float(close.iloc[-1])
+    if last_atr > 0:
+        rel = last_atr / (close_now + 1e-9)
+        if rel > 0.01:
+            score -= 4; reasons.append("High_ATR")
+        else:
+            reasons.append("ATR_ok")
 
-def adaptive_tp_sl_for_sell(entry: float, atr_val: float, mode: str, score: float) -> Tuple[float, float]:
-    # returns (tp, sl) for SELL where tp < entry, sl > entry
-    tp_buy, sl_buy = adaptive_tp_sl(entry, atr_val, mode, score)
-    # symmetric for sell
-    sell_tp = entry - (tp_buy - entry)
-    sell_sl = entry + (entry - sl_buy)
-    return round(sell_tp, 8), round(sell_sl, 8)
+    # price vs sma50
+    sma50 = sma(close, 50).iloc[-1]
+    if close_now > sma50:
+        score += 6; reasons.append("Price_above_SMA50")
 
-# ---------------- cooldown persistence ----------------
-def load_cooldown_map(path: str = COOLDOWN_PERSIST_PATH):
-    global _COOLDOWN_MAP
-    data = safe_load_json(path) or {}
-    out: Dict[Tuple[str, str], float] = {}
-    for k, v in data.items():
-        try:
-            sym, mode = k.split("::")
-            out[(sym, mode)] = float(v)
-        except Exception:
-            continue
-    with _COOLDOWN_LOCK:
-        _COOLDOWN_MAP = out
-    logger.info("Cooldown map loaded (%d entries)", len(_COOLDOWN_MAP))
+    # clamp
+    score = max(0.0, min(100.0, score))
+    return round(score, 1), reasons
 
-def persist_cooldown_map(path: str = COOLDOWN_PERSIST_PATH):
-    with _COOLDOWN_LOCK:
-        simple = {f"{k[0]}::{k[1]}": v for k, v in _COOLDOWN_MAP.items()}
-    safe_write_atomic(path, simple)
-    logger.debug("Cooldown map persisted")
+# ------------------------------
+# Signal builder
+# ------------------------------
+def build_signal(df: pd.DataFrame, symbol: str, score: float, reasons: List[str], mode: str = "MID") -> Dict[str, Any]:
+    close_now = float(df['close'].iloc[-1])
+    last_atr = float(atr(df).iloc[-1] if not atr(df).empty else 0.0)
 
-def is_in_cooldown(symbol: str, mode: str) -> bool:
-    key = (symbol.upper(), mode.lower())
-    with _COOLDOWN_LOCK:
-        ts = _COOLDOWN_MAP.get(key, 0)
-    return ts > now_ts()
+    entry = close_now
+    if mode.upper() == "QUICK":
+        tp = entry + last_atr * 1.5
+        sl = entry - last_atr * 1.2
+    elif mode.upper() == "TREND":
+        tp = entry + last_atr * 3.0
+        sl = entry - last_atr * 2.0
+    else:  # MID
+        tp = entry + last_atr * 2.0
+        sl = entry - last_atr * 1.5
 
-def set_cooldown(symbol: str, mode: str, seconds: int = SAME_COIN_BLOCK):
-    key = (symbol.upper(), mode.lower())
-    with _COOLDOWN_LOCK:
-        _COOLDOWN_MAP[key] = now_ts() + seconds
-    logger.info("Cooldown set %s %s until %s", symbol, mode, datetime.fromtimestamp(_COOLDOWN_MAP[key]).isoformat())
+    danger_low = entry - last_atr * 1.1
+    danger_high = entry + last_atr * 1.1
 
-# ---------------- backtest / trade log ----------------
-def record_backtest(symbol: str, payload: Dict[str, Any], result: Dict[str, Any]):
-    with _BACKTEST_LOCK:
-        data = safe_load_json(BACKTEST_DB) or []
-        data.append({"ts": now_ts(), "symbol": symbol, "payload": payload, "result": result})
-        if len(data) > 20000:
-            data = data[-20000:]
-        safe_write_atomic(BACKTEST_DB, data)
+    return {
+        "pair": normalize_symbol(symbol),
+        "mode": mode.upper(),
+        "score": score,
+        "entry": round(entry, 8),
+        "tp": round(tp, 8),
+        "sl": round(sl, 8),
+        "danger": (round(danger_low, 8), round(danger_high, 8)),
+        "atr": round(last_atr, 8),
+        "reasons": reasons,
+        "ts": int(time.time())
+    }
 
-def append_trade_log(entry: Dict[str, Any]):
-    try:
-        data = safe_load_json(TRADE_LOG) or []
-        data.append(entry)
-        if len(data) > 20000:
-            data = data[-20000:]
-        safe_write_atomic(TRADE_LOG, data)
-    except Exception:
-        logger.exception("append_trade_log failed")
+# ------------------------------
+# Telegram message
+# ------------------------------
+def format_signal_message(sig: Dict[str, Any]) -> str:
+    mode = sig.get("mode", "MID")
+    emoji = "⚡" if mode == "QUICK" else ("🔥" if mode == "MID" else "🚀")
+    danger_low, danger_high = sig.get("danger", (0,0))
+    reason_text = ", ".join(sig.get("reasons", []))
+    msg = (
+        f"{emoji} <b>BUY SIGNAL — {mode}</b>\n"
+        f"Pair: <b>{sig['pair']}</b>  Score: <b>{sig['score']}</b>\n"
+        f"Entry: <code>{sig['entry']}</code>\n"
+        f"TP: <code>{sig['tp']}</code>   SL: <code>{sig['sl']}</code>\n"
+        f"Qty: (manual)   Size: (manual)   Lev: (manual)\n"
+        f"⚠️ Danger Zone: <code>{danger_low}</code> - <code>{danger_high}</code> (ATR={sig['atr']})\n"
+        f"Reason: {reason_text}\n"
+        f"Mode: {sig['mode']} | Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(sig['ts']))} UTC"
+    )
+    return msg
 
-# ---------------- telegram formatting & send ----------------
-def format_signal_message(symbol: str, side: str, mode: str, score: float, entry: float, tp: float, sl: float, atr_val: float, reasons: List[str], vol_est: float) -> str:
-    mode_u = mode.upper()
-    side_u = side.upper()
-    emoji = "🔥" if mode_u == "QUICK" else "⚡" if mode_u == "MID" else "💎"
-    sign_emoji = "🔺" if side_u == "BUY" else "🔻"
-    danger_low = entry - atr_val
-    danger_high = entry + atr_val
-    lines: List[str] = []
-    lines.append(f"{emoji} {sign_emoji} <b>{side_u} SIGNAL — {mode_u}</b>")
-    lines.append(f"💱 <b>Pair:</b> {symbol}/USDT   📊 <b>Score:</b> {score}%")
-    lines.append(f"💰 <b>Entry:</b> <code>{entry:.8f}</code>")
-    lines.append(f"🎯 <b>TP:</b> <code>{tp:.8f}</code>   🛑 <b>SL:</b> <code>{sl:.8f}</code>")
-    lines.append(f"📦 <b>Qty:</b> (manual)   💵 <b>Size:</b> (manual)   ⚡ <b>Lev:</b> (manual)")
-    lines.append(f"⚠️ <b>Danger Zone:</b> <code>{danger_low:.8f}</code> — <code>{danger_high:.8f}</code>  (ATR={atr_val:.6f})")
-    lines.append(f"📌 <b>Reason:</b> {' · '.join(reasons) if reasons else '-'}")
-    lines.append(f"⏱ <b>Est time to TP:</b> (est)  |  🎛 <b>Mode:</b> {mode_u}")
-    return "\n".join(lines)
-
-def send_telegram(text: str) -> bool:
+def send_telegram_message(msg: str, preview: bool = False) -> bool:
+    """
+    Send Telegram message. If NOTIFY_ONLY True, skip actual send (preview logged).
+    """
     if NOTIFY_ONLY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.info("NOTIFY_ONLY or telegram not configured — preview:\n%s", text)
+        LOG.info("Telegram preview (NOT SENT):\n%s", msg)
         return True
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
-            logger.info("Telegram sent")
             return True
-        else:
-            logger.error("Telegram failed %s %s", r.status_code, r.text)
-            return False
-    except Exception:
-        logger.exception("Telegram send exception")
+        LOG.warning("Telegram send failed: %s %s", r.status_code, r.text)
+        return False
+    except Exception as e:
+        LOG.warning("Telegram send exception: %s", e)
         return False
 
-# ---------------- core scanner (supports buy & sell) ----------------
-def scan_and_maybe_emit(exchange, symbol: str, mode: str = "mid", side: str = "buy", timeframe: str = TIMEFRAME_DEFAULT) -> bool:
+# ------------------------------
+# Top-level analyze_symbol (sync)
+# ------------------------------
+def analyze_symbol_sync(ex: ccxt.Exchange, symbol: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch OHLCV, compute indicators, score, filter, and emit message.
-    side: 'buy' or 'sell'
+    Analyze one symbol and return signal dict or None.
+    This is synchronous to be used in main.py (sync loop).
     """
-    pair = symbol if "/" in symbol else f"{symbol}/USDT"
-    # fetch
-    ohlcv = fetch_ohlcv_with_retry(exchange, pair, timeframe=timeframe, limit=240)
-    if not ohlcv:
-        return False
-    df = ohlcv_to_df(ohlcv)
-    if df is None or len(df) < 40:
-        return False
-    df = add_indicators(df)
-    score_info = compute_signal_score(df)
-    score = score_info.get("score", 0.0)
-    thr = MODE_THRESHOLDS.get(mode.lower(), MIN_SIGNAL_SCORE)
-    if score < thr:
-        logger.debug("%s %s %s score %.1f < thr %.1f", symbol, mode, side, score, thr)
-        return False
-
-    latest = df.iloc[-1]
-    # direction condition
-    if side.lower() == "buy":
-        cond_trend = (latest['ema20'] > latest['ema50']) and (latest['macd_hist'] > 0)
-    else:
-        cond_trend = (latest['ema20'] < latest['ema50']) and (latest['macd_hist'] < 0)
-    if not cond_trend:
-        logger.debug("%s %s condition fail for side=%s", symbol, mode, side)
-        return False
-
-    # basic filters
-    vol_avg = df['volume'].tail(1440).mean() if len(df) > 1440 else (df['volume'].tail(100).mean() * 24)
-    spread_pct = ((df['high'].iloc[-1] - df['low'].iloc[-1]) / df['close'].iloc[-1]) * 100
-    if vol_avg < MIN_24H_VOLUME:
-        logger.debug("%s blocked low volume %.1f", symbol, vol_avg)
-        return False
-    if spread_pct > MAX_SPREAD_PCT:
-        logger.debug("%s blocked spread %.3f", symbol, spread_pct)
-        return False
-    if is_in_cooldown(symbol, mode):
-        logger.debug("%s in cooldown %s", symbol, mode)
-        return False
-
-    entry = score_info['entry']; atrv = score_info['atr']
-    if side.lower() == "buy":
-        tp, sl = adaptive_tp_sl(entry, atrv, mode, score)
-    else:
-        tp, sl = adaptive_tp_sl_for_sell(entry, atrv, mode, score)
-
-    msg = format_signal_message(symbol, side, mode, score, entry, tp, sl, atrv, score_info.get('reasons', []), vol_avg)
-    ok = send_telegram(msg)
-    if ok:
-        record_backtest(symbol, {"mode": mode, "side": side, "score": score, "entry": entry, "tp": tp, "sl": sl}, {"tp_hit": None})
-        set_cooldown(symbol, mode, seconds=SAME_COIN_BLOCK)
-    return ok
-
-# ---------------- symbol resolver ----------------
-def resolve_symbol_if_needed(exchange, symbol: str) -> str:
-    if "/" in symbol:
-        return symbol
     try:
-        markets = getattr(exchange, "markets", None)
-        if not markets:
-            try:
-                exchange.load_markets()
-                markets = exchange.markets
-            except Exception:
-                markets = None
-        cand = symbol + "/USDT"
-        if markets and cand in markets:
-            return cand
-        if markets:
-            for m in markets:
-                if m.startswith(symbol + "/"):
-                    return m
-        return symbol + "/USDT"
-    except Exception:
-        return symbol + "/USDT"
+        s = normalize_symbol(symbol)
+        # quick existence check
+        try:
+            ex.load_markets()
+            if s not in ex.markets:
+                LOG.debug("Symbol not in markets: %s", s)
+                return None
+        except Exception:
+            # ignore load_markets issues
+            pass
 
-# ---------------- end of helpers.py ----------------
+        df = fetch_ohlcv_with_retry_sync(ex, s, timeframe="1m", limit=200)
+        if df is None or df.empty:
+            return None
+
+        # quick filters
+        # volume check (use last candle volume as proxy)
+        last_vol = float(df['vol'].iloc[-1]) if 'vol' in df.columns and not df['vol'].empty else 0.0
+        if last_vol < MIN_24H_VOLUME:
+            LOG.debug("%s skipped: vol %.1f < MIN_24H_VOLUME %.1f", s, last_vol, MIN_24H_VOLUME)
+            return None
+
+        # compute score
+        score, reasons = compute_score(df)
+        if score < MIN_SIGNAL_SCORE:
+            LOG.debug("%s skipped: score %.1f < MIN_SIGNAL_SCORE %.1f", s, score, MIN_SIGNAL_SCORE)
+            return None
+
+        # decide mode
+        mode = "MID"
+        if score >= THRESH_QUICK:
+            mode = "QUICK"
+        elif score >= THRESH_MID:
+            mode = "MID"
+        elif score >= THRESH_TREND:
+            mode = "TREND"
+        else:
+            return None
+
+        sig = build_signal(df, s, score, reasons, mode=mode)
+        return sig
+    except Exception as e:
+        LOG.exception("analyze_symbol_sync error for %s: %s", symbol, e)
+        return None
+
+# ------------------------------
+# Simple helper: key name builder
+# ------------------------------
+def cooldown_key_for(sig_or_pair: Any, mode: Optional[str] = None) -> str:
+    if isinstance(sig_or_pair, dict):
+        pair = sig_or_pair.get("pair") or sig_or_pair.get("symbol")
+    else:
+        pair = sig_or_pair
+    pair = normalize_symbol(pair)
+    m = mode or (sig_or_pair.get("mode") if isinstance(sig_or_pair, dict) else "MID")
+    return f"{pair}::{m.upper()}"
+
+# ------------------------------
+# Backward-compatible local cooldown helpers (sync)
+# ------------------------------
+def load_local_cooldown_map(path: str = COOLDOWN_JSON) -> Dict[str, int]:
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return {k: int(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+def save_local_cooldown_map(m: Dict[str, int], path: str = COOLDOWN_JSON):
+    try:
+        with open(path + ".tmp", "w") as f:
+            json.dump(m, f)
+        os.replace(path + ".tmp", path)
+    except Exception as e:
+        LOG.warning("save_local_cooldown_map failed: %s", e)
+
+# ------------------------------
+# Small util: pretty print signal (for logs)
+# ------------------------------
+def preview_signal_log(sig: Dict[str, Any]):
+    try:
+        LOG.info("→ SIGNAL %s | mode=%s score=%.1f entry=%s tp=%s sl=%s",
+                 sig.get("pair"), sig.get("mode"), sig.get("score"),
+                 sig.get("entry"), sig.get("tp"), sig.get("sl"))
+    except Exception:
+        LOG.info("→ SIGNAL (unable to pretty print)")
+
+# ------------------------------
+# End of helpers.py
+# ------------------------------
