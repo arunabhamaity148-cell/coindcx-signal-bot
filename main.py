@@ -1,10 +1,10 @@
-import time
-import logging
+import time, logging
 from helpers import (
     get_exchange,
-    analyze_symbol,          # ← FIXED
+    analyze_coin,
     format_signal_message,
     send_telegram_message,
+    btc_calm
 )
 
 logging.basicConfig(
@@ -13,9 +13,8 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("main")
 
-SCAN_BATCH = 20        # প্রতি লুপে কয়টা কয়েন
-SLEEP = 5              # প্রতি ব্যাচের মধ্যে sleep
-
+SCAN_BATCH = 20
+SLEEP = 5
 
 def main_loop():
     ex = get_exchange()
@@ -23,28 +22,30 @@ def main_loop():
 
     while True:
         try:
-            markets = list(ex.markets.keys())
-            symbols = [s for s in markets if s.endswith("/USDT")]
+            if not btc_calm(ex):
+                LOG.info("⏳ BTC unstable — cooling…")
+                time.sleep(8)
+                continue
+
+            symbols = [s for s in ex.markets if s.endswith("/USDT")]
 
             for idx in range(0, len(symbols), SCAN_BATCH):
-                batch = symbols[idx:idx + SCAN_BATCH]
-
+                batch = symbols[idx:idx+SCAN_BATCH]
                 emits = 0
-                LOG.info(f"Loop {idx//SCAN_BATCH + 1} | scanning batch size={len(batch)}")
 
                 for sym in batch:
-                    sig = analyze_symbol(ex, sym)   # ← FIXED
+                    sig = analyze_coin(ex, sym)
                     if sig:
                         emits += 1
                         msg = format_signal_message(sig)
                         send_telegram_message(msg)
                         LOG.info(f"EMIT → {sym} | mode={sig['mode']} score={sig['score']}")
 
-                LOG.info(f"Loop done | scanned={len(batch)} emitted={emits} | sleeping {SLEEP}s")
+                LOG.info(f"Loop {idx//SCAN_BATCH} | scanned={len(batch)} emitted={emits}")
                 time.sleep(SLEEP)
 
         except Exception as e:
-            LOG.error(f"Main loop error: {e}")
+            LOG.error(f"Main Error: {e}")
             time.sleep(3)
 
 
