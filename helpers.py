@@ -519,9 +519,7 @@ def send_telegram_message(msg):
         return False
 
 
-# -----------------------------
-# FINAL ANALYZER (with ALL filters)
-# -----------------------------
+# FINAL ANALYZER (WITH ALL FILTERS)
 def analyze_coin(ex, symbol):
     try:
         symbol_n = normalize_symbol(symbol)
@@ -532,56 +530,39 @@ def analyze_coin(ex, symbol):
 
         # fetch OHLCV
         df1 = fetch_ohlcv_sync(ex, symbol_n, timeframe="1m", limit=200)
-df5 = fetch_ohlcv_sync(ex, symbol_n, timeframe="5m", limit=200)
+        df5 = fetch_ohlcv_sync(ex, symbol_n, timeframe="5m", limit=200)
 
         if df1 is None or df1.empty:
             return None
 
         # volume filter
-        vol_last = float(df1["volume"].iloc[-1])
-        if vol_last < MIN_24H_VOLUME:
+        last_vol = float(df1['volume'].iloc[-1]) if 'volume' in df1.columns else 0.0
+        if last_vol < MIN_24H_VOLUME:
             return None
 
         # orderbook + spread
-        ob = fetch_orderbook_safe(ex, symbol_n)
-        spread = calc_spread(ob)
+        ob = fetch_orderbook_safe(ex, symbol_n, limit=50)
+        spread = calc_spread_from_ob(ob)
         if spread > MAX_SPREAD_PCT:
             return None
 
-        # S/R filter
-        pivots = support_resistance_levels(df1)
-        entry = float(df1["close"].iloc[-1])
-        if s_r_conflict(entry, pivots):
+        # S/R + gainers filter
+        if not passes_sr_filter(df1):
+            return None
+        if not passes_gainers_filter(symbol_n):
             return None
 
-        # compute score
-        score, reasons = compute_score(df1, df5, ob, spread)
+        # scoring
+        score, reasons = compute_score_and_reasons(df1, df5, ob, spread)
         if score < MIN_SIGNAL_SCORE:
             return None
 
-        # cooldown check
-        # same coin 30–60 min block
-        if score >= THRESH_QUICK:
-            mode = "QUICK"
-        elif score >= THRESH_MID:
-            mode = "MID"
-        else:
-            mode = "TREND"
-
-        key = cooldown_key_for(symbol_n, mode)
-        if _cd_mgr.is_cooled(key):
-            return None   # skip same coin too soon
-
-        # build final signal
-        sig = build_signal(symbol_n, df1, df5, ob, score, reasons)
-
-        # set cooldown
-        _cd_mgr.set_cooldown(key, mode)
-
+        # build signal
+        sig = build_signal_from_df(symbol_n, df1, df5, ob, score, reasons)
         return sig
 
     except Exception as e:
-        LOG.exception(f"analyze_coin error {symbol}: {e}")
+        LOG.exception("analyze_coin error %s: %s", symbol, e)
         return None
 
 
