@@ -1,6 +1,7 @@
-ccxt==4.1.85
-pandas==2.1.1
-requests==2.31.0
-python-telegram-bot==20.5
-numpy==1.26.4
+ccxt
+pandas
+numpy
+redis
+requests
 python-dotenv
+aiohttp
