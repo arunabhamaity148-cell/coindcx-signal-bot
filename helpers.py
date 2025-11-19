@@ -1,20 +1,47 @@
-# helpers.py — FINAL CLEAN (redis-free) for ArunBot
+# helpers.py — FINAL CLEAN (Redis-free, MTF, liquidity, buy/sell, emoji messages)
 from __future__ import annotations
-import os, time, json, math, logging
+import os, time, json, math, logging, requests
 from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
-
 try:
     import ccxt
 except Exception:
     ccxt = None
 
-import requests
-from dotenv import load_dotenv
-load_dotenv()
+# env
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+NOTIFY_ONLY = os.getenv("NOTIFY_ONLY", "True").lower() in ("1","true","yes")
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "binance")
+QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
 
+SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "20"))
+LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "5"))
+MAX_EMITS_PER_LOOP = int(os.getenv("MAX_EMITS_PER_LOOP", "1"))
+
+MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "85"))
+THRESH_QUICK = float(os.getenv("THRESH_QUICK", "92"))
+THRESH_MID = float(os.getenv("THRESH_MID", "85"))
+THRESH_TREND = float(os.getenv("THRESH_TREND", "72"))
+
+MIN_24H_VOLUME = float(os.getenv("MIN_24H_VOLUME", "250000"))  # on quote currency units
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.004"))  # 0.4%
+
+COOLDOWN_JSON = os.getenv("COOLDOWN_PERSIST_PATH", "cooldown.json")
+
+# TTLs (seconds)
+TTL_QUICK = int(os.getenv("COOLDOWN_QUICK_S", "1800"))   # 30m
+TTL_MID   = int(os.getenv("COOLDOWN_MID_S", "1800"))     # 30m (user wanted 30m same-coin)
+TTL_TREND = int(os.getenv("COOLDOWN_TREND_S", "3600"))   # 60m
+
+# indicators
+EMA_FAST = 20
+EMA_SLOW = 50
+EMA_LONG = 200
+
+# logging
 LOG = logging.getLogger("helpers")
 if not LOG.handlers:
     h = logging.StreamHandler()
@@ -23,73 +50,32 @@ if not LOG.handlers:
 LOG.setLevel(os.getenv("HELPERS_LOG_LEVEL", "INFO"))
 
 # -----------------------------
-# Config (env)
-# -----------------------------
-NOTIFY_ONLY = os.getenv("NOTIFY_ONLY", "True").lower() in ("1","true","yes")
-AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "False").lower() in ("1","true","yes")
-EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "binance")
-QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
-
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "20"))
-LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "5"))
-MAX_EMITS_PER_LOOP = int(os.getenv("MAX_EMITS_PER_LOOP", "1"))
-
-MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "90"))   # stricter default
-THRESH_QUICK = float(os.getenv("THRESH_QUICK", "95"))
-THRESH_MID = float(os.getenv("THRESH_MID", "90"))
-THRESH_TREND = float(os.getenv("THRESH_TREND", "82"))
-
-MIN_24H_VOLUME = float(os.getenv("MIN_24H_VOLUME", "250000"))   # base filter
-VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "2.2"))  # last candle vs avg*mult
-
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.002"))  # 0.2% default stricter
-
-COOLDOWN_JSON = os.getenv("COOLDOWN_PERSIST_PATH", "cooldown.json")
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-OHLCV_MAX_RETRIES = int(os.getenv("OHLCV_MAX_RETRIES", "3"))
-OHLCV_RETRY_DELAY = float(os.getenv("OHLCV_RETRY_DELAY", "0.8"))
-RATE_LIMIT_PAUSE = float(os.getenv("RATE_LIMIT_PAUSE", "0.6"))
-
-# Indicator params
-EMA_FAST = int(os.getenv("EMA_FAST", "20"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
-EMA_LONG = int(os.getenv("EMA_LONG", "200"))
-
-# TTL defaults (seconds) — same-coin cooldown per mode
-TTL_QUICK = int(os.getenv("COOLDOWN_QUICK_S", "900"))   # 15m
-TTL_MID   = int(os.getenv("COOLDOWN_MID_S", "1800"))    # 30m
-TTL_TREND = int(os.getenv("COOLDOWN_TREND_S", "3600"))  # 60m
-
-# -----------------------------
-# Local cooldown manager (JSON only)
+# Cooldown (local JSON only)
 # -----------------------------
 class CooldownManager:
-    def __init__(self, path: str = COOLDOWN_JSON):
-        self.path = path
-        self.map: Dict[str,int] = {}
-        self._load()
-        LOG.info("CooldownManager: using local JSON fallback (%s)", self.path)
+    def __init__(self):
+        self._local_map: Dict[str,int] = {}
+        self._load_local()
+        LOG.info("CooldownManager: using local JSON fallback (%s)", COOLDOWN_JSON)
 
-    def _load(self):
+    def _load_local(self):
         try:
-            with open(self.path,"r") as f:
-                self.map = {k:int(v) for k,v in json.load(f).items()}
+            with open(COOLDOWN_JSON, "r") as f:
+                data = json.load(f)
+            self._local_map = {k:int(v) for k,v in data.items()}
         except Exception:
-            self.map = {}
+            self._local_map = {}
 
-    def _save(self):
+    def _save_local(self):
         try:
-            with open(self.path + ".tmp","w") as f:
-                json.dump(self.map, f)
-            os.replace(self.path + ".tmp", self.path)
+            with open(COOLDOWN_JSON + ".tmp","w") as f:
+                json.dump(self._local_map, f)
+            os.replace(COOLDOWN_JSON + ".tmp", COOLDOWN_JSON)
         except Exception as e:
-            LOG.warning("CooldownManager save failed: %s", e)
+            LOG.warning("CooldownManager: failed to save local json: %s", e)
 
     def _ttl_for_mode(self, mode: str) -> int:
-        m = (mode or "").lower()
+        m = mode.lower()
         if m == "quick": return TTL_QUICK
         if m == "mid": return TTL_MID
         return TTL_TREND
@@ -97,28 +83,27 @@ class CooldownManager:
     def set_cooldown(self, key: str, mode: str) -> bool:
         ttl = self._ttl_for_mode(mode)
         now = int(time.time())
-        exp = self.map.get(key, 0)
+        exp = self._local_map.get(key, 0)
         if exp <= now:
-            self.map[key] = now + ttl
-            self._save()
+            self._local_map[key] = now + ttl
+            self._save_local()
             return True
         return False
 
     def is_cooled(self, key: str) -> bool:
         now = int(time.time())
-        exp = self.map.get(key)
+        exp = self._local_map.get(key)
         if not exp: return False
         if exp <= now:
-            self.map.pop(key, None)
-            self._save()
+            self._local_map.pop(key, None)
+            self._save_local()
             return False
         return True
 
-    def clear(self, key: str):
-        self.map.pop(key, None)
-        self._save()
+_cd_mgr = CooldownManager()
 
-_cd = CooldownManager()
+def cooldown_key_for(pair: str, mode: str) -> str:
+    return f"{pair.upper()}::{mode.upper()}"
 
 # -----------------------------
 # Exchange helpers
@@ -128,15 +113,10 @@ def get_exchange(api_keys: bool = False) -> "ccxt.Exchange":
         raise RuntimeError("ccxt not installed")
     ex_name = EXCHANGE_NAME.lower()
     try:
-        if ex_name == "binance":
-            ex = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
-        else:
-            ex_cls = getattr(ccxt, ex_name, None)
-            ex = ex_cls({'enableRateLimit': True}) if ex_cls else ccxt.binance({'enableRateLimit': True})
+        ex_cls = getattr(ccxt, ex_name, ccxt.binance)
+        ex = ex_cls({'enableRateLimit': True})
     except Exception:
         ex = ccxt.binance({'enableRateLimit': True})
-    if api_keys and os.getenv("EXCHANGE_API_KEY") and os.getenv("EXCHANGE_API_SECRET"):
-        ex.apiKey = os.getenv("EXCHANGE_API_KEY"); ex.secret = os.getenv("EXCHANGE_API_SECRET")
     try:
         ex.load_markets()
     except Exception:
@@ -150,7 +130,7 @@ def normalize_symbol(sym: str) -> str:
     return s
 
 # -----------------------------
-# OHLCV fetch (sync) with retries
+# OHLCV fetch + df helper
 # -----------------------------
 def df_from_ohlcv(ohlcv) -> Optional[pd.DataFrame]:
     if not ohlcv: return None
@@ -163,19 +143,18 @@ def df_from_ohlcv(ohlcv) -> Optional[pd.DataFrame]:
     if df.empty: return None
     return df
 
-def fetch_ohlcv_with_retry_sync(ex: "ccxt.Exchange", symbol: str, timeframe: str = "1m", limit: int = 200) -> Optional[pd.DataFrame]:
+def fetch_ohlcv_sync(ex: "ccxt.Exchange", symbol: str, timeframe: str="1m", limit: int=200, retries:int=3) -> Optional[pd.DataFrame]:
     s = normalize_symbol(symbol)
     last_exc = None
-    for attempt in range(OHLCV_MAX_RETRIES):
+    for attempt in range(retries):
         try:
             data = ex.fetch_ohlcv(s, timeframe=timeframe, limit=limit)
-            time.sleep(RATE_LIMIT_PAUSE)
+            time.sleep(0.2)
             return df_from_ohlcv(data)
         except Exception as e:
             last_exc = e
-            LOG.debug("fetch_ohlcv attempt %d failed for %s: %s", attempt+1, s, e)
-            time.sleep(OHLCV_RETRY_DELAY * (attempt+1))
-    LOG.warning("fetch_ohlcv failed for %s after %d attempts: %s", s, OHLCV_MAX_RETRIES, last_exc)
+            time.sleep(0.3 * (attempt+1))
+    LOG.debug("fetch_ohlcv failed for %s: %s", s, last_exc)
     return None
 
 # -----------------------------
@@ -201,25 +180,34 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     return tr.rolling(length, min_periods=1).mean().bfill()
 
 # -----------------------------
-# Orderbook & spread
+# Orderbook & liquidity
 # -----------------------------
-def fetch_orderbook_safe_sync(ex: "ccxt.Exchange", symbol: str, limit: int = 50) -> dict:
+def fetch_orderbook_safe(ex: "ccxt.Exchange", symbol: str, limit: int = 50) -> dict:
     try:
         ob = ex.fetch_order_book(normalize_symbol(symbol), limit=limit)
-        time.sleep(RATE_LIMIT_PAUSE)
+        time.sleep(0.15)
         return ob or {}
     except Exception:
-        LOG.debug("fetch_orderbook failed for %s", symbol)
         return {}
 
-def orderbook_imbalance_from_ob(ob: dict, depth_levels: int = 12) -> float:
+def orderbook_imbalance_from_ob(ob: dict, depth_levels:int=12) -> float:
     bids = ob.get('bids', []); asks = ob.get('asks', [])
-    bid_vol = sum([float(x[1]) for x in bids[:depth_levels]])
-    ask_vol = sum([float(x[1]) for x in asks[:depth_levels]])
+    bid_vol = sum([float(x[1]) for x in bids[:depth_levels]]) if bids else 0.0
+    ask_vol = sum([float(x[1]) for x in asks[:depth_levels]]) if asks else 0.0
     total = bid_vol + ask_vol + 1e-12
     return (bid_vol - ask_vol) / total
 
-def calc_spread_from_orderbook(ob: dict) -> float:
+def liquidity_score(ob: dict) -> float:
+    # simple liquidity score: (top 5 depth total size) / (avg of top 20 size)
+    bids = ob.get('bids', [])
+    asks = ob.get('asks', [])
+    top = (sum([float(x[1]) for x in bids[:5]]) + sum([float(x[1]) for x in asks[:5]])) / 2.0 if (bids or asks) else 0.0
+    deeper = (sum([float(x[1]) for x in bids[:20]]) + sum([float(x[1]) for x in asks[:20]])) / 2.0 if (bids or asks) else 1.0
+    if deeper == 0: return 0.0
+    score = min(1.0, top / (deeper + 1e-12))
+    return round(score,3)
+
+def calc_spread_from_ob(ob: dict) -> float:
     try:
         bid = float(ob['bids'][0][0])
         ask = float(ob['asks'][0][0])
@@ -228,66 +216,70 @@ def calc_spread_from_orderbook(ob: dict) -> float:
         return 999.0
 
 # -----------------------------
-# Filters & helpers (MTF)
+# Scoring (MTF + liquidity + volume + OBI + spread)
 # -----------------------------
-def btc_stable_from_df(df: pd.DataFrame) -> bool:
-    p = df['close'].pct_change().abs().tail(6).mean()
-    return p < 0.0018
-
-def danger_zone_check(entry: float, sl: float, atr_val: float) -> bool:
-    return abs(entry - sl) < (0.6 * atr_val)
-
-# -----------------------------
-# Scoring engine (MTF: uses 1m + 5m)
-# -----------------------------
-def compute_score_and_reasons(df1m: pd.DataFrame, df5m: pd.DataFrame, ob_imb: float, spread: float) -> Tuple[float, List[str]]:
+def compute_score_and_reasons(df_1m: pd.DataFrame, df_5m: pd.DataFrame, ob: dict, spread: float) -> Tuple[float, List[str]]:
     reasons: List[str] = []
-    if df1m is None or df5m is None or len(df1m) < 30 or len(df5m) < 20:
+    if df_1m is None or df_1m.empty:
         return 0.0, ["insufficient_data"]
-    close = df1m['close']
+    close1 = df_1m['close']
     score = 40.0
 
-    # EMA alignment (use 1m and 5m)
-    e20_1 = ema(close, EMA_FAST).iloc[-1]
-    e50_1 = ema(close, EMA_SLOW).iloc[-1]
-    e200_1 = ema(close, EMA_LONG).iloc[-1]
+    # MTF EMA alignment: 1m + 5m both confirm => stronger
+    e20_1 = ema(close1, EMA_FAST).iloc[-1]
+    e50_1 = ema(close1, EMA_SLOW).iloc[-1]
+    e20_5 = ema(df_5m['close'], EMA_FAST).iloc[-1] if df_5m is not None else e20_1
+    e50_5 = ema(df_5m['close'], EMA_SLOW).iloc[-1] if df_5m is not None else e50_1
+
+    # EMA alignment scoring (MTF)
     if e20_1 > e50_1:
         score += 10; reasons.append("EMA20>50_1m")
-    if e20_1 > e200_1:
-        score += 6; reasons.append("EMA20>200_1m")
-
-    # 5m confirmation (trend higher weight)
-    c5 = df5m['close']
-    e20_5 = ema(c5, EMA_FAST).iloc[-1]
-    e50_5 = ema(c5, EMA_SLOW).iloc[-1]
+    else:
+        reasons.append("EMA20<=50_1m")
     if e20_5 > e50_5:
-        score += 12; reasons.append("EMA20>50_5m")
+        score += 8; reasons.append("EMA20>50_5m")
+    else:
+        reasons.append("EMA20<=50_5m")
 
-    # MACD-like
-    macd_val = (ema(close, 12) - ema(close, 26)).iloc[-1]
+    # MACD-ish on 1m
+    macd_val = (ema(close1,12) - ema(close1,26)).iloc[-1]
     if macd_val > 0:
         score += 10; reasons.append("MACD_pos")
+    else:
+        reasons.append("MACD_neg")
 
-    # RSI (1m)
-    r = float(rsi(close).iloc[-1])
+    # RSI on 1m
+    r = float(rsi(close1).iloc[-1])
     if 40 < r < 70:
         score += 6; reasons.append("RSI_ok")
     elif r <= 40:
         score += 2; reasons.append("RSI_low")
+    else:
+        score += 1; reasons.append("RSI_high")
 
-    # volume spike (1m vs 20-avg)
-    vol = df1m['volume']
-    vol_avg = vol.rolling(20, min_periods=1).mean().iloc[-1] or 1.0
-    if vol.iloc[-1] > vol_avg * VOLUME_MULTIPLIER:
+    # Volume spike (compare to 20-window on 1m)
+    vol = df_1m['volume']; vol_avg = vol.rolling(20, min_periods=1).mean().iloc[-1] or 1.0
+    if vol.iloc[-1] > vol_avg * 1.6:
         score += 12; reasons.append("Vol_spike")
     else:
         reasons.append("Vol_ok")
 
-    # orderbook & spread
+    # orderbook imbalance and liquidity
+    ob_imb = orderbook_imbalance_from_ob(ob)
     if ob_imb > 0.55:
-        score += 8; reasons.append("OB_buy_pressure")
+        score += 6; reasons.append("OB_buy_pressure")
+    elif ob_imb < -0.55:
+        score += 6; reasons.append("OB_sell_pressure")
+
+    liq = liquidity_score(ob)
+    if liq > 0.55:
+        score += 8; reasons.append("Liquidity_ok")
+    else:
+        reasons.append("Liquidity_low")
+
+    # spread
     if spread <= MAX_SPREAD_PCT:
-        score += 8; reasons.append("Spread_ok")
+        score += 6; reasons.append("Spread_ok")
     else:
         reasons.append("Spread_high")
 
@@ -295,12 +287,21 @@ def compute_score_and_reasons(df1m: pd.DataFrame, df5m: pd.DataFrame, ob_imb: fl
     return round(score,1), reasons
 
 # -----------------------------
-# Signal builder
+# Signal builder (BUY + SELL, symmetric)
 # -----------------------------
-def build_signal_from_df(symbol: str, df1m: pd.DataFrame, df5m: pd.DataFrame, ob: dict, score: float, reasons: List[str]) -> Dict[str,Any]:
-    last = df1m.iloc[-1]
+def build_signal_from_df(symbol: str, df_1m: pd.DataFrame, df_5m: pd.DataFrame, ob: dict, score: float, reasons: List[str]) -> Dict[str,Any]:
+    last = df_1m.iloc[-1]
     entry = float(last['close'])
-    atr_val = float(atr(df1m).iloc[-1]) if not atr(df1m).empty else 0.0
+    atr_val = float(atr(df_1m).iloc[-1]) if not atr(df_1m).empty else 0.0
+
+    # direction by EMA cross + orderbook imbalance
+    e20 = ema(df_1m['close'], EMA_FAST).iloc[-1]
+    e50 = ema(df_1m['close'], EMA_SLOW).iloc[-1]
+    ob_imb = orderbook_imbalance_from_ob(ob)
+
+    direction = "BUY"
+    if e20 < e50 or ob_imb < -0.45:
+        direction = "SELL"
 
     mode = "MID"
     if score >= THRESH_QUICK: mode = "QUICK"
@@ -308,20 +309,24 @@ def build_signal_from_df(symbol: str, df1m: pd.DataFrame, df5m: pd.DataFrame, ob
     else: mode = "TREND"
 
     if mode == "QUICK":
-        tp = entry + atr_val*1.2
-        sl = entry - atr_val*0.9
+        tp_off = atr_val * 1.5
+        sl_off = atr_val * 1.0
     elif mode == "TREND":
-        tp = entry + atr_val*3.5
-        sl = entry - atr_val*2.2
+        tp_off = atr_val * 3.0
+        sl_off = atr_val * 2.0
     else:
-        tp = entry + atr_val*2.2
-        sl = entry - atr_val*1.4
+        tp_off = atr_val * 2.0
+        sl_off = atr_val * 1.4
 
-    direction = "BUY"
-    if ema(df1m['close'], EMA_FAST).iloc[-1] < ema(df1m['close'], EMA_SLOW).iloc[-1]:
-        direction = "SELL"
-        tp = entry - (tp - entry)
-        sl = entry + (entry - sl)
+    if direction == "BUY":
+        tp = entry + tp_off
+        sl = entry - sl_off
+    else:
+        tp = entry - tp_off
+        sl = entry + sl_off
+
+    # suggested leverage (only suggestion)
+    lev = "25x" if mode=="MID" else ("50x" if mode=="QUICK" else "20x")
 
     danger = (round(entry - atr_val*1.1,8), round(entry + atr_val*1.1,8))
     return {
@@ -335,31 +340,32 @@ def build_signal_from_df(symbol: str, df1m: pd.DataFrame, df5m: pd.DataFrame, ob
         "direction": direction,
         "reasons": reasons,
         "danger": danger,
+        "lev_suggest": lev,
         "ts": int(time.time())
     }
 
 # -----------------------------
-# Telegram formatting & sender
+# Formatter & Telegram sender
 # -----------------------------
 def format_signal_message(sig: Dict[str,Any]) -> str:
     em = "🔥" if sig['mode']=="MID" else ("⚡" if sig['mode']=="QUICK" else "🚀")
+    dir_emoji = "⬆️" if sig['direction']=="BUY" else "⬇️"
     dz_low, dz_high = sig.get("danger", (0,0))
     reason = ", ".join(sig.get("reasons", []))
-    lev_sugg = os.getenv("AUTO_LEVERAGE_SUGGEST", "25x")
     return (
-        f"{em} <b>{sig['direction']} SIGNAL — {sig['mode']}</b>\n"
+        f"{em} <b>{dir_emoji} {sig['direction']} SIGNAL — {sig['mode']}</b>\n"
         f"Pair: <b>{sig['pair']}</b>\n"
         f"Entry: <code>{sig['entry']}</code>\n"
         f"TP: <code>{sig['tp']}</code>   SL: <code>{sig['sl']}</code>\n"
-        f"Leverage: <b>{lev_sugg}</b>\n"
+        f"Leverage: <b>{sig['lev_suggest']}</b>\n"
         f"Score: <b>{sig['score']}</b>\n"
         f"ATR: {sig['atr']}\n"
-        f"Reason: {reason}\n"
         f"⚠️ Danger Zone: <code>{dz_low}</code> - <code>{dz_high}</code>\n"
+        f"Reason: {reason}\n"
         f"Time: {pd.to_datetime(sig['ts'], unit='s').strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
-def send_telegram_message(msg: str, preview: bool = False) -> bool:
+def send_telegram_message(msg: str) -> bool:
     if NOTIFY_ONLY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         LOG.info("Telegram preview (NOT SENT):\n%s", msg)
         return True
@@ -376,11 +382,12 @@ def send_telegram_message(msg: str, preview: bool = False) -> bool:
         return False
 
 # -----------------------------
-# Top-level analyze (sync) - name analyze_coin (used by main)
+# Top-level analyzer
 # -----------------------------
 def analyze_coin(ex: "ccxt.Exchange", symbol: str) -> Optional[Dict[str,Any]]:
     try:
         norm = normalize_symbol(symbol)
+        # quick market existence
         try:
             ex.load_markets()
             if norm not in ex.markets:
@@ -389,51 +396,28 @@ def analyze_coin(ex: "ccxt.Exchange", symbol: str) -> Optional[Dict[str,Any]]:
         except Exception:
             pass
 
-        # fetch 1m + 5m (MTF)
-        df1 = fetch_ohlcv_with_retry_sync(ex, norm, timeframe="1m", limit=200)
-        df5 = fetch_ohlcv_with_retry_sync(ex, norm, timeframe="5m", limit=200)
-        if df1 is None or df5 is None:
+        df1 = fetch_ohlcv_sync(ex, norm, timeframe="1m", limit=200)
+        df5 = fetch_ohlcv_sync(ex, norm, timeframe="5m", limit=200)
+
+        if df1 is None or df1.empty:
             return None
 
-        # quick volume filter (use last candle vs avg * multiplier)
+        # volume filter: use 1m last volume scaled to quote if exchange uses quote differently — assume raw
         last_vol = float(df1['volume'].iloc[-1]) if 'volume' in df1.columns and not df1['volume'].empty else 0.0
-        vol_avg_20 = float(df1['volume'].rolling(20, min_periods=1).mean().iloc[-1] or 1.0)
-        if last_vol < MIN_24H_VOLUME and last_vol < (vol_avg_20 * VOLUME_MULTIPLIER):
-            LOG.debug("%s skip: low vol last %.1f avg20*mult %.1f", norm, last_vol, vol_avg_20 * VOLUME_MULTIPLIER)
-            return None
+        if last_vol < MIN_24H_VOLUME:
+            LOG.debug("%s skip: low vol %.1f", norm, last_vol); return None
 
-        # orderbook & spread
-        ob = fetch_orderbook_safe_sync(ex, norm, limit=30)
-        ob_imb = orderbook_imbalance_from_ob(ob)
-        spread = calc_spread_from_orderbook(ob)
+        ob = fetch_orderbook_safe(ex, norm, limit=50)
+        spread = calc_spread_from_ob(ob)
         if spread > MAX_SPREAD_PCT:
-            LOG.debug("%s skip: spread %.6f > max %.6f", norm, spread, MAX_SPREAD_PCT)
-            return None
+            LOG.debug("%s skip: spread %.6f > max %.6f", norm, spread, MAX_SPREAD_PCT); return None
 
-        # score
-        score, reasons = compute_score_and_reasons(df1, df5, ob_imb, spread)
+        score, reasons = compute_score_and_reasons(df1, df5, ob, spread)
         if score < MIN_SIGNAL_SCORE:
-            LOG.debug("%s skip: score %.1f < min %.1f", norm, score, MIN_SIGNAL_SCORE)
-            return None
+            LOG.debug("%s skip: score %.1f < min %.1f", norm, score, MIN_SIGNAL_SCORE); return None
 
         sig = build_signal_from_df(norm, df1, df5, ob, score, reasons)
         return sig
     except Exception as e:
         LOG.exception("analyze_coin error %s: %s", symbol, e)
         return None
-
-def cooldown_key_for(sig_or_pair: Any, mode: Optional[str]=None) -> str:
-    if isinstance(sig_or_pair, dict):
-        pair = sig_or_pair.get("pair") or sig_or_pair.get("symbol")
-    else:
-        pair = sig_or_pair
-    m = mode or (sig_or_pair.get("mode") if isinstance(sig_or_pair, dict) else "MID")
-    return f"{normalize_symbol(pair)}::{m.upper()}"
-
-def preview_signal_log(sig: Dict[str,Any]):
-    try:
-        LOG.info("→ SIGNAL %s | mode=%s score=%.1f entry=%s tp=%s sl=%s",
-                 sig.get("pair"), sig.get("mode"), sig.get("score"),
-                 sig.get("entry"), sig.get("tp"), sig.get("sl"))
-    except Exception:
-        LOG.info("→ SIGNAL (preview failed)")
