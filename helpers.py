@@ -1,13 +1,14 @@
-import os, time, logging, requests, math
+# ============================
+# helpers.py — FINAL VERSION
+# Stable, Redis-free, Lightweight
+# ============================
+
+import os, time, math, logging
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, List, Optional
-from dotenv import load_dotenv
-
-# external
 import ccxt
-
-load_dotenv()
+import requests
+from datetime import datetime
 
 LOG = logging.getLogger("helpers")
 if not LOG.handlers:
@@ -16,276 +17,193 @@ if not LOG.handlers:
     LOG.addHandler(h)
 LOG.setLevel("INFO")
 
-# -----------------------
-# CONFIG
-# -----------------------
-EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "binance")
-QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
+# -------- ENV --------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
+MIN_SCORE = 85
+TH_Q = 92
+TH_M = 85
+TH_T = 72
+COOLDOWN = 30 * 60     # 30 min
+_last_send = {}        # cooldown map
 
-MIN_SIGNAL_SCORE = 85
-THRESH_QUICK = 92
-THRESH_MID   = 85
-THRESH_TREND = 72
 
-MIN_VOL = 150000
-MAX_SPREAD = 0.004
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-NOTIFY_ONLY = os.getenv("NOTIFY_ONLY", "True").lower() in ("1","true")
-
-EMA_FAST = 20
-EMA_SLOW = 50
-EMA_LONG = 200
-
-# ------------------------------------------
-# EXCHANGE
-# ------------------------------------------
+# ------- Exchange -------
 def get_exchange():
-    ex_name = EXCHANGE_NAME.lower()
-    if ex_name == "binance":
-        ex = ccxt.binance({'enableRateLimit': True})
-    else:
-        ex = getattr(ccxt, ex_name, ccxt.binance)({'enableRateLimit': True})
-
+    ex = ccxt.binance({'enableRateLimit': True})
     try:
         ex.load_markets()
     except:
         pass
     return ex
 
-def normalize_symbol(s):
-    s = s.upper().strip()
-    if "/" not in s:
-        s = f"{s}/{QUOTE_ASSET}"
-    return s
 
-# ------------------------------------------
-# FETCH OHLCV
-# ------------------------------------------
-def df_from_ohlcv(data):
-    if not data:
-        return None
-    df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df.set_index("ts", inplace=True)
-    return df
+# ------- Indicators -------
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def rsi(s, n=14):
+    d = s.diff()
+    u = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+    v = -d.clip(upper=0).ewm(alpha=1/n, adjust=False).mean()
+    rs = u / (v + 1e-9)
+    return 100 - 100/(1+rs)
 
-def fetch_ohlcv(ex, symbol, tf="1m", lim=200):
-    sym = normalize_symbol(symbol)
-    try:
-        data = ex.fetch_ohlcv(sym, timeframe=tf, limit=lim)
-        time.sleep(0.4)
-        return df_from_ohlcv(data)
-    except:
-        return None
-
-# ------------------------------------------
-# INDICATORS
-# ------------------------------------------
-def ema(s, span):
-    return s.ewm(span=span, adjust=False).mean()
-
-def rsi(series, length=14):
-    delta = series.diff()
-    up = delta.clip(lower=0).ewm(alpha=1/length, adjust=False).mean()
-    down = -delta.clip(upper=0).ewm(alpha=1/length, adjust=False).mean()
-    rs = up/(down+1e-12)
-    return 100 - (100/(1+rs))
-
-def atr(df, length=14):
-    h = df["high"]; l = df["low"]; c = df["close"]
+def atr(df, n=14):
+    h,l,c = df['high'], df['low'], df['close']
     prev = c.shift(1)
     tr = pd.concat([
-        (h-l),
-        (h-prev).abs(),
-        (l-prev).abs()
+        h - l,
+        (h - prev).abs(),
+        (l - prev).abs()
     ], axis=1).max(axis=1)
-    return tr.rolling(length, min_periods=1).mean().bfill()
+    return tr.rolling(n).mean().bfill()
 
-# ------------------------------------------
-# ORDERBOOK
-# ------------------------------------------
-def fetch_orderbook(ex, symbol):
+
+# ------- Telegram -------
+def send_telegram_message(msg: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        LOG.info("Telegram message preview (not sent)\n" + msg)
+        return True
     try:
-        ob = ex.fetch_order_book(normalize_symbol(symbol), limit=20)
-        time.sleep(0.4)
-        return ob
-    except:
-        return {}
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }, timeout=10)
+        return True
+    except Exception as e:
+        LOG.warning("Telegram send fail: %s", e)
+        return False
 
-def spread_from_ob(ob):
+
+# ------- BTC Calm -------
+def btc_calm(ex):
     try:
-        bid = ob["bids"][0][0]
-        ask = ob["asks"][0][0]
-        return abs(ask - bid)/ask
+        df = ex.fetch_ohlcv("BTC/USDT", "1m", limit=20)
+        df = pd.DataFrame(df, columns=["ts","open","high","low","close","vol"])
+        df['close'] = pd.to_numeric(df['close'])
+        vol = df['close'].pct_change().abs().tail(8).mean()
+        return vol < 0.002          # stable
     except:
-        return 999
+        return True
 
-# ------------------------------------------
-# BTC STABILITY
-# ------------------------------------------
-def btc_stable(ex):
-    df = fetch_ohlcv(ex, "BTC/USDT", "1m", 30)
-    if df is None: return False
-    vol = df["close"].pct_change().abs().tail(8).mean()
-    return vol < 0.0018
 
-# ------------------------------------------
-# SCORE ENGINE
-# ------------------------------------------
-def compute_score(df, ob_spread):
-    reasons = []
-    close = df["close"]
-
+# ------- Score -------
+def compute_score(df):
+    close = df['close']
+    e20 = ema(close, 20).iloc[-1]
+    e50 = ema(close, 50).iloc[-1]
+    e200 = ema(close, 200).iloc[-1]
     score = 40
-    e20 = ema(close, EMA_FAST).iloc[-1]
-    e50 = ema(close, EMA_SLOW).iloc[-1]
-    e200 = ema(close, EMA_LONG).iloc[-1]
+    reasons = []
 
-    if e20 > e50:
-        score += 12; reasons.append("EMA20>50")
-    else:
-        reasons.append("EMA20<=50")
+    if e20 > e50: score += 12; reasons.append("EMA20>50")
+    if e20 > e200: score += 8; reasons.append("EMA20>200")
 
-    if e20 > e200:
-        score += 8; reasons.append("EMA20>200")
-
-    macd_val = (ema(close,12) - ema(close,26)).iloc[-1]
-    if macd_val > 0:
-        score += 10; reasons.append("MACD_pos")
+    macd = (ema(close,12) - ema(close,26)).iloc[-1]
+    if macd > 0: score += 12; reasons.append("MACD_pos")
 
     r = rsi(close).iloc[-1]
-    if 40 < r < 70:
-        score += 8; reasons.append("RSI_ok")
+    if 40 < r < 70: score += 8; reasons.append("RSI_ok")
 
-    vol = df["volume"]
-    avg = vol.rolling(20).mean().iloc[-1]
-    if vol.iloc[-1] > avg*1.5:
+    vol = df['volume']
+    if vol.iloc[-1] > vol.rolling(20).mean().iloc[-1] * 1.5:
         score += 10; reasons.append("Vol_spike")
-
-    if ob_spread <= MAX_SPREAD:
-        score += 6; reasons.append("Spread_ok")
 
     return min(score,100), reasons
 
-# ------------------------------------------
-# BUILD SIGNAL
-# ------------------------------------------
-def build_signal(symbol, df, score, reasons):
-    close = df["close"].iloc[-1]
-    atr_val = atr(df).iloc[-1]
 
-    if score >= THRESH_QUICK: mode = "QUICK"
-    elif score >= THRESH_MID: mode = "MID"
+# ------- TP/SL by MODE -------
+def calc_tp_sl(entry, atr_v, mode):
+    if mode == "QUICK":   # super fast
+        tp = entry + atr_v * 1.2
+        sl = entry - atr_v * 0.8
+    elif mode == "TREND":
+        tp = entry + atr_v * 3.2
+        sl = entry - atr_v * 1.8
+    else: # MID
+        tp = entry + atr_v * 2.1
+        sl = entry - atr_v * 1.0
+    return round(tp,8), round(sl,8)
+
+
+# ------- Cooldown -------
+def cooled(sym):
+    now = time.time()
+    if sym not in _last_send: return True
+    return (now - _last_send[sym]) > COOLDOWN
+
+
+# ------- Analyze -------
+def analyze_coin(ex, symbol):
+    if not cooled(symbol):
+        return None
+
+    try:
+        df = ex.fetch_ohlcv(symbol, "1m", limit=200)
+    except:
+        return None
+
+    df = pd.DataFrame(df, columns=["ts","open","high","low","close","volume"])
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df[c])
+
+    if df.empty: return None
+
+    score, reasons = compute_score(df)
+    if score < MIN_SCORE:
+        return None
+
+    # mode select
+    if score >= TH_Q: mode = "QUICK"
+    elif score >= TH_M: mode = "MID"
     else: mode = "TREND"
 
-    if mode == "QUICK":
-        tp = close + atr_val*1.4
-        sl = close - atr_val*0.9
-    elif mode == "MID":
-        tp = close + atr_val*2.0
-        sl = close - atr_val*1.2
-    else:
-        tp = close + atr_val*2.8
-        sl = close - atr_val*1.6
+    entry = df['close'].iloc[-1]
+    atr_v = float(atr(df).iloc[-1])
+    tp, sl = calc_tp_sl(entry, atr_v, mode)
 
-    # BUY/SELL detection
     direction = "BUY"
-    e20 = ema(df["close"],20).iloc[-1]
-    e50 = ema(df["close"],50).iloc[-1]
-    if e20 < e50:
+    if ema(df['close'],20).iloc[-1] < ema(df['close'],50).iloc[-1]:
         direction = "SELL"
-        tp = close - (tp - close)
-        sl = close + (close - sl)
+        tp = entry - (tp-entry)
+        sl = entry + (entry-sl)
 
-    danger_low  = round(close - atr_val*1.1,8)
-    danger_high = round(close + atr_val*1.1,8)
+    _last_send[symbol] = time.time()
 
     return {
-        "pair": symbol,
+        "symbol": symbol,
         "mode": mode,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
         "score": score,
-        "entry": round(close,8),
-        "tp": round(tp,8),
-        "sl": round(sl,8),
-        "atr": round(atr_val,8),
+        "atr": atr_v,
         "direction": direction,
-        "danger": (danger_low, danger_high),
-        "reasons": reasons
+        "reasons": reasons,
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     }
 
-# ------------------------------------------
-# ANALYZE SYMBOL
-# ------------------------------------------
-def analyze_symbol(ex, symbol):
-    sym = normalize_symbol(symbol)
 
-    # Market check
-    try:
-        if sym not in ex.markets:
-            return None
-    except:
-        pass
-
-    df = fetch_ohlcv(ex, symbol, "1m", 200)
-    if df is None or df.empty:
-        return None
-
-    # volume last candle
-    if df["volume"].iloc[-1] < MIN_VOL:
-        return None
-
-    # orderbook spread
-    ob = fetch_orderbook(ex, symbol)
-    spread = spread_from_ob(ob)
-    if spread > MAX_SPREAD:
-        return None
-
-    score, reasons = compute_score(df, spread)
-    if score < MIN_SIGNAL_SCORE:
-        return None
-
-    return build_signal(sym, df, score, reasons)
-
-# ------------------------------------------
-# TELEGRAM
-# ------------------------------------------
-def send_telegram(msg):
-    if NOTIFY_ONLY:
-        LOG.info("Telegram Preview:\n%s", msg)
-        return True
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        LOG.warning("Telegram missing keys")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        return r.status_code == 200
-    except:
-        return False
-
-# ------------------------------------------
-# FORMAT MSG
-# ------------------------------------------
-def format_msg(sig):
+# ------- Format Telegram -------
+def format_signal_message(sig):
     em = "⚡" if sig["mode"]=="QUICK" else ("🔥" if sig["mode"]=="MID" else "🚀")
-    d1, d2 = sig["danger"]
-
     return (
         f"{em} <b>{sig['direction']} SIGNAL — {sig['mode']}</b>\n"
-        f"Pair: <b>{sig['pair']}</b>  Score: <b>{sig['score']}</b>\n"
+        f"Pair: <b>{sig['symbol']}</b>\n"
         f"Entry: <code>{sig['entry']}</code>\n"
         f"TP: <code>{sig['tp']}</code>   SL: <code>{sig['sl']}</code>\n"
-        f"Qty: (manual)  Size: (manual)  Lev: (manual)\n"
-        f"⚠️ Danger Zone: <code>{d1}</code> — <code>{d2}</code> (ATR={sig['atr']})\n"
-        f"Reason: {', '.join(sig['reasons'])}"
+        f"Leverage: <b>{auto_leverage(sig['mode'])}x</b>\n"
+        f"Score: <b>{sig['score']}</b>\n"
+        f"ATR: {sig['atr']}\n"
+        f"Reason: {', '.join(sig['reasons'])}\n"
+        f"Time: {sig['time']} UTC"
     )
+
+
+# ------- Auto Leverage -------
+def auto_leverage(mode):
+    if mode=="QUICK": return 35
+    if mode=="MID":   return 25
+    return 10
