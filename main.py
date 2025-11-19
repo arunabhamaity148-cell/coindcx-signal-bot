@@ -1,5 +1,5 @@
 # main.py
-# ASCII SAFE VERSION ONLY - FINAL 24/7 RAILWAY VERSION WITH SAFE RUNNER
+# ASCII SAFE VERSION ONLY - FINAL 24/7 RAILWAY VERSION WITH SAFE RUNNER + PORT FIX
 
 import asyncio
 import logging
@@ -9,11 +9,13 @@ from typing import List, Dict, Any
 import aiohttp
 from dotenv import load_dotenv
 
-# FastAPI server to keep Railway container alive
 from fastapi import FastAPI
 import uvicorn
-
 import threading
+
+# -----------------------------------------------------------
+# FASTAPI SERVER TO KEEP RAILWAY CONTAINER RUNNING
+# -----------------------------------------------------------
 
 app = FastAPI()
 
@@ -21,20 +23,32 @@ app = FastAPI()
 def root():
     return {"status": "running"}
 
-# Load environment variables
+# -----------------------------------------------------------
+# ENVIRONMENT VARIABLES
+# -----------------------------------------------------------
+
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PING_URL = os.getenv("PING_URL")
 
-# Helpers import
+# -----------------------------------------------------------
+# IMPORT HELPERS
+# -----------------------------------------------------------
+
 from helpers import run_all_modes, format_signal, multi_override_watch
 
-# Logging setup
+# -----------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# HTTP session cache
+# -----------------------------------------------------------
+# GLOBAL HTTP SESSION
+# -----------------------------------------------------------
+
 _http_session = None
 
 async def get_session():
@@ -49,20 +63,28 @@ async def close_session():
         await _http_session.close()
         _http_session = None
 
-# Telegram sender
+# -----------------------------------------------------------
+# TELEGRAM MESSAGE SENDER
+# -----------------------------------------------------------
+
 async def tg_send(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Telegram token or chat id not set.")
+        logger.error("Telegram token or chat ID missing.")
         return
+
     url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+
     try:
         sess = await get_session()
         await sess.post(url, data=payload, timeout=10)
     except Exception as e:
         logger.error("Telegram send error: " + str(e))
 
-# Spam protection (5 min per pair)
+# -----------------------------------------------------------
+# SPAM PROTECTION (5 MIN)
+# -----------------------------------------------------------
+
 LAST_ALERT = {}
 
 def can_alert(symbol: str) -> bool:
@@ -74,7 +96,10 @@ def can_alert(symbol: str) -> bool:
 def mark_alert(symbol: str):
     LAST_ALERT[symbol] = int(time.time())
 
-# Send formatted signals
+# -----------------------------------------------------------
+# SEND SIGNALS
+# -----------------------------------------------------------
+
 async def send_signals(signals: List[Dict[str, Any]]):
     for sig in signals:
         try:
@@ -83,13 +108,17 @@ async def send_signals(signals: List[Dict[str, Any]]):
                 mark_alert(sig["symbol"])
                 await asyncio.sleep(1)
         except Exception as e:
-            logger.error("Error sending signal for " + sig.get("symbol", "unknown") + ": " + str(e))
+            logger.error("Error sending signal: " + str(e))
 
-# Keepalive ping task to prevent Railway sleep
+# -----------------------------------------------------------
+# KEEPALIVE PING
+# -----------------------------------------------------------
+
 async def keepalive_ping():
     if not PING_URL:
-        logger.info("PING_URL not set. Keepalive disabled.")
+        logger.info("PING_URL not set. Disable keepalive.")
         return
+
     logger.info("Keepalive ping active.")
     while True:
         try:
@@ -99,59 +128,78 @@ async def keepalive_ping():
             pass
         await asyncio.sleep(60)
 
-# Main trading engine
+# -----------------------------------------------------------
+# TRADING ENGINE LOOP
+# -----------------------------------------------------------
+
 async def engine():
     logger.info("ENGINE STARTED - BALANCED MODE (10-15 alerts/day)")
     while True:
         try:
             all_modes = await run_all_modes()
-            signals = all_modes.get("quick", []) + all_modes.get("mid", []) + all_modes.get("trend", [])
+
+            signals = (
+                all_modes.get("quick", []) +
+                all_modes.get("mid", []) +
+                all_modes.get("trend", [])
+            )
 
             if len(signals) > 0:
                 await send_signals(signals)
 
-                # Override danger watcher (uses helpers.multi_override_watch)
                 alerts = await multi_override_watch(signals)
                 for a in alerts:
                     await tg_send(a)
 
         except Exception as e:
-            logger.error("Engine cycle error: " + str(e))
+            logger.error("Engine error: " + str(e))
 
         await asyncio.sleep(20)
 
-# Start web server function (uvicorn)
-def start_web():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# -----------------------------------------------------------
+# START WEB SERVER (PORT FIX FOR RAILWAY)
+# -----------------------------------------------------------
 
-# Async starter that runs engine and optional ping
+def start_web():
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# -----------------------------------------------------------
+# START EVERYTHING
+# -----------------------------------------------------------
+
 async def start_all():
-    task_engine = asyncio.create_task(engine())
-    task_ping = None
+    t_engine = asyncio.create_task(engine())
+    t_ping = None
 
     if PING_URL:
-        task_ping = asyncio.create_task(keepalive_ping())
+        t_ping = asyncio.create_task(keepalive_ping())
 
-    if task_ping:
-        await asyncio.gather(task_engine, task_ping)
+    if t_ping:
+        await asyncio.gather(t_engine, t_ping)
     else:
-        await asyncio.gather(task_engine)
+        await asyncio.gather(t_engine)
 
-# safe_runner wrapper - keep process alive if engine crashes
+# -----------------------------------------------------------
+# SAFE RUNNER (AUTO RESTART IF ENGINE RETURNS)
+# -----------------------------------------------------------
+
 async def safe_runner():
     while True:
         try:
             await start_all()
-            # if start_all returns (unexpected), sleep and restart
-            logger.warning("start_all() returned unexpectedly. Restarting in 5s.")
+            logger.warning("start_all returned unexpectedly. Restarting.")
             await asyncio.sleep(5)
         except Exception as e:
-            logger.error("safe_runner caught exception: " + str(e))
-            # wait a bit before restart to avoid crash-loop
+            logger.error("safe_runner exception: " + str(e))
             await asyncio.sleep(5)
 
+# -----------------------------------------------------------
+# MAIN ENTRY POINT
+# -----------------------------------------------------------
+
 if __name__ == "__main__":
-    # start UVicorn server thread
+
     server_thread = threading.Thread(target=start_web)
     server_thread.daemon = True
     server_thread.start()
