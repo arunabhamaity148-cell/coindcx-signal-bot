@@ -1,5 +1,9 @@
 import time
 import logging
+import os
+import threading
+import requests
+
 from helpers import (
     get_exchange,
     analyze_coin,
@@ -14,29 +18,43 @@ logging.basicConfig(
 LOG = logging.getLogger("main")
 
 # Scan settings
-SCAN_BATCH_SIZE = 20        # একেকবারে কয়টা coin scan করবে
-LOOP_SLEEP_SECONDS = 5      # batch scan → sleep → next batch
-MAX_EMITS_PER_LOOP = 1      # প্রতি loop এ কয়টা signal allow
+SCAN_BATCH_SIZE = 20
+LOOP_SLEEP_SECONDS = 5
+MAX_EMITS_PER_LOOP = 1
 
 
+# ---------------------------------------------------
+# 🔥 SELF KEEP-ALIVE (Railway Idle বন্ধ করবে)
+# ---------------------------------------------------
+def self_keepalive():
+    try:
+        url = os.getenv("RAILWAY_PUBLIC_URL", "")
+        if url:
+            requests.get(url, timeout=5)     # hit itself
+            LOG.info("🔄 KeepAlive Ping Sent")
+    except Exception as e:
+        LOG.warning(f"KeepAlive Error: {e}")
+
+    threading.Timer(120, self_keepalive).start()  # every 2 min
+
+
+# ---------------------------------------------------
+# 🔥 MAIN SCANNER LOOP
+# ---------------------------------------------------
 def main_loop():
     ex = get_exchange()
     LOG.info("🚀 ArunBot Pro Scanner Started")
 
     while True:
         try:
-            # সব market names load করা
             markets = list(ex.markets.keys())
             symbols = [s for s in markets if s.endswith("/USDT")]
-
             total = len(symbols)
 
-            # batch-by-batch scan
             for idx in range(0, total, SCAN_BATCH_SIZE):
                 batch = symbols[idx:idx + SCAN_BATCH_SIZE]
 
                 emits = 0
-
                 for sym in batch:
                     sig = analyze_coin(ex, sym)
 
@@ -50,7 +68,6 @@ def main_loop():
                             f"dir={sig['direction']} | score={sig['score']}"
                         )
 
-                        # এক loop এ একটার বেশি signal allow না
                         if emits >= MAX_EMITS_PER_LOOP:
                             break
 
@@ -66,5 +83,12 @@ def main_loop():
             time.sleep(3)
 
 
+# ---------------------------------------------------
+# 🔥 START
+# ---------------------------------------------------
 if __name__ == "__main__":
+    # keepalive start here
+    self_keepalive()
+
+    # main scanner start
     main_loop()
