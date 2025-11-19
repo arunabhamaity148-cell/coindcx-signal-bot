@@ -626,3 +626,315 @@ __all__ = [
     "danger_watch", "multi_override_watch",
     "format_signal", "format_exit_alert"
 ]
+# -------------------------
+# UPGRADE PACK (helpers.py)
+# ASCII SAFE
+# -------------------------
+
+import math
+import asyncio
+import time
+from typing import Dict, Any, List
+
+# safe-get helpers (use existing implementations if present)
+def _safe_get(name: str, default=None):
+    return globals().get(name, default)
+
+logger = _safe_get("logger", None)
+if logger is None:
+    import logging as _logging
+    logger = _logging.getLogger("helpers-upgrade")
+    logger.setLevel(_logging.INFO)
+
+# Attempt to use existing fetch_ohlcv / fetch_orderbook / fetch_funding if available
+fetch_ohlcv = _safe_get("fetch_ohlcv")
+fetch_orderbook = _safe_get("fetch_orderbook")
+fetch_funding = _safe_get("fetch_funding")
+format_signal = _safe_get("format_signal")  # optional formatter for telegram
+
+# -------------------------
+# 1) HTF ALIGNMENT CHECK
+# returns True if 15m and 1h EMAs agree for direction
+# expecting ohlcv frames (list of dicts or pandas DataFrame) — be defensive
+# -------------------------
+def _to_pd(df_like):
+    try:
+        import pandas as pd
+        if isinstance(df_like, pd.DataFrame):
+            return df_like
+        # if list of dicts -> convert
+        return pd.DataFrame(df_like)
+    except Exception as e:
+        logger.debug("pandas missing or conversion failed: %s", str(e))
+        return None
+
+def htf_alignment(ohlcv_15m, ohlcv_1h, ema_short=20, ema_long=50) -> bool:
+    """
+    Return True if direction aligned (both short>long or both short<long)
+    Defensive: returns True if cannot compute (prefer allowing signals rather than blocking).
+    """
+    try:
+        df15 = _to_pd(ohlcv_15m)
+        df60 = _to_pd(ohlcv_1h)
+        if df15 is None or df60 is None or len(df15) < ema_long or len(df60) < ema_long:
+            logger.debug("htf_alignment: insufficient data, allowing by default")
+            return True
+
+        def ema(series, span):
+            return series.ewm(span=span, adjust=False).mean()
+
+        s15 = ema(df15["close"], ema_short).iloc[-1]
+        l15 = ema(df15["close"], ema_long).iloc[-1]
+        s60 = ema(df60["close"], ema_short).iloc[-1]
+        l60 = ema(df60["close"], ema_long).iloc[-1]
+
+        dir15 = 1 if s15 > l15 else -1
+        dir60 = 1 if s60 > l60 else -1
+        aligned = dir15 == dir60
+        logger.debug("htf_alignment: dir15=%s dir60=%s aligned=%s", dir15, dir60, aligned)
+        return aligned
+    except Exception as e:
+        logger.warning("htf_alignment failed: %s", str(e))
+        return True
+
+# -------------------------
+# 2) LIQUIDITY SWEEP DETECTOR
+# looks for large wick beyond body and volume context
+# returns dict with boolean + reason
+# -------------------------
+def detect_liquidity_sweep(ohlcv, wick_ratio_threshold=2.5, body_threshold=0.002) -> Dict[str, Any]:
+    """
+    ohlcv: pandas DataFrame or list of dicts with keys: open, high, low, close, volume
+    returns { 'sweep': bool, 'reason': str }
+    """
+    try:
+        df = _to_pd(ohlcv)
+        if df is None or len(df) < 3:
+            return {"sweep": False, "reason": "insufficient_data"}
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        body = abs(last["close"] - last["open"])
+        upper_wick = last["high"] - max(last["open"], last["close"])
+        lower_wick = min(last["open"], last["close"]) - last["low"]
+        avg_vol = df["volume"].rolling(10, min_periods=1).mean().iloc[-2]
+        vol = last["volume"]
+
+        # big wick relative to body and previous volatility
+        if body <= 0:
+            return {"sweep": False, "reason": "zero_body"}
+
+        wick_ratio = max(upper_wick, lower_wick) / (body + 1e-12)
+        vol_spike = vol > max(1.5 * avg_vol, 1e-6)
+
+        if wick_ratio >= wick_ratio_threshold and vol_spike:
+            direction = "upper" if upper_wick > lower_wick else "lower"
+            reason = f"wick_ratio={wick_ratio:.2f}, vol_spike={vol_spike}, dir={direction}"
+            logger.info("liquidity_sweep detected: %s", reason)
+            return {"sweep": True, "reason": reason, "direction": direction}
+
+        return {"sweep": False, "reason": "none"}
+    except Exception as e:
+        logger.warning("detect_liquidity_sweep failed: %s", str(e))
+        return {"sweep": False, "reason": "error"}
+
+# -------------------------
+# 3) SUDDEN SPIKE DETECTOR (volume + price)
+# -------------------------
+def detect_sudden_spike(ohlcv, vol_multiplier=3.0, price_move_pct=0.01) -> Dict[str, Any]:
+    """
+    returns { 'spike': bool, 'reason': str }
+    """
+    try:
+        df = _to_pd(ohlcv)
+        if df is None or len(df) < 10:
+            return {"spike": False, "reason": "insufficient_data"}
+
+        last = df.iloc[-1]
+        prev_avg_vol = df["volume"].rolling(10, min_periods=5).mean().iloc[-2]
+        vol_spike = last["volume"] > max(prev_avg_vol * vol_multiplier, 1e-6)
+        price_move = abs(last["close"] - df["close"].iloc[-2]) / (df["close"].iloc[-2] + 1e-12)
+
+        if vol_spike and price_move >= price_move_pct:
+            reason = f"vol_mult={(last['volume']/max(prev_avg_vol,1e-12)):.2f}, price_move={price_move:.3f}"
+            logger.info("sudden_spike detected: %s", reason)
+            return {"spike": True, "reason": reason, "price_move": price_move, "vol_mult": last["volume"]/max(prev_avg_vol,1e-12)}
+        return {"spike": False, "reason": "none"}
+    except Exception as e:
+        logger.warning("detect_sudden_spike failed: %s", str(e))
+        return {"spike": False, "reason": "error"}
+
+# -------------------------
+# 4) SL-BEFORE-TOUCH CHECK
+# This checks active signals and orderbook distance to liquidation/SL
+# returns list of warning messages (strings)
+# -------------------------
+async def sl_before_touch_check(active_signals: List[Dict[str, Any]]) -> List[str]:
+    """
+    active_signals: list of dicts expected to include keys:
+       symbol, entry, sl, leverage (optional), position_size (optional)
+    This function will fetch orderbook (if available) and compute distance.
+    """
+    warnings = []
+    if not active_signals:
+        return warnings
+
+    # try to use fetch_orderbook if available
+    for sig in active_signals:
+        try:
+            symbol = sig.get("symbol") or sig.get("pair") or sig.get("market")
+            if not symbol:
+                continue
+            sl = float(sig.get("sl", 0))
+            entry = float(sig.get("entry", 0))
+            if sl == 0 or entry == 0:
+                continue
+
+            # compute percent distance from entry to SL
+            dist_pct = abs(entry - sl) / (entry + 1e-12)
+            # safe thresholds (if SL very close)
+            if dist_pct <= 0.006:  # 0.6% distance
+                # optionally check orderbook top levels to see liquidity
+                ob_ok = True
+                if fetch_orderbook:
+                    try:
+                        ob = await fetch_orderbook(symbol, depth=5)
+                        # expected ob format: {"bids":[[price,size],...],"asks":[...]}
+                        top_bid = float(ob.get("bids", [[0,0]])[0][0]) if ob.get("bids") else 0
+                        top_ask = float(ob.get("asks", [[0,0]])[0][0]) if ob.get("asks") else 0
+                        # if book spread huge or top levels small, mark warning
+                        top_liq = (ob.get("bids",[])[0][1] if ob.get("bids") else 0) + (ob.get("asks",[])[0][1] if ob.get("asks") else 0)
+                        if top_liq < 0.5:  # small size on top
+                            ob_ok = False
+                    except Exception as oe:
+                        logger.debug("fetch_orderbook error: %s", str(oe))
+                        ob_ok = True
+                if not ob_ok:
+                    warnings.append(f"⚠️ SL CLOSE & LOW BOOK LIQUIDITY: {symbol} entry={entry} sl={sl} dist={dist_pct:.4f}")
+                else:
+                    warnings.append(f"⚠️ SL CLOSE: {symbol} entry={entry} sl={sl} dist={dist_pct:.4f}")
+        except Exception as e:
+            logger.debug("sl_before_touch_check item fail: %s", str(e))
+            continue
+    return warnings
+
+# -------------------------
+# 5) MULTI OVERRIDE WATCH (MAIN)
+# Accepts active_signals (list of dicts) and returns list of alert strings
+# -------------------------
+async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str]:
+    """
+    Main override watcher that protects capital.
+    Steps:
+      - run SL-before-touch checks
+      - for each signal check HTF alignment (if possible)
+      - detect liquidity sweep & sudden spike on symbol
+      - build alert messages (strings) and return list
+    """
+    alerts: List[str] = []
+    try:
+        if not isinstance(active_signals, list):
+            logger.warning("multi_override_watch: expected list, got %s", type(active_signals))
+            return alerts
+
+        # 1) SL-before-touch global check
+        sl_warns = await sl_before_touch_check(active_signals)
+        alerts.extend(sl_warns)
+
+        # 2) per-signal checks
+        for sig in active_signals:
+            try:
+                symbol = sig.get("symbol") or sig.get("pair") or sig.get("market")
+                if not symbol:
+                    continue
+
+                # fetch ohlcv for 1m, 15m, 1h — use fetch_ohlcv if available
+                ohlcv_1m = None
+                ohlcv_15m = None
+                ohlcv_1h = None
+                if fetch_ohlcv:
+                    try:
+                        ohlcv_1m = await fetch_ohlcv(symbol, "1m", 80)
+                        ohlcv_15m = await fetch_ohlcv(symbol, "15m", 80)
+                        ohlcv_1h = await fetch_ohlcv(symbol, "1h", 80)
+                    except Exception as e:
+                        logger.debug("fetch_ohlcv error for %s: %s", symbol, str(e))
+
+                # HTF alignment
+                htf_ok = True
+                if ohlcv_15m is not None and ohlcv_1h is not None:
+                    htf_ok = htf_alignment(ohlcv_15m, ohlcv_1h)
+                    if not htf_ok:
+                        alerts.append(f"⚠️ HTF MISALIGN: {symbol} — skip or review (15m vs 1h conflict)")
+
+                # liquidity sweep check on 1m or 15m
+                sweep = {"sweep": False}
+                if ohlcv_1m is not None:
+                    sweep = detect_liquidity_sweep(ohlcv_1m)
+                if sweep.get("sweep"):
+                    alerts.append(f"⚠️ LIQ SWEEP: {symbol} — {sweep.get('reason')}")
+
+                # sudden spike check on 1m
+                spike = {"spike": False}
+                if ohlcv_1m is not None:
+                    spike = detect_sudden_spike(ohlcv_1m)
+                if spike.get("spike"):
+                    alerts.append(f"⚠️ SUDDEN SPIKE: {symbol} — {spike.get('reason')}")
+
+                # combine into formatted override alert if any critical found
+                critical = []
+                if not htf_ok:
+                    critical.append("HTF_MISALIGN")
+                if sweep.get("sweep"):
+                    critical.append("LIQ_SWEEP")
+                if spike.get("spike"):
+                    critical.append("SUDDEN_SPIKE")
+
+                if critical:
+                    # build a premium red alert message string
+                    parts = [
+                        "🚨 ACTION: EXIT NOW — PROTECT CAPITAL",
+                        f"Pair: {symbol}",
+                        f"Issues: {', '.join(critical)}",
+                        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+                    ]
+                    # include signal details if available
+                    if isinstance(sig, dict):
+                        entry = sig.get("entry")
+                        tp = sig.get("tp") or sig.get("tps")
+                        sl = sig.get("sl")
+                        if entry:
+                            parts.append(f"Entry: {entry}")
+                        if tp:
+                            parts.append(f"TP: {tp}")
+                        if sl:
+                            parts.append(f"SL: {sl}")
+                    alert_text = "\n".join(parts)
+                    # format via format_signal if provided
+                    if callable(format_signal):
+                        try:
+                            alert_text = format_signal(sig, override_reason=", ".join(critical))
+                        except Exception:
+                            pass
+                    alerts.append(alert_text)
+
+            except Exception as e:
+                logger.debug("multi_override per-sig fail: %s", str(e))
+                continue
+
+        # return unique alerts (dedup)
+        unique = []
+        seen = set()
+        for a in alerts:
+            if a not in seen:
+                unique.append(a)
+                seen.add(a)
+        return unique
+
+    except Exception as e:
+        logger.error("multi_override_watch top-level error: %s", str(e))
+        return alerts
+
+# -------------------------
+# END UPGRADE PACK
+# -------------------------
