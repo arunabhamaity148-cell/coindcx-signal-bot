@@ -1,8 +1,5 @@
 # main.py
-# -------------------------------------------------------------
-# FINAL ASCII-SAFE MAIN ENGINE WITH KEEPALIVE PING
-# TELEGRAM SENDER - MODE SCAN - OVERRIDE GUARDIAN - KEEPALIVE
-# -------------------------------------------------------------
+# ASCII SAFE VERSION ONLY
 
 import asyncio
 import logging
@@ -12,33 +9,22 @@ from typing import List, Dict, Any
 import aiohttp
 from dotenv import load_dotenv
 
-# load env
+# Load env
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-PING_URL = os.getenv("PING_URL")  # e.g. https://yourapp.up.railway.app/
+PING_URL = os.getenv("PING_URL")
 
-# import helpers (assumes helpers.py is in same folder)
 from helpers import run_all_modes, format_signal, multi_override_watch
 
-# -------------------------------------------------------------
-# LOGGING
-# -------------------------------------------------------------
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------
-# VALIDATE ENV
-# -------------------------------------------------------------
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in .env. Telegram send will fail until set.")
+# HTTP session cache
+_http_session = None
 
-# -------------------------------------------------------------
-# HTTP SESSION (reuse)
-# -------------------------------------------------------------
-_http_session: aiohttp.ClientSession = None
-
-async def get_session() -> aiohttp.ClientSession:
+async def get_session():
     global _http_session
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession()
@@ -50,28 +36,22 @@ async def close_session():
         await _http_session.close()
         _http_session = None
 
-# -------------------------------------------------------------
-# TELEGRAM SENDER
-# -------------------------------------------------------------
+# Telegram sender
 async def tg_send(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Telegram credentials missing. Skipping send.")
+        logger.error("Telegram environment variables not set.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
     try:
         sess = await get_session()
-        async with sess.post(url, data=payload, timeout=10) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logger.error(f"Telegram send failed status={resp.status} text={text}")
+        async with sess.post(url, data=payload, timeout=10):
+            pass
     except Exception as e:
-        logger.error(f"Telegram send exception: {e}")
+        logger.error("Telegram send error: " + str(e))
 
-# -------------------------------------------------------------
-# SPAM PROTECTION (5 MIN PER PAIR)
-# -------------------------------------------------------------
-LAST_ALERT: Dict[str, int] = {}
+# Spam protection
+LAST_ALERT = {}
 
 def can_alert(symbol: str) -> bool:
     now = int(time.time())
@@ -82,91 +62,54 @@ def can_alert(symbol: str) -> bool:
 def mark_alert(symbol: str):
     LAST_ALERT[symbol] = int(time.time())
 
-# -------------------------------------------------------------
-# SEND SIGNALS ONE BY ONE (SAFE)
-# -------------------------------------------------------------
+# Send multiple signals
 async def send_signals(signals: List[Dict[str, Any]]):
     for sig in signals:
-        try:
-            if not can_alert(sig["symbol"]):
-                continue
-            msg = format_signal(sig)
-            await tg_send(msg)
+        if can_alert(sig["symbol"]):
+            await tg_send(format_signal(sig))
             mark_alert(sig["symbol"])
-            await asyncio.sleep(1)  # pacing to avoid rate limits
-        except Exception as e:
-            logger.error(f"Error sending signal for {sig.get('symbol')}: {e}")
+            await asyncio.sleep(1)
 
-# -------------------------------------------------------------
-# KEEPALIVE PING (prevents Railway/Render sleep)
-# -------------------------------------------------------------
+# Keepalive ping
 async def keepalive_ping():
     if not PING_URL:
-        logger.info("PING_URL not set. Keepalive ping disabled.")
+        logger.info("PING_URL not set. Keepalive disabled.")
         return
-    logger.info("Keepalive ping task started.")
     while True:
         try:
             sess = await get_session()
-            async with sess.get(PING_URL, timeout=10) as resp:
-                logger.debug(f"Ping to {PING_URL} returned {resp.status}")
-        except Exception as e:
-            logger.warning(f"Ping failed: {e}")
-        await asyncio.sleep(60)  # ping every 60 seconds
+            await sess.get(PING_URL, timeout=10)
+        except:
+            pass
+        await asyncio.sleep(60)
 
-# -------------------------------------------------------------
-# MAIN ENGINE LOOP
-# -------------------------------------------------------------
+# Engine loop
 async def engine():
-    logger.info("ENGINE STARTED - BALANCED MODE ACTIVE (10-15 alerts per day)")
+    logger.info("Engine started")
+    while True:
+        try:
+            all_modes = await run_all_modes()
+            signals = all_modes.get("quick", []) + all_modes.get("mid", []) + all_modes.get("trend", [])
+            if len(signals) > 0:
+                await send_signals(signals)
+                alerts = await multi_override_watch(signals)
+                for al in alerts:
+                    await tg_send(al)
+        except Exception as e:
+            logger.error("Engine error: " + str(e))
+        await asyncio.sleep(20)
 
-    try:
-        while True:
-            try:
-                # SCAN ALL MODES (quick, mid, trend)
-                all_modes = await run_all_modes()
-
-                # MERGE SIGNALS
-                signals = (
-                    all_modes.get("quick", []) +
-                    all_modes.get("mid", []) +
-                    all_modes.get("trend", [])
-                )
-
-                # SEND SIGNALS
-                if len(signals) > 0:
-                    await send_signals(signals)
-
-                    # OVERRIDE WATCH
-                    danger = await multi_override_watch(signals)
-                    for d in danger:
-                        await tg_send(d)
-
-            except Exception as e:
-                logger.error(f"ENGINE cycle error: {e}")
-
-            # WAIT BEFORE NEXT SCAN
-            await asyncio.sleep(20)
-
-    finally:
-        # cleanup session on stop
-        await close_session()
-
-# -------------------------------------------------------------
-# RUN BOTH ENGINE + PING IN PARALLEL
-# -------------------------------------------------------------
+# Start both engine + ping
 if __name__ == "__main__":
     async def start_all():
-        tasks = []
-        tasks.append(asyncio.create_task(engine()))
-        # start keepalive ping if PING_URL provided
+        t1 = asyncio.create_task(engine())
         if PING_URL:
-            tasks.append(asyncio.create_task(keepalive_ping()))
-        await asyncio.gather(*tasks)
+            t2 = asyncio.create_task(keepalive_ping())
+            await asyncio.gather(t1, t2)
+        else:
+            await asyncio.gather(t1)
 
     try:
         asyncio.run(start_all())
     except KeyboardInterrupt:
-        logger.info("Received exit. Shutting down...")
-    except Exception as e:
-        logger.error(f"Fatal error in main: {e}")
+        pass
