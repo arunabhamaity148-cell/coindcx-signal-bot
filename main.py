@@ -1,9 +1,8 @@
 import time
 import logging
-from datetime import datetime
 from helpers import (
     get_exchange,
-    analyze_coin,
+    analyze_symbol,          # ← FIXED
     format_signal_message,
     send_telegram_message,
 )
@@ -14,8 +13,8 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("main")
 
-SCAN_BATCH = 20
-SLEEP = 5
+SCAN_BATCH = 20        # প্রতি লুপে কয়টা কয়েন
+SLEEP = 5              # প্রতি ব্যাচের মধ্যে sleep
 
 
 def main_loop():
@@ -31,16 +30,17 @@ def main_loop():
                 batch = symbols[idx:idx + SCAN_BATCH]
 
                 emits = 0
+                LOG.info(f"Loop {idx//SCAN_BATCH + 1} | scanning batch size={len(batch)}")
+
                 for sym in batch:
-                    sig = analyze_coin(ex, sym)
+                    sig = analyze_symbol(ex, sym)   # ← FIXED
                     if sig:
                         emits += 1
                         msg = format_signal_message(sig)
                         send_telegram_message(msg)
                         LOG.info(f"EMIT → {sym} | mode={sig['mode']} score={sig['score']}")
 
-                LOG.info(f"Loop | scanned={len(batch)} emitted={emits} sleeping={SLEEP}")
-
+                LOG.info(f"Loop done | scanned={len(batch)} emitted={emits} | sleeping {SLEEP}s")
                 time.sleep(SLEEP)
 
         except Exception as e:
