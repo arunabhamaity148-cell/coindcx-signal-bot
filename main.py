@@ -1,36 +1,21 @@
 # main.py
-# Final runner for signal scanner (uses helpers.py)
-# - Single-file entrypoint that uses your helpers.py functions
-# - Reads coins.csv, loops in batches, honors cooldowns and NOTIFY_ONLY
-# - Designed to work with the helpers.py you provided
-# Save as main.py and run (python main.py)
+# Final runner that uses helpers.py (sync). Adds detailed loop logging:
+# - loop number, start_idx, scanned, emitted, sleeping seconds
+# - handles get_exchange / get_ex import flexibly
+# - uses CooldownManager (init_cooldown_manager) from helpers
+#
+# Save next to helpers.py and run: python main.py
 
 from __future__ import annotations
 import os
 import sys
 import time
-import csv
-import signal
-import asyncio
+import math
 import logging
-from typing import List, Optional
+import csv
+from typing import List
 
-# ensure project root is on path
-ROOT = os.path.dirname(os.path.abspath(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
-# import helpers (your helpers.py must be in same folder)
-from helpers import (
-    get_exchange,
-    analyze_symbol_sync,
-    init_cooldown_manager,
-    cooldown_key_for,
-    preview_signal_log,
-    send_telegram_message,
-)
-
-# basic logger
+# --- logging setup
 LOG = logging.getLogger("main")
 if not LOG.handlers:
     h = logging.StreamHandler()
@@ -38,169 +23,208 @@ if not LOG.handlers:
     LOG.addHandler(h)
 LOG.setLevel(os.getenv("MAIN_LOG_LEVEL", "INFO"))
 
-# config from env (mirrors helpers)
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "20"))
-LOOP_SLEEP_SECONDS = float(os.getenv("LOOP_SLEEP_SECONDS", "5"))
-MAX_EMITS_PER_LOOP = int(os.getenv("MAX_EMITS_PER_LOOP", "1"))
-COIN_CSV = os.getenv("COINS_CSV_PATH", "coins.csv")
-QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
-
-# Graceful shutdown flag
-_run = True
-def _handle_exit(signum, frame):
-    global _run
-    LOG.info("Shutdown signal received (%s). Stopping main loop...", signum)
-    _run = False
-
-signal.signal(signal.SIGINT, _handle_exit)
-signal.signal(signal.SIGTERM, _handle_exit)
-
-# helper: read coins.csv (first column header 'symbol', supports both SYMBOL or SYMBOL/USDT)
-def load_coins_from_csv(path: str) -> List[str]:
-    coins: List[str] = []
+# --- import helpers with graceful fallback for different names
+try:
+    # prefer the expected API
+    from helpers import (
+        init_cooldown_manager,
+        analyze_symbol_sync,
+        format_signal_message,
+        send_telegram_message,
+        preview_signal_log,
+        cooldown_key_for,
+        SCAN_BATCH_SIZE,
+        LOOP_SLEEP_SECONDS,
+        MAX_EMITS_PER_LOOP,
+    )
+    # attempt to import exchange factory (some helpers versions call get_exchange or get_ex)
     try:
-        with open(path, newline='', encoding='utf-8') as f:
-            rdr = csv.reader(f)
-            header = next(rdr, None)
-            # if header looks like symbol, continue; otherwise treat first row as data
-            # we accept simple lists like:
-            # symbol
-            # BTC
-            # ETH
-            # or full pairs like BTC/USDT
-            if header:
-                if len(header) == 1 and header[0].strip().lower() == "symbol":
-                    # header consumed, iterate remaining
-                    pass
-                else:
-                    # treat header as a coin entry if it doesn't look like header
-                    coins.append(header[0].strip())
-            for row in rdr:
-                if not row: continue
-                val = row[0].strip()
-                if not val: continue
-                # normalize: allow either 'BTC' or 'BTC/USDT'
-                if "/" not in val:
-                    val = f"{val}/{QUOTE_ASSET}"
-                coins.append(val)
-    except FileNotFoundError:
-        LOG.error("coins.csv not found at %s — create coins.csv with a `symbol` column", path)
+        from helpers import get_exchange as _get_exchange  # type: ignore
+    except Exception:
+        try:
+            from helpers import get_ex as _get_exchange  # type: ignore
+        except Exception:
+            _get_exchange = None
+except Exception as e:
+    LOG.exception("Failed to import helpers module: %s", e)
+    raise
+
+if _get_exchange is None:
+    LOG.warning("helpers.get_exchange / get_ex not found — will create exchange directly if needed.")
+
+
+def load_coins_csv(path: str = "coins.csv") -> List[str]:
+    coins = []
+    if not os.path.exists(path):
+        LOG.warning("coins.csv not found at %s", path)
+        return coins
+    try:
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row: 
+                    continue
+                # first column may be header 'symbol'
+                symbol = str(row[0]).strip()
+                if not symbol or symbol.lower() == "symbol":
+                    continue
+                coins.append(symbol.upper())
     except Exception as e:
         LOG.exception("Failed to read coins.csv: %s", e)
-    # dedupe preserving order
-    seen = set()
-    out = []
-    for c in coins:
-        up = c.upper()
-        if up in seen: continue
-        seen.add(up)
-        out.append(up)
-    return out
+    LOG.info("Loaded %d coins from %s", len(coins), path)
+    return coins
 
-async def main_loop():
-    LOG.info("Starting main loop")
-    # init exchange (no api keys by default)
+
+def create_exchange_instance():
+    if _get_exchange:
+        try:
+            ex = _get_exchange(api_keys=False)
+            LOG.info("Exchange created via helpers factory.")
+            return ex
+        except Exception as e:
+            LOG.warning("helpers exchange factory failed: %s", e)
+    # fallback: attempt to import ccxt and create a default binance exchange
     try:
-        ex = get_exchange(api_keys=False)
+        import ccxt
+        ex = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        try:
+            ex.load_markets()
+        except Exception:
+            LOG.debug("exchange.load_markets ignored/fail")
+        LOG.info("Exchange created via fallback ccxt.binance().")
+        return ex
     except Exception as e:
-        LOG.exception("Failed to create exchange instance: %s", e)
-        return
+        LOG.exception("Unable to create exchange: %s", e)
+        raise RuntimeError("Exchange creation failed") from e
 
-    # init cooldown manager (from helpers)
-    cd = await init_cooldown_manager()
 
-    # load coins
-    coins = load_coins_from_csv(COIN_CSV)
+def main_loop():
+    coins = load_coins_csv()
     if not coins:
-        LOG.error("No coins loaded. Exiting.")
+        LOG.error("No coins to scan. Place symbols in coins.csv (one per line). Exiting.")
         return
-    LOG.info("Loaded %d coins from %s", len(coins), COIN_CSV)
 
-    loop_idx = 0
-    while _run:
-        loop_idx += 1
-        LOG.info("Main loop #%d — scanning up to %d coins (start_idx=%d)", loop_idx, SCAN_BATCH_SIZE, (loop_idx-1)*SCAN_BATCH_SIZE)
-        emitted = 0
-        start_idx = ((loop_idx-1) * SCAN_BATCH_SIZE) % max(1, len(coins))
-        # create a view of coins for this loop (wrap-around)
-        batch = []
-        idx = start_idx
-        while len(batch) < SCAN_BATCH_SIZE and len(batch) < len(coins):
-            batch.append(coins[idx % len(coins)])
-            idx += 1
+    ex = create_exchange_instance()
 
-        for pair in batch:
-            if emitted >= MAX_EMITS_PER_LOOP:
-                LOG.debug("Max emits for this loop reached (%d). Breaking.", MAX_EMITS_PER_LOOP)
-                break
-            if not _run:
-                break
-            try:
-                # quick cooldown check - if cooled, skip; we want to emit only if not cooled
-                key_mid = cooldown_key_for(pair, "MID")
-                key_quick = cooldown_key_for(pair, "QUICK")
-                key_trend = cooldown_key_for(pair, "TREND")
-                # If any of the modes are still cooling, we still allow analysis but skip emission for that mode as needed.
-                # Run analysis (sync)
-                sig = analyze_symbol_sync(ex, pair)
-                if not sig:
-                    LOG.debug("No signal for %s", pair)
-                    continue
-
-                # check per-pair cooldown for this sig.mode
-                cd_key = cooldown_key_for(sig)
-                is_cooled = await cd.is_cooled(cd_key)
-                if is_cooled:
-                    LOG.debug("%s skipped: cooled (%s)", sig.get("pair"), cd_key)
-                    continue
-
-                # preview in logs
-                preview_signal_log(sig)
-
-                # try set cooldown (atomic-ish)
-                set_ok = await cd.set_cooldown(cd_key, sig.get("mode", "MID"))
-                if not set_ok:
-                    LOG.debug("%s cooldown set failed/other actor set it", sig.get("pair"))
-                    continue
-
-                # format and send message
-                msg = preview_signal_message(sig := sig) if False else None  # slip - for compatibility below
-                # use helpers.format_signal_message by calling send_telegram_message expects formatted text
-                from helpers import format_signal_message
-                text = format_signal_message(sig)
-                sent = send_telegram_message(text, preview=True)  # preview True will only log unless NOTIFY_ONLY env off
-                if sent:
-                    emitted += 1
-                    LOG.info("Emitted signal for %s mode=%s score=%.1f", sig.get("pair"), sig.get("mode"), sig.get("score"))
-                else:
-                    LOG.warning("Failed to send signal for %s", sig.get("pair"))
-            except Exception as e:
-                LOG.exception("Error while analyzing %s: %s", pair, e)
-                # continue scanning others
-
-        LOG.info("Loop %d done: scanned=%d emitted=%d sleeping=%.1fs", loop_idx, len(batch), emitted, LOOP_SLEEP_SECONDS)
-        # sleep but allow quick exit
-        slept = 0.0
-        while slept < LOOP_SLEEP_SECONDS and _run:
-            await asyncio.sleep(0.5)
-            slept += 0.5
-
-    LOG.info("Main loop exiting — persisting cooldown map if applicable and cleaning up.")
-    # no explicit cleanup required; helpers cooldown persists to local JSON if redis not used
-
-def preview_signal_message(sig):
-    # small wrapper to avoid circular import earlier — uses helpers.format_signal_message
+    # init cooldown manager
+    cd = None
     try:
-        from helpers import format_signal_message
-        return format_signal_message(sig)
-    except Exception:
-        return str(sig)
+        cd = init_cooldown_manager()
+        # init_cooldown_manager returns a coroutine or object depending on helpers implementation,
+        # call it if coroutine-like
+        if callable(getattr(cd, "__await__", None)):
+            # it's a coroutine function, await-like -> run on loop
+            import asyncio
+            cd = asyncio.run(cd)
+        LOG.info("Cooldown manager initialized.")
+    except Exception as e:
+        LOG.exception("Cooldown manager initialization failed: %s", e)
+        cd = None
+
+    loop_count = 0
+    batch = int(SCAN_BATCH_SIZE or 20)
+    sleep_s = float(LOOP_SLEEP_SECONDS or 5.0)
+    max_emits = int(MAX_EMITS_PER_LOOP or 1)
+
+    LOG.info("Starting main loop: batch=%d sleep=%.1fs max_emits=%d", batch, sleep_s, max_emits)
+
+    try:
+        while True:
+            loop_count += 1
+            emitted_total = 0
+            scanned_total = 0
+
+            # process in batches
+            for start_idx in range(0, len(coins), batch):
+                loop_start_time = time.time()
+                batch_coins = coins[start_idx:start_idx + batch]
+                LOG.info("Loop %d | start_idx=%d | scanning %d coins (batch)", loop_count, start_idx, len(batch_coins))
+
+                emitted_in_batch = 0
+                for symbol in batch_coins:
+                    scanned_total += 1
+                    try:
+                        sig = analyze_symbol_sync(ex, symbol)
+                    except Exception as e:
+                        LOG.exception("Error analyzing %s: %s", symbol, e)
+                        sig = None
+
+                    if sig is None:
+                        continue
+
+                    # cooldown key & check
+                    ckey = cooldown_key_for(sig.get("pair", symbol), sig.get("mode", None))
+                    cooled = False
+                    try:
+                        if cd:
+                            # cd.is_cooled may be coroutine or function
+                            is_cooled = cd.is_cooled(ckey)
+                            if callable(getattr(is_cooled, "__await__", None)):
+                                import asyncio
+                                is_cooled = asyncio.run(is_cooled)
+                            cooled = is_cooled
+                        else:
+                            cooled = False
+                    except Exception as e:
+                        LOG.warning("Cooldown check failed for %s: %s", ckey, e)
+                        cooled = False
+
+                    if cooled:
+                        LOG.debug("Skipping %s (%s) — cooled.", sig.get("pair"), sig.get("mode"))
+                        continue
+
+                    # emit signal
+                    try:
+                        preview_signal_log(sig)
+                        msg = format_signal_message(sig)
+                        sent = send_telegram_message(msg, preview=True)  # preview True by default; helpers handles NOTIFY_ONLY
+                        if sent:
+                            # set cooldown (async or sync)
+                            if cd:
+                                try:
+                                    res = cd.set_cooldown(ckey, sig.get("mode", "MID"))
+                                    if callable(getattr(res, "__await__", None)):
+                                        import asyncio
+                                        res = asyncio.run(res)
+                                except Exception as e:
+                                    LOG.warning("Failed to set cooldown for %s: %s", ckey, e)
+                            emitted_total += 1
+                            emitted_in_batch += 1
+                        else:
+                            LOG.warning("Telegram send failed for %s", sig.get("pair"))
+                    except Exception as e:
+                        LOG.exception("Failed to emit signal for %s: %s", symbol, e)
+
+                    # respect max emits per loop (global)
+                    if emitted_total >= max_emits:
+                        LOG.info("Max emits reached for this loop (max_emits=%d). Breaking batch.", max_emits)
+                        break
+
+                # batch done
+                elapsed = time.time() - loop_start_time
+                LOG.info(
+                    "Loop %d | batch start_idx=%d done — scanned=%d emitted=%d elapsed=%.2fs sleeping=%.2fs",
+                    loop_count, start_idx, scanned_total, emitted_total, elapsed, sleep_s
+                )
+
+                if emitted_total >= max_emits:
+                    break
+
+                # sleep between batches
+                time.sleep(sleep_s)
+
+            # full loop done
+            LOG.info("Loop %d complete — total_scanned=%d total_emitted=%d sleeping=%.2fs", loop_count, scanned_total, emitted_total, sleep_s)
+            # short pause before next full cycle
+            time.sleep(sleep_s)
+
+    except KeyboardInterrupt:
+        LOG.info("Shutdown requested by user (KeyboardInterrupt). Exiting cleanly.")
+    except Exception as e:
+        LOG.exception("Unexpected error in main loop: %s", e)
+    finally:
+        LOG.info("Main stopped.")
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        LOG.info("KeyboardInterrupt received — shutting down.")
-    except Exception as e:
-        LOG.exception("Fatal error in main: %s", e)
-        raise
+    main_loop()
