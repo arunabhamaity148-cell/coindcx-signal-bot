@@ -1,14 +1,15 @@
-# main.py
+# main.py — FINAL run loop + loop logging + emit-limit + cooldown check
 import time, logging
-from datetime import datetime
 from helpers import (
     get_exchange,
     analyze_coin,
     format_signal_message,
     send_telegram_message,
     cooldown_key_for,
-    _cd,  # cooldown manager instance from helpers
+    _cd_mgr,
+    MAX_EMITS_PER_LOOP,
 )
+from math import ceil
 
 LOG = logging.getLogger("main")
 if not LOG.handlers:
@@ -17,58 +18,58 @@ if not LOG.handlers:
     LOG.addHandler(h)
 LOG.setLevel(logging.INFO)
 
-SCAN_BATCH = int(__import__("os").environ.get("SCAN_BATCH_SIZE", "20"))
-SLEEP = float(__import__("os").environ.get("LOOP_SLEEP_SECONDS", "5"))
-MAX_EMITS = int(__import__("os").environ.get("MAX_EMITS_PER_LOOP", "1"))
+SCAN_BATCH = int(20)
+SLEEP = float(5.0)
 
 def main_loop():
     ex = get_exchange()
     LOG.info("🚀 ArunBot Pro Scanner Started")
-    loop_count = 0
-
+    loop_no = 0
     while True:
-        loop_count += 1
-        start_ts = time.time()
+        loop_no += 1
         try:
             markets = list(ex.markets.keys())
             symbols = [s for s in markets if s.endswith("/USDT")]
+            total = len(symbols)
+            if total == 0:
+                LOG.warning("No symbols found in exchange.markets")
+                time.sleep(10); continue
 
-            total_scanned = 0
-            total_emitted = 0
-
-            for idx in range(0, len(symbols), SCAN_BATCH):
-                batch = symbols[idx:idx + SCAN_BATCH]
+            # split into parts to show progress
+            parts = range(0, total, SCAN_BATCH)
+            for part_idx, start in enumerate(parts):
+                end = min(start + SCAN_BATCH, total)
+                batch = symbols[start:end]
                 emits = 0
+                LOG.info(f"Loop #{loop_no} part idx={start} | scanned={len(batch)} emitted={emits} sleeping={SLEEP}")
+
                 for sym in batch:
-                    total_scanned += 1
-                    sig = analyze_coin(ex, sym)
-                    if sig:
-                        key = cooldown_key_for(sig)
-                        if _cd.is_cooled(key):
-                            LOG.debug("Cooled: %s", key)
+                    if emits >= MAX_EMITS_PER_LOOP:
+                        break
+                    try:
+                        sig = analyze_coin(ex, sym)
+                        if not sig:
                             continue
-                        if emits >= MAX_EMITS:
-                            LOG.debug("Max emits reached for this loop")
-                            continue
-                        # emit
+                        key = cooldown_key_for(sig['pair'], sig['mode'])
+                        if _cd_mgr.is_cooled(key):
+                            LOG.info("Cooldown active skip %s %s", sig['pair'], sig['mode']); continue
+                        # set cooldown
+                        _cd_mgr.set_cooldown(key, sig['mode'])
+                        # send
                         msg = format_signal_message(sig)
                         ok = send_telegram_message(msg)
                         if ok:
-                            _cd.set_cooldown(key, sig.get("mode","MID"))
                             emits += 1
-                            total_emitted += 1
-                            LOG.info("EMIT → %s | mode=%s score=%.1f", sig.get("pair"), sig.get("mode"), sig.get("score"))
-                LOG.info("Loop #%d part idx=%d | scanned=%d emitted=%d sleeping=%.1f",
-                         loop_count, idx, len(batch), emits, SLEEP)
-                time.sleep(SLEEP)
+                            LOG.info(f"EMIT → {sig['pair']} | mode={sig['mode']} score={sig['score']}")
+                    except Exception as e:
+                        LOG.exception("Error processing %s: %s", sym, e)
 
-            elapsed = time.time() - start_ts
-            LOG.info("LOOP FINISHED #%d | scanned_total=%d emitted_total=%d elapsed=%.2fs",
-                     loop_count, total_scanned, total_emitted, elapsed)
+                LOG.info(f"Loop #{loop_no} part idx={start} | scanned={len(batch)} emitted={emits} sleeping={SLEEP}")
+                time.sleep(SLEEP)
 
         except Exception as e:
             LOG.exception("Main loop error: %s", e)
-            time.sleep(3)
+            time.sleep(5)
 
 if __name__ == "__main__":
     main_loop()
