@@ -531,8 +531,8 @@ def analyze_coin(ex, symbol):
             return None
 
         # fetch OHLCV
-        df1 = fetch_ohlcv_sync(ex, symbol_n, "1m", 200)
-        df5 = fetch_ohlcv_sync(ex, symbol_n, "5m", 200)
+        df1 = fetch_ohlcv_sync(ex, symbol_n, timeframe="1m", limit=200)
+df5 = fetch_ohlcv_sync(ex, symbol_n, timeframe="5m", limit=200)
 
         if df1 is None or df1.empty:
             return None
