@@ -1,5 +1,5 @@
 # main.py
-# ASCII SAFE VERSION ONLY - FINAL 24/7 RAILWAY VERSION
+# ASCII SAFE VERSION ONLY - FINAL 24/7 RAILWAY VERSION WITH SAFE RUNNER
 
 import asyncio
 import logging
@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 # FastAPI server to keep Railway container alive
 from fastapi import FastAPI
 import uvicorn
+
+import threading
 
 app = FastAPI()
 
@@ -108,7 +110,7 @@ async def engine():
             if len(signals) > 0:
                 await send_signals(signals)
 
-                # Override danger watcher
+                # Override danger watcher (uses helpers.multi_override_watch)
                 alerts = await multi_override_watch(signals)
                 for a in alerts:
                     await tg_send(a)
@@ -118,33 +120,44 @@ async def engine():
 
         await asyncio.sleep(20)
 
-# Start both engine + web server
+# Start web server function (uvicorn)
+def start_web():
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# Async starter that runs engine and optional ping
+async def start_all():
+    task_engine = asyncio.create_task(engine())
+    task_ping = None
+
+    if PING_URL:
+        task_ping = asyncio.create_task(keepalive_ping())
+
+    if task_ping:
+        await asyncio.gather(task_engine, task_ping)
+    else:
+        await asyncio.gather(task_engine)
+
+# safe_runner wrapper - keep process alive if engine crashes
+async def safe_runner():
+    while True:
+        try:
+            await start_all()
+            # if start_all returns (unexpected), sleep and restart
+            logger.warning("start_all() returned unexpectedly. Restarting in 5s.")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.error("safe_runner caught exception: " + str(e))
+            # wait a bit before restart to avoid crash-loop
+            await asyncio.sleep(5)
+
 if __name__ == "__main__":
-
-    async def start_all():
-        task_engine = asyncio.create_task(engine())
-        task_ping = None
-
-        if PING_URL:
-            task_ping = asyncio.create_task(keepalive_ping())
-
-        if task_ping:
-            await asyncio.gather(task_engine, task_ping)
-        else:
-            await asyncio.gather(task_engine)
-
-    # Start FastAPI server in a separate thread
-    import threading
-
-    def start_web():
-        uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    # start UVicorn server thread
     server_thread = threading.Thread(target=start_web)
     server_thread.daemon = True
     server_thread.start()
 
     try:
-        asyncio.run(start_all())
+        asyncio.run(safe_runner())
     except KeyboardInterrupt:
         pass
     except Exception as e:
