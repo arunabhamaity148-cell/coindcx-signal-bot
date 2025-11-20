@@ -1,6 +1,8 @@
-# helpers.py - unified version with Telegram + override watcher
+# helpers.py (Part 1 of 4)
+# -------------------------------------------------------------
+# BASIC IMPORTS, LOGGING, SESSION, OHLCV, TICKER, INDICATORS
+# -------------------------------------------------------------
 
-import os
 import asyncio
 import aiohttp
 import logging
@@ -13,45 +15,8 @@ import numpy as np
 # -------------------------------------------------------------
 # LOGGING SETUP
 # -------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-# -------------------------------------------------------------
-# TELEGRAM CONFIG
-# -------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-async def send_telegram(text: str) -> None:
-    """
-    Simple Telegram sender.
-    Uses TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from env.
-    """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("TELEGRAM CONFIG MISSING – skipping send")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=10) as resp:
-                body = await resp.text()
-                if resp.status != 200:
-                    logger.error("TELEGRAM SEND FAILED %s – %s", resp.status, body)
-                else:
-                    logger.info("TELEGRAM: send OK")
-    except Exception as e:
-        logger.error("TELEGRAM SEND EXCEPTION: %s", e)
 
 # -------------------------------------------------------------
 # BINANCE API URL
@@ -92,7 +57,7 @@ async def fetch_ohlcv(symbol: str, interval: str = "1m", limit: int = 200) -> pd
         df = df[["open","high","low","close","volume"]].astype(float)
         return df
     except Exception as e:
-        logger.error("OHLCV fetch failed for %s: %s", symbol, e)
+        logger.error(f"OHLCV fetch failed for {symbol}: {e}")
         return pd.DataFrame()
 
 # -------------------------------------------------------------
@@ -132,7 +97,7 @@ async def fetch_server_time() -> int:
     url = f"{BINANCE_BASE}/api/v3/time"
     try:
         data = await HTTPSession.get(url)
-        return int(data.get("serverTime", 0))
+        return data.get("serverTime", 0)
     except Exception:
         return 0
 
@@ -168,6 +133,12 @@ def atr(df: pd.DataFrame, length: int = 14):
 def vwap(df: pd.DataFrame):
     typical = (df['high'] + df['low'] + df['close']) / 3
     return (typical * df['volume']).cumsum() / df['volume'].cumsum()
+# helpers.py (Part 2 of 4)
+# -------------------------------------------------------------
+# ADVANCED FILTERS: BTC STABILITY + HTF PATTERNS + PRICE ACTION
+# -------------------------------------------------------------
+
+from typing import Dict, Any
 
 # -------------------------------------------------------------
 # BTC STABILITY CHECK
@@ -177,23 +148,30 @@ async def btc_stable() -> Dict[str, Any]:
     if df.empty:
         return {"ok": False, "reason": "BTC data error"}
 
-    close = df['close']
-    high = df['high']
-    low = df['low']
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
 
+    # volatility (last 10 candle range vs last close)
     vol = (high.tail(10).max() - low.tail(10).min()) / close.iloc[-1] * 100
 
+    # wick check (last candle)
     last_high = high.iloc[-1]
     last_low = low.iloc[-1]
     last_close = close.iloc[-1]
-    last_open = df['open'].iloc[-1]
+    last_open = df["open"].iloc[-1]
+
     upper_wick = last_high - max(last_close, last_open)
     lower_wick = min(last_close, last_open) - last_low
     wick_pct = (upper_wick + lower_wick) / last_close * 100
 
     stable = vol < 1 and wick_pct < 0.5
 
-    return {"ok": stable, "vol": vol, "wick": wick_pct}
+    return {
+        "ok": stable,
+        "vol": vol,
+        "wick": wick_pct,
+    }
 
 # -------------------------------------------------------------
 # HTF CANDLE PATTERN DETECTION (15m + 1h)
@@ -202,19 +180,24 @@ def detect_pattern(df: pd.DataFrame) -> str:
     if len(df) < 3:
         return "none"
 
-    o = df['open'].iloc[-1]
-    c = df['close'].iloc[-1]
-    h = df['high'].iloc[-1]
-    l = df['low'].iloc[-1]
+    o = df["open"].iloc[-1]
+    c = df["close"].iloc[-1]
+    h = df["high"].iloc[-1]
+    l = df["low"].iloc[-1]
 
-    if c > o and (c - o) > (h - l) * 0.6:
+    body = abs(c - o)
+    range_ = h - l
+
+    # basic engulf / hammer / shooting star
+    if c > o and body > range_ * 0.6:
         return "bull_engulf"
-    if o > c and (o - c) > (h - l) * 0.6:
+    if o > c and body > range_ * 0.6:
         return "bear_engulf"
-    if (h - max(o, c)) > (c - o) * 2:
+    if (h - max(o, c)) > body * 2:
         return "shooting_star"
-    if (min(o, c) - l) > (c - o) * 2:
+    if (min(o, c) - l) > body * 2:
         return "hammer"
+
     return "none"
 
 async def htf_signal(symbol: str) -> Dict[str, str]:
@@ -226,6 +209,7 @@ async def htf_signal(symbol: str) -> Dict[str, str]:
 
     p15 = detect_pattern(df15)
     p1h = detect_pattern(df1h)
+
     return {"15m": p15, "1h": p1h}
 
 # -------------------------------------------------------------
@@ -234,40 +218,45 @@ async def htf_signal(symbol: str) -> Dict[str, str]:
 def liquidity_sweep(df: pd.DataFrame) -> bool:
     if len(df) < 5:
         return False
-    w = (df['high'].iloc[-1] - df['low'].iloc[-1])
-    body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
+    w = df["high"].iloc[-1] - df["low"].iloc[-1]
+    body = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
     return w > body * 3
 
 def ema21_pullback(df: pd.DataFrame) -> bool:
-    e21 = ema(df['close'], 21)
     if len(df) < 2:
         return False
-    return abs(df['close'].iloc[-1] - e21.iloc[-1]) / df['close'].iloc[-1] < 0.002
+    e21 = ema(df["close"], 21)
+    return abs(df["close"].iloc[-1] - e21.iloc[-1]) / df["close"].iloc[-1] < 0.002
 
 def range_break_retest(df: pd.DataFrame) -> bool:
     if len(df) < 20:
         return False
-    high_line = df['high'].tail(20).max()
-    broke = df['close'].iloc[-1] > high_line
-    retest = df['low'].iloc[-1] <= high_line
+    high_line = df["high"].tail(20).max()
+    broke = df["close"].iloc[-1] > high_line
+    retest = df["low"].iloc[-1] <= high_line
     return broke and retest
 
+# -------------------------------------------------------------
+# ORDER BLOCK + FVG (FAIR VALUE GAP)
+# -------------------------------------------------------------
 def detect_order_block(df: pd.DataFrame) -> str:
     if len(df) < 3:
         return "none"
-    if df['close'].iloc[-2] < df['open'].iloc[-2] and df['close'].iloc[-1] > df['open'].iloc[-1]:
+    # bearish candle then strong bull candle
+    if df["close"].iloc[-2] < df["open"].iloc[-2] and df["close"].iloc[-1] > df["open"].iloc[-1]:
         return "bull_OB"
-    if df['close'].iloc[-2] > df['open'].iloc[-2] and df['close'].iloc[-1] < df['open'].iloc[-1]:
+    # bullish candle then strong bear candle
+    if df["close"].iloc[-2] > df["open"].iloc[-2] and df["close"].iloc[-1] < df["open"].iloc[-1]:
         return "bear_OB"
     return "none"
 
 def detect_fvg(df: pd.DataFrame) -> str:
     if len(df) < 3:
         return "none"
-    h1 = df['high'].iloc[-3]
-    l1 = df['low'].iloc[-3]
-    h2 = df['high'].iloc[-1]
-    l2 = df['low'].iloc[-1]
+    h1 = df["high"].iloc[-3]
+    l1 = df["low"].iloc[-3]
+    h2 = df["high"].iloc[-1]
+    l2 = df["low"].iloc[-1]
 
     if l1 > h2:
         return "bull_FVG"
@@ -280,95 +269,135 @@ def detect_fvg(df: pd.DataFrame) -> str:
 # -------------------------------------------------------------
 async def spread_ok(symbol: str) -> bool:
     sp = await fetch_spread(symbol)
-    return sp < 0.06
+    return sp < 0.06   # 0.06% max spread
 
 async def funding_ok(symbol: str) -> bool:
     f = await fetch_funding(symbol)
-    return abs(f) < 0.02
+    return abs(f) < 0.02  # ±0.02% funding
 
 def session_now(ts: int) -> str:
-    h = time.gmtime(ts/1000).tm_hour
+    """
+    ts: server time in milliseconds (Binance serverTime)
+    """
+    h = time.gmtime(ts / 1000).tm_hour
     if 1 <= h < 8:
         return "asia"
     if 8 <= h < 16:
         return "europe"
     return "us"
-
+# helpers.py (Part 3 of 4)
 # -------------------------------------------------------------
 # VOLUME FILTERS • SCORE SYSTEM • MODES (QUICK/MID/TREND)
-# COOLDOWN SYSTEM • COIN LIST (50 COINS)
+# COOLDOWN SYSTEM • COIN LIST • TP/SL • SIGNAL BUILDER
+# TELEGRAM FORMATTERS
 # -------------------------------------------------------------
-COOLDOWN: Dict[str, int] = {}
 
+import time
+from typing import Dict, Any
+
+# -------------------------------------------------------------
+# 1) VOLUME SPIKE FILTER
+# -------------------------------------------------------------
 def volume_spike(df: pd.DataFrame) -> bool:
     if len(df) < 30:
         return False
-    recent = df['volume'].iloc[-1]
-    avg = df['volume'].tail(20).mean()
-    return recent > avg * 2
+    recent = df["volume"].iloc[-1]
+    avg = df["volume"].tail(20).mean()
+    return recent > avg * 2   # 200% spike
 
-def calc_score(symbol: str, df: pd.DataFrame, htf: Dict[str, str],
-               pa: Dict[str, Any], spread_ok_flag: bool, funding_ok_flag: bool) -> int:
+# -------------------------------------------------------------
+# 2) SCORE SYSTEM (90+ REQUIRED FOR BALANCED MODE)
+# -------------------------------------------------------------
+def calc_score(
+    symbol: str,
+    df: pd.DataFrame,
+    htf: Dict[str, str],
+    pa: Dict[str, Any],
+    spread_ok: bool,
+    funding_ok_flag: bool,
+) -> int:
     score = 0
 
-    close = df['close']
+    close = df["close"]
     if len(close) > 50:
         e20 = ema(close, 20).iloc[-1]
         e50 = ema(close, 50).iloc[-1]
         if e20 > e50:
             score += 15
 
+    # volume spike
     if volume_spike(df):
         score += 15
 
-    if htf['15m'] in ["bull_engulf", "hammer"]:
+    # HTF match
+    if htf.get("15m") in ["bull_engulf", "hammer"]:
         score += 10
-    if htf['1h'] in ["bull_engulf", "hammer"]:
-        score += 10
-
-    if pa.get('sweep'):
-        score += 10
-    if pa.get('pullback'):
-        score += 10
-    if pa.get('range_retest'):
-        score += 10
-    if pa.get('ob') != "none":
-        score += 10
-    if pa.get('fvg') != "none":
+    if htf.get("1h") in ["bull_engulf", "hammer"]:
         score += 10
 
-    if spread_ok_flag:
+    # Price action
+    if pa.get("sweep"):
+        score += 10
+    if pa.get("pullback"):
+        score += 10
+    if pa.get("range_retest"):
+        score += 10
+    if pa.get("ob") != "none":
+        score += 10
+    if pa.get("fvg") != "none":
+        score += 10
+
+    # Spread + funding
+    if spread_ok:
         score += 5
     if funding_ok_flag:
         score += 5
 
     return min(score, 100)
 
+# -------------------------------------------------------------
+# 3) MODE LOGIC (QUICK / MID / TREND)
+# -------------------------------------------------------------
 def mode_requirements(df: pd.DataFrame, mode: str) -> bool:
-    close = df['close']
+    close = df["close"]
+    if len(close) < 50:
+        return False
+
     e20 = ema(close, 20).iloc[-1]
     e50 = ema(close, 50).iloc[-1]
 
+    # Quick mode: light trend
     if mode == "quick":
         return e20 > e50
 
+    # Mid mode: trend + volume spike
     if mode == "mid":
         return e20 > e50 and volume_spike(df)
 
+    # Trend mode: strong trend, price above EMA20
     if mode == "trend":
         return e20 > e50 and close.iloc[-1] > e20
 
     return False
 
+# -------------------------------------------------------------
+# 4) COOLDOWN SYSTEM (30 MIN PER COIN)
+# -------------------------------------------------------------
+COOLDOWN: Dict[str, int] = {}
+
 def cooldown_ok(symbol: str) -> bool:
     now = int(time.time())
-    if symbol not in COOLDOWN:
+    last = COOLDOWN.get(symbol)
+    if last is None:
         return True
-    return (now - COOLDOWN[symbol]) > 1800
+    return (now - last) > 1800  # 30 minutes
 
-def set_cooldown(symbol: str) -> None:
+def set_cooldown(symbol: str):
     COOLDOWN[symbol] = int(time.time())
 
+# -------------------------------------------------------------
+# 5) COIN LIST (50 COINS)
+# -------------------------------------------------------------
 COIN_LIST = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","MATICUSDT",
     "DOTUSDT","LTCUSDT","BCHUSDT","AVAXUSDT","UNIUSDT","LINKUSDT","ATOMUSDT","ETCUSDT",
@@ -376,57 +405,68 @@ COIN_LIST = [
     "RUNEUSDT","ALGOUSDT","EGLDUSDT","IMXUSDT","INJUSDT","OPUSDT","ARBUSDT","SUIUSDT",
     "TIAUSDT","PEPEUSDT","TRBUSDT","SEIUSDT","JTOUSDT","PYTHUSDT","RAYUSDT","GMTUSDT",
     "MINAUSDT","WLDUSDT","ZKUSDT","STRKUSDT","DYDXUSDT","VETUSDT","GALAUSDT","KAVAUSDT",
-    "FLOWUSDT","SKLUSDT"
+    "FLOWUSDT","SKLUSDT",
 ]
 
 # -------------------------------------------------------------
-# SIGNAL BUILDER • TP/SL ENGINE • PREMIUM TELEGRAM FORMATTER
+# 6) TP/SL AUTO CALCULATOR (MODE-WISE)
 # -------------------------------------------------------------
 def calc_tp_sl(entry: float, mode: str) -> Dict[str, float]:
     if mode == "quick":
-        tp = entry * 1.004
-        sl = entry * 0.996
+        tp = entry * 1.004   # +0.4%
+        sl = entry * 0.996   # -0.4%
     elif mode == "mid":
-        tp = entry * 1.020
-        sl = entry * 0.990
+        tp = entry * 1.020   # +2%
+        sl = entry * 0.990   # -1%
     elif mode == "trend":
-        tp = entry * 1.030
-        sl = entry * 0.985
+        tp = entry * 1.030   # +3%
+        sl = entry * 0.985   # -1.5%
     else:
         tp = entry * 1.010
         sl = entry * 0.990
 
     return {"tp": round(tp, 8), "sl": round(sl, 8)}
 
+# -------------------------------------------------------------
+# 7) SIGNAL BUILDER (FINAL DECISION + STRUCTURED OUTPUT)
+# -------------------------------------------------------------
 async def build_signal(symbol: str, mode: str) -> Dict[str, Any]:
+    # cooldown check
     if not cooldown_ok(symbol):
         return {"ok": False, "reason": "cooldown"}
 
+    # main data
     df = await fetch_ohlcv(symbol, "1m", 200)
     if df.empty:
         return {"ok": False, "reason": "data_error"}
 
+    # HTF
     htf = await htf_signal(symbol)
 
+    # Price action set
     pa = {
         "sweep": liquidity_sweep(df),
         "pullback": ema21_pullback(df),
         "range_retest": range_break_retest(df),
         "ob": detect_order_block(df),
-        "fvg": detect_fvg(df)
+        "fvg": detect_fvg(df),
     }
 
+    # Spread + funding
     sp_ok = await spread_ok(symbol)
     f_ok = await funding_ok(symbol)
 
+    # Score
     score = calc_score(symbol, df, htf, pa, sp_ok, f_ok)
     if score < 90:
         return {"ok": False, "reason": "low_score", "score": score}
 
+    # Mode requirement
     if not mode_requirements(df, mode):
         return {"ok": False, "reason": "mode_not_fit"}
 
-    entry = float(df['close'].iloc[-1])
+    # Final entry + TP/SL
+    entry = float(df["close"].iloc[-1])
     tpsl = calc_tp_sl(entry, mode)
 
     set_cooldown(symbol)
@@ -436,14 +476,17 @@ async def build_signal(symbol: str, mode: str) -> Dict[str, Any]:
         "symbol": symbol,
         "mode": mode,
         "entry": entry,
-        "tp": tpsl['tp'],
-        "sl": tpsl['sl'],
+        "tp": tpsl["tp"],
+        "sl": tpsl["sl"],
         "score": score,
         "htf": htf,
         "pa": pa,
-        "time": time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+        "time": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     }
 
+# -------------------------------------------------------------
+# 8) TELEGRAM SIGNAL FORMATTER (BUY)
+# -------------------------------------------------------------
 def format_signal(sig: Dict[str, Any]) -> str:
     return f"""
 🔥 BUY SIGNAL — {sig['mode'].upper()} MODE
@@ -467,8 +510,11 @@ OB: {sig['pa']['ob']}
 FVG: {sig['pa']['fvg']}
 ━━━━━━━━━━━━━━━━
 ⏱ Time: {sig['time']}
-"""
+""".strip()
 
+# -------------------------------------------------------------
+# 9) PREMIUM RED-DANGER EXIT WARNING FORMATTER
+# -------------------------------------------------------------
 def format_exit_alert(symbol: str, reason_main: str, extra: str = "") -> str:
     return f"""
 🛑 EMERGENCY EXIT — {symbol}
@@ -480,62 +526,56 @@ Reason: {reason_main}
 🚨 ACTION: EXIT NOW — PROTECT CAPITAL
 ━━━━━━━━━━━━━━━━━━━━
 ⏱ Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
-"""
-
+""".strip()
+# helpers.py (Part 4 of 4)
 # -------------------------------------------------------------
-# MAIN SCAN LOOP • MULTI-MODE RUNNER
+# UPGRADE PACK • CLEAN MULTI_OVERRIDE_WATCH (SINGLE EXIT MSG)
 # -------------------------------------------------------------
-async def scan_coin(symbol: str, mode: str) -> Dict[str, Any]:
-    try:
-        sig = await build_signal(symbol, mode)
-        return sig
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
-async def run_mode(mode: str) -> List[Dict[str, Any]]:
-    tasks = [scan_coin(sym, mode) for sym in COIN_LIST]
-    results = await asyncio.gather(*tasks)
-    return [r for r in results if r.get("ok")]
+import math as _math
+from typing import Dict, Any, List
 
-async def run_all_modes() -> Dict[str, List[Dict[str, Any]]]:
-    return {
-        "quick": await run_mode("quick"),
-        "mid": await run_mode("mid"),
-        "trend": await run_mode("trend"),
-    }
+def _safe_get(name: str, default=None):
+    return globals().get(name, default)
 
-# -------------------------------------------------------------
-# OVERRIDE UPGRADE HELPERS
-# -------------------------------------------------------------
+# existing helpers jodi thake, segulo reuse
+fetch_ohlcv = _safe_get("fetch_ohlcv")
+fetch_orderbook = _safe_get("fetch_orderbook")   # optional
+fetch_funding = _safe_get("fetch_funding")       # optional
+
+# small helper: pandas frame e convert
 def _to_pd(df_like):
-    if isinstance(df_like, pd.DataFrame):
-        return df_like
     try:
+        if isinstance(df_like, pd.DataFrame):
+            return df_like
         return pd.DataFrame(df_like)
     except Exception:
         return None
 
-def htf_alignment(ohlcv_15m, ohlcv_1h, ema_short: int = 20, ema_long: int = 50) -> bool:
+# 1) HTF ALIGNMENT (15m vs 1h EMA)
+def htf_alignment(ohlcv_15m, ohlcv_1h, ema_short=20, ema_long=50) -> bool:
     try:
         df15 = _to_pd(ohlcv_15m)
         df60 = _to_pd(ohlcv_1h)
         if df15 is None or df60 is None or len(df15) < ema_long or len(df60) < ema_long:
             return True
 
-        s15 = ema(df15["close"], ema_short).iloc[-1]
-        l15 = ema(df15["close"], ema_long).iloc[-1]
-        s60 = ema(df60["close"], ema_short).iloc[-1]
-        l60 = ema(df60["close"], ema_long).iloc[-1]
+        def _ema(series, span):
+            return series.ewm(span=span, adjust=False).mean()
+
+        s15 = _ema(df15["close"], ema_short).iloc[-1]
+        l15 = _ema(df15["close"], ema_long).iloc[-1]
+        s60 = _ema(df60["close"], ema_short).iloc[-1]
+        l60 = _ema(df60["close"], ema_long).iloc[-1]
 
         dir15 = 1 if s15 > l15 else -1
         dir60 = 1 if s60 > l60 else -1
         return dir15 == dir60
-    except Exception as e:
-        logger.warning("htf_alignment failed: %s", e)
+    except Exception:
         return True
 
-def detect_liquidity_sweep_adv(ohlcv, wick_ratio_threshold: float = 2.5,
-                               vol_mult: float = 1.5) -> Dict[str, Any]:
+# 2) LIQUIDITY SWEEP DETECTOR
+def detect_liquidity_sweep(ohlcv, wick_ratio_threshold=2.5, vol_mult_threshold=1.5) -> Dict[str, Any]:
     try:
         df = _to_pd(ohlcv)
         if df is None or len(df) < 3:
@@ -552,146 +592,173 @@ def detect_liquidity_sweep_adv(ohlcv, wick_ratio_threshold: float = 2.5,
 
         avg_vol = df["volume"].rolling(10, min_periods=1).mean().iloc[-2]
         vol = last["volume"]
-        vol_spike = vol > max(avg_vol * vol_mult, 1e-6)
+        vol_mult = vol / max(avg_vol, 1e-12)
 
-        if wick_ratio >= wick_ratio_threshold and vol_spike:
+        if wick_ratio >= wick_ratio_threshold and vol_mult >= vol_mult_threshold:
             direction = "upper" if upper_wick > lower_wick else "lower"
-            reason = f"wick_ratio={wick_ratio:.2f}, vol_spike={vol_spike}, dir={direction}"
+            reason = f"wick_ratio={wick_ratio:.2f}, vol_mult={vol_mult:.2f}, dir={direction}"
             return {"sweep": True, "reason": reason, "direction": direction}
         return {"sweep": False, "reason": "none"}
-    except Exception as e:
-        logger.warning("detect_liquidity_sweep_adv failed: %s", e)
+    except Exception:
         return {"sweep": False, "reason": "error"}
 
-def detect_sudden_spike(ohlcv, vol_multiplier: float = 3.0,
-                        price_move_pct: float = 0.01) -> Dict[str, Any]:
+# 3) SUDDEN SPIKE DETECTOR
+def detect_sudden_spike(ohlcv, vol_multiplier=3.0, price_move_pct=0.01) -> Dict[str, Any]:
     try:
         df = _to_pd(ohlcv)
         if df is None or len(df) < 10:
             return {"spike": False, "reason": "insufficient_data"}
 
         last = df.iloc[-1]
-        prev_avg_vol = df["volume"].rolling(10, min_periods=5).mean().iloc[-2]
-        vol_spike = last["volume"] > max(prev_avg_vol * vol_multiplier, 1e-6)
         prev_close = df["close"].iloc[-2]
+        prev_avg_vol = df["volume"].rolling(10, min_periods=5).mean().iloc[-2]
+
+        vol_spike = last["volume"] > max(prev_avg_vol * vol_multiplier, 1e-6)
         price_move = abs(last["close"] - prev_close) / (prev_close + 1e-12)
 
         if vol_spike and price_move >= price_move_pct:
             reason = f"vol_mult={(last['volume']/max(prev_avg_vol,1e-12)):.2f}, price_move={price_move:.3f}"
-            return {
-                "spike": True,
-                "reason": reason,
-                "price_move": price_move,
-                "vol_mult": last["volume"] / max(prev_avg_vol, 1e-12),
-            }
+            return {"spike": True, "reason": reason}
         return {"spike": False, "reason": "none"}
-    except Exception as e:
-        logger.warning("detect_sudden_spike failed: %s", e)
+    except Exception:
         return {"spike": False, "reason": "error"}
 
-async def sl_before_touch_check(active_signals: List[Dict[str, Any]]) -> List[str]:
-    warnings: List[str] = []
+# 4) SL-BEFORE-TOUCH CHECK (only data, no message)
+async def sl_before_touch_check(active_signals: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    info: Dict[str, Dict[str, Any]] = {}
     if not active_signals:
-        return warnings
+        return info
 
     for sig in active_signals:
         try:
             symbol = sig.get("symbol") or sig.get("pair") or sig.get("market")
             if not symbol:
                 continue
-            sl = float(sig.get("sl", 0) or 0)
-            entry = float(sig.get("entry", 0) or 0)
-            if sl == 0 or entry == 0:
+            sl = float(sig.get("sl", 0.0))
+            entry = float(sig.get("entry", 0.0))
+            if sl == 0.0 or entry == 0.0:
                 continue
 
             dist_pct = abs(entry - sl) / (entry + 1e-12)
-            if dist_pct <= 0.006:
-                warnings.append(
-                    f"⚠️ SL CLOSE: {symbol} entry={entry} sl={sl} dist={dist_pct:.4f}"
-                )
-        except Exception as e:
-            logger.debug("sl_before_touch_check item fail: %s", e)
-            continue
-    return warnings
+            low_liq = False
 
-# -------------------------------------------------------------
-# MULTI OVERRIDE WATCH (MAIN)
-# -------------------------------------------------------------
+            if fetch_orderbook and dist_pct <= 0.006:
+                try:
+                    ob = await fetch_orderbook(symbol, depth=5)
+                    bids = ob.get("bids") or []
+                    asks = ob.get("asks") or []
+                    top_liq = 0.0
+                    if bids:
+                        top_liq += float(bids[0][1])
+                    if asks:
+                        top_liq += float(asks[0][1])
+                    if top_liq < 0.5:
+                        low_liq = True
+                except Exception:
+                    low_liq = False
+
+            info[symbol] = {"dist_pct": dist_pct, "low_liq": low_liq}
+        except Exception:
+            continue
+
+    return info
+
+# 5) MAIN MULTI_OVERRIDE_WATCH — SINGLE EXIT MESSAGE PER COIN
 async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str]:
     alerts: List[str] = []
-    if not isinstance(active_signals, list):
-        logger.warning("multi_override_watch: expected list, got %s", type(active_signals))
+    if not active_signals:
         return alerts
 
-    # 1) SL-close warnings
-    sl_warns = await sl_before_touch_check(active_signals)
-    alerts.extend(sl_warns)
+    try:
+        sl_info_map = await sl_before_touch_check(active_signals)
 
-    for sig in active_signals:
-        try:
-            symbol = sig.get("symbol") or sig.get("pair") or sig.get("market")
-            if not symbol:
-                continue
+        for sig in active_signals:
+            try:
+                symbol = sig.get("symbol") or sig.get("pair") or sig.get("market")
+                if not symbol:
+                    continue
 
-            # fetch HTF/1m data
-            ohlcv_1m = await fetch_ohlcv(symbol, "1m", 80)
-            ohlcv_15m = await fetch_ohlcv(symbol, "15m", 80)
-            ohlcv_1h = await fetch_ohlcv(symbol, "1h", 80)
+                issues: List[str] = []
+                detail_lines: List[str] = []
 
-            # HTF alignment
-            critical_flags: List[str] = []
-            if not htf_alignment(ohlcv_15m, ohlcv_1h):
-                alerts.append(f"⚠️ HTF MISALIGN: {symbol} — skip or review (15m vs 1h conflict)")
-                critical_flags.append("HTF_MISALIGN")
+                # SL distance
+                sl_info = sl_info_map.get(symbol)
+                if sl_info and sl_info["dist_pct"] <= 0.006:
+                    issues.append("SL_CLOSE")
+                    detail_lines.append(f"SL distance: {sl_info['dist_pct']:.4f}")
+                    if sl_info["low_liq"]:
+                        issues.append("LOW_BOOK_LIQUIDITY")
+                        detail_lines.append("Orderbook top liquidity low")
 
-            sweep = detect_liquidity_sweep_adv(ohlcv_1m)
-            if sweep.get("sweep"):
-                alerts.append(f"⚠️ LIQ SWEEP: {symbol} — {sweep.get('reason')}")
-                critical_flags.append("LIQ_SWEEP")
+                # OHLCV load
+                ohlcv_1m = ohlcv_15m = ohlcv_1h = None
+                if fetch_ohlcv:
+                    try:
+                        ohlcv_1m = await fetch_ohlcv(symbol, "1m", 80)
+                        ohlcv_15m = await fetch_ohlcv(symbol, "15m", 80)
+                        ohlcv_1h = await fetch_ohlcv(symbol, "1h", 80)
+                    except Exception:
+                        pass
 
-            spike = detect_sudden_spike(ohlcv_1m)
-            if spike.get("spike"):
-                alerts.append(f"⚠️ SUDDEN SPIKE: {symbol} — {spike.get('reason')}")
-                critical_flags.append("SUDDEN_SPIKE")
+                # HTF misalign
+                if ohlcv_15m is not None and ohlcv_1h is not None:
+                    if not htf_alignment(ohlcv_15m, ohlcv_1h):
+                        issues.append("HTF_MISALIGN")
+                        detail_lines.append("15m vs 1h EMA conflict")
 
-            if critical_flags:
+                # Liquidity sweep
+                if ohlcv_1m is not None:
+                    sweep = detect_liquidity_sweep(ohlcv_1m)
+                    if sweep.get("sweep"):
+                        issues.append("LIQ_SWEEP")
+                        detail_lines.append(f"Sweep: {sweep.get('reason')}")
+
+                # Sudden spike
+                if ohlcv_1m is not None:
+                    spike = detect_sudden_spike(ohlcv_1m)
+                    if spike.get("spike"):
+                        issues.append("SUDDEN_SPIKE")
+                        detail_lines.append(f"Spike: {spike.get('reason')}")
+
+                if not issues:
+                    continue
+
                 parts = [
                     "🚨 ACTION: EXIT NOW — PROTECT CAPITAL",
                     f"Pair: {symbol}",
-                    f"Issues: {', '.join(critical_flags)}",
+                    f"Issues: {', '.join(issues)}",
                     f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
                 ]
+
                 entry = sig.get("entry")
                 tp = sig.get("tp") or sig.get("tps")
                 sl = sig.get("sl")
-                if entry:
+                if entry is not None:
                     parts.append(f"Entry: {entry}")
-                if tp:
+                if tp is not None:
                     parts.append(f"TP: {tp}")
-                if sl:
+                if sl is not None:
                     parts.append(f"SL: {sl}")
+
+                if detail_lines:
+                    parts.append("Details:")
+                    parts.extend(detail_lines)
+
                 alert_text = "\n".join(parts)
-                alerts.append(alert_text)
 
-                # try Telegram send
-                try:
-                    await send_telegram(alert_text)
-                except Exception as e:
-                    logger.error("Telegram send failed in override: %s", e)
+                if alert_text not in alerts:
+                    alerts.append(alert_text)
 
-        except Exception as e:
-            logger.debug("multi_override per-sig fail: %s", e)
-            continue
+            except Exception:
+                continue
 
-    # dedupe
-    unique: List[str] = []
-    seen = set()
-    for a in alerts:
-        if a not in seen:
-            unique.append(a)
-            seen.add(a)
-    return unique
+        return alerts
+    except Exception:
+        return alerts
 
+# -------------------------------------------------------------
+# EXPORTS
+# -------------------------------------------------------------
 __all__ = [
     "scan_coin",
     "run_mode",
@@ -699,5 +766,4 @@ __all__ = [
     "multi_override_watch",
     "format_signal",
     "format_exit_alert",
-    "send_telegram",
 ]
