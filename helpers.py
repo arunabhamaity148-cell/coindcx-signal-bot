@@ -407,6 +407,41 @@ COIN_LIST = [
     "MINAUSDT","WLDUSDT","ZKUSDT","STRKUSDT","DYDXUSDT","VETUSDT","GALAUSDT","KAVAUSDT",
     "FLOWUSDT","SKLUSDT",
 ]
+# -------------------------------------------------------------
+# SCANNER HELPERS • SINGLE/MODE/ALL MODES
+# (add this after COIN_LIST)
+# -------------------------------------------------------------
+import asyncio
+from typing import Dict, Any, List
+
+async def scan_coin(symbol: str, mode: str) -> Dict[str, Any]:
+    """
+    Single coin scan – build_signal use kore.
+    """
+    try:
+        sig = await build_signal(symbol, mode)
+        return sig
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+async def run_mode(mode: str) -> List[Dict[str, Any]]:
+    """
+    Ekta mode (quick/mid/trend) er jonno 50 ta coin scan.
+    """
+    tasks = [scan_coin(sym, mode) for sym in COIN_LIST]
+    results = await asyncio.gather(*tasks)
+    # sudhu ok==True signal gula rakhbo
+    return [r for r in results if isinstance(r, dict) and r.get("ok")]
+
+async def run_all_modes() -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Main runner: quick + mid + trend
+    """
+    return {
+        "quick": await run_mode("quick"),
+        "mid":   await run_mode("mid"),
+        "trend": await run_mode("trend"),
+    }
 
 # -------------------------------------------------------------
 # 6) TP/SL AUTO CALCULATOR (MODE-WISE)
