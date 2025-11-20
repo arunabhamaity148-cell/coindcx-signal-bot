@@ -564,38 +564,50 @@ Reason: {reason_main}
 """.strip()
 # helpers.py (Part 4 of 4)
 # -------------------------------------------------------------
-# UPGRADE PACK • CLEAN MULTI_OVERRIDE_WATCH (SINGLE EXIT MSG)
+# -------------------------------------------------------------
+# OVERRIDE / PROTECT LAYER V2
+# - Active trades watch
+# - 3-level alerts (YELLOW / ORANGE / RED)
+# - BTC stability check
+# - Per-mode SL sensitivity (quick / mid / trend)
+# - De-duplicate alerts
 # -------------------------------------------------------------
 
-import math as _math
+import time
 from typing import Dict, Any, List
 
-def _safe_get(name: str, default=None):
-    return globals().get(name, default)
+# ধরেছি helpers.py তে আগেই আছে:
+#   fetch_ohlcv(symbol, interval, limit)
+#   fetch_funding(symbol)
+#   btc_stable()
+#   ema()
+# না থাকলে আগে এগুলো রাখবে।
 
-# existing helpers jodi thake, segulo reuse
-fetch_ohlcv = _safe_get("fetch_ohlcv")
-fetch_orderbook = _safe_get("fetch_orderbook")   # optional
-fetch_funding = _safe_get("fetch_funding")       # optional
-
-# small helper: pandas frame e convert
 def _to_pd(df_like):
+    """Safely convert to pandas DataFrame."""
     try:
+        import pandas as pd
         if isinstance(df_like, pd.DataFrame):
             return df_like
         return pd.DataFrame(df_like)
     except Exception:
         return None
 
-# 1) HTF ALIGNMENT (15m vs 1h EMA)
-def htf_alignment(ohlcv_15m, ohlcv_1h, ema_short=20, ema_long=50) -> bool:
+def htf_alignment(ohlcv_15m, ohlcv_1h, ema_short: int = 20, ema_long: int = 50) -> bool:
+    """
+    15m আর 1h EMA trend একদিকে কিনা চেক করে।
+    mismatch হলে False, নাহলে True।
+    """
     try:
+        import pandas as pd
         df15 = _to_pd(ohlcv_15m)
         df60 = _to_pd(ohlcv_1h)
-        if df15 is None or df60 is None or len(df15) < ema_long or len(df60) < ema_long:
+        if df15 is None or df60 is None:
             return True
+        if len(df15) < ema_long or len(df60) < ema_long:
+            return True  # data কম হলে block না করে allow
 
-        def _ema(series, span):
+        def _ema(series: "pd.Series", span: int):
             return series.ewm(span=span, adjust=False).mean()
 
         s15 = _ema(df15["close"], ema_short).iloc[-1]
@@ -609,196 +621,393 @@ def htf_alignment(ohlcv_15m, ohlcv_1h, ema_short=20, ema_long=50) -> bool:
     except Exception:
         return True
 
-# 2) LIQUIDITY SWEEP DETECTOR
-def detect_liquidity_sweep(ohlcv, wick_ratio_threshold=2.5, vol_mult_threshold=1.5) -> Dict[str, Any]:
+def detect_liquidity_sweep(ohlcv, wick_ratio_threshold: float = 2.5) -> Dict[str, Any]:
+    """
+    Simple liquidity sweep detector:
+    - body ছোট, wick বড় + volume বেশি => sweep True
+    """
     try:
         df = _to_pd(ohlcv)
         if df is None or len(df) < 3:
-            return {"sweep": False, "reason": "insufficient_data"}
+            return {"sweep": False}
 
         last = df.iloc[-1]
         body = abs(last["close"] - last["open"])
-        if body <= 0:
-            return {"sweep": False, "reason": "zero_body"}
-
         upper_wick = last["high"] - max(last["open"], last["close"])
         lower_wick = min(last["open"], last["close"]) - last["low"]
+
+        if body <= 0:
+            return {"sweep": False}
+
         wick_ratio = max(upper_wick, lower_wick) / (body + 1e-12)
 
-        avg_vol = df["volume"].rolling(10, min_periods=1).mean().iloc[-2]
+        avg_vol = df["volume"].rolling(10, min_periods=3).mean().iloc[-2]
         vol = last["volume"]
-        vol_mult = vol / max(avg_vol, 1e-12)
+        vol_spike = vol > max(1.5 * avg_vol, 1e-6)
 
-        if wick_ratio >= wick_ratio_threshold and vol_mult >= vol_mult_threshold:
+        if wick_ratio >= wick_ratio_threshold and vol_spike:
             direction = "upper" if upper_wick > lower_wick else "lower"
-            reason = f"wick_ratio={wick_ratio:.2f}, vol_mult={vol_mult:.2f}, dir={direction}"
-            return {"sweep": True, "reason": reason, "direction": direction}
-        return {"sweep": False, "reason": "none"}
-    except Exception:
-        return {"sweep": False, "reason": "error"}
+            return {
+                "sweep": True,
+                "direction": direction,
+                "wick_ratio": float(wick_ratio),
+                "vol_spike": bool(vol_spike),
+            }
 
-# 3) SUDDEN SPIKE DETECTOR
-def detect_sudden_spike(ohlcv, vol_multiplier=3.0, price_move_pct=0.01) -> Dict[str, Any]:
+        return {"sweep": False}
+    except Exception:
+        return {"sweep": False}
+
+def detect_sudden_spike(ohlcv, vol_multiplier: float = 3.0, price_move_pct: float = 0.01) -> Dict[str, Any]:
+    """
+    Volume + price sudden spike detector.
+    """
     try:
         df = _to_pd(ohlcv)
         if df is None or len(df) < 10:
-            return {"spike": False, "reason": "insufficient_data"}
+            return {"spike": False}
 
         last = df.iloc[-1]
         prev_close = df["close"].iloc[-2]
         prev_avg_vol = df["volume"].rolling(10, min_periods=5).mean().iloc[-2]
 
-        vol_spike = last["volume"] > max(prev_avg_vol * vol_multiplier, 1e-6)
         price_move = abs(last["close"] - prev_close) / (prev_close + 1e-12)
+        vol_spike = last["volume"] > max(prev_avg_vol * vol_multiplier, 1e-6)
 
         if vol_spike and price_move >= price_move_pct:
-            reason = f"vol_mult={(last['volume']/max(prev_avg_vol,1e-12)):.2f}, price_move={price_move:.3f}"
-            return {"spike": True, "reason": reason}
-        return {"spike": False, "reason": "none"}
+            return {
+                "spike": True,
+                "price_move": float(price_move),
+                "vol_mult": float(last["volume"] / max(prev_avg_vol, 1e-12)),
+            }
+
+        return {"spike": False}
     except Exception:
-        return {"spike": False, "reason": "error"}
+        return {"spike": False}
 
-# 4) SL-BEFORE-TOUCH CHECK (only data, no message)
-async def sl_before_touch_check(active_signals: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    info: Dict[str, Dict[str, Any]] = {}
-    if not active_signals:
-        return info
+# -------------------------------------------------------------
+# ACTIVE TRADES STATE
+# -------------------------------------------------------------
 
-    for sig in active_signals:
+ACTIVE_TRADES: List[Dict[str, Any]] = []
+LAST_ISSUES: Dict[str, Dict[str, Any]] = {}  # symbol -> {"level": int, "issues": set}
+MAX_TRADE_AGE = 60 * 60  # 60 মিনিট পর পুরোনো trade drop
+
+def _trade_key(sig: Dict[str, Any]) -> str:
+    """symbol+mode+entry দিয়ে simple key বানাই (duplicate avoid)."""
+    symbol = sig.get("symbol") or sig.get("pair") or sig.get("market") or ""
+    mode = sig.get("mode", "mid")
+    entry = sig.get("entry")
+    try:
+        entry = float(entry) if entry is not None else 0.0
+    except Exception:
+        entry = 0.0
+    return f"{symbol}:{mode}:{entry:.6f}"
+
+def _update_active_trades(new_signals: List[Dict[str, Any]]):
+    """run_all_modes থেকে আসা signal দিয়ে ACTIVE_TRADES আপডেট।"""
+    now = time.time()
+    existing_keys = {t["key"] for t in ACTIVE_TRADES}
+    for sig in new_signals:
+        if not isinstance(sig, dict):
+            continue
+        if not sig.get("ok", True):
+            continue
+
+        key = _trade_key(sig)
+        if key in existing_keys:
+            continue
+
+        symbol = sig.get("symbol") or sig.get("pair") or sig.get("market")
+        if not symbol:
+            continue
+
         try:
-            symbol = sig.get("symbol") or sig.get("pair") or sig.get("market")
-            if not symbol:
-                continue
-            sl = float(sig.get("sl", 0.0))
-            entry = float(sig.get("entry", 0.0))
-            if sl == 0.0 or entry == 0.0:
-                continue
-
-            dist_pct = abs(entry - sl) / (entry + 1e-12)
-            low_liq = False
-
-            if fetch_orderbook and dist_pct <= 0.006:
-                try:
-                    ob = await fetch_orderbook(symbol, depth=5)
-                    bids = ob.get("bids") or []
-                    asks = ob.get("asks") or []
-                    top_liq = 0.0
-                    if bids:
-                        top_liq += float(bids[0][1])
-                    if asks:
-                        top_liq += float(asks[0][1])
-                    if top_liq < 0.5:
-                        low_liq = True
-                except Exception:
-                    low_liq = False
-
-            info[symbol] = {"dist_pct": dist_pct, "low_liq": low_liq}
+            entry = float(sig.get("entry"))
         except Exception:
             continue
 
-    return info
+        tp = sig.get("tp") or sig.get("tps") or 0
+        sl = sig.get("sl") or 0
+        try:
+            tp = float(tp)
+        except Exception:
+            tp = 0.0
+        try:
+            sl = float(sl)
+        except Exception:
+            sl = 0.0
 
-# 5) MAIN MULTI_OVERRIDE_WATCH — SINGLE EXIT MESSAGE PER COIN
+        ACTIVE_TRADES.append(
+            {
+                "key": key,
+                "symbol": symbol,
+                "mode": sig.get("mode", "mid"),
+                "entry": entry,
+                "tp": tp,
+                "sl": sl,
+                "start_ts": now,
+            }
+        )
+
+    # পুরোনো trade পরিষ্কার
+    fresh: List[Dict[str, Any]] = []
+    for t in ACTIVE_TRADES:
+        if now - t.get("start_ts", now) <= MAX_TRADE_AGE:
+            fresh.append(t)
+    ACTIVE_TRADES.clear()
+    ACTIVE_TRADES.extend(fresh)
+
+# -------------------------------------------------------------
+# THRESHOLD HELPERS (mode + age অনুযায়ী SL distance)
+# -------------------------------------------------------------
+
+def _sl_thresholds(mode: str, age_sec: float):
+    """
+    mode ও trade এর বয়স দেখে দুইটা threshold ফেরত দেয়:
+    close_th  = Level-1 (YELLOW) এর জন্য approx distance
+    very_th   = Level-3 এর জন্য খুব কাছের SL
+    """
+    mode = (mode or "mid").lower()
+    if mode == "quick":
+        base_close = 0.008   # 0.8%
+        base_very = 0.004    # 0.4%
+    elif mode == "trend":
+        base_close = 0.015   # 1.5%
+        base_very = 0.010    # 1.0%
+    else:  # mid
+        base_close = 0.010   # 1.0%
+        base_very = 0.006    # 0.6%
+
+    # প্রথম ৫ মিনিটে extra কড়া guard
+    if age_sec < 300:
+        factor = 0.8
+    elif age_sec < 900:
+        factor = 1.0
+    else:
+        factor = 1.2
+
+    close_th = base_close * factor
+    very_th = base_very * factor
+    return close_th, very_th
+
+# -------------------------------------------------------------
+# OVERRIDE MESSAGE BUILDER
+# -------------------------------------------------------------
+
+def _build_override_message(
+    symbol: str,
+    mode: str,
+    level: int,
+    issues: List[str],
+    price: float,
+    dist_to_sl: float,
+    trade: Dict[str, Any],
+    btc_ok: bool,
+) -> str:
+    mode = (mode or "mid").upper()
+    issues_txt = ", ".join(issues)
+    base = [
+        f"Pair: {symbol}",
+        f"Mode: {mode}",
+        f"Issues: {issues_txt}",
+        f"Price: {price}",
+        f"Entry: {trade.get('entry')}",
+        f"TP: {trade.get('tp')}",
+        f"SL: {trade.get('sl')}",
+        f"SL distance: {dist_to_sl*100:.2f}%",
+        f"BTC_ok: {btc_ok}",
+        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+    ]
+    detail = "\n".join(base)
+
+    if level == 1:
+        title = "🟡 CAUTION — WATCH CLOSELY"
+        advice = "Note: Risk increased. SL tighten / partial exit ভাবতে পারো।"
+    elif level == 2:
+        title = "🟠 HIGH RISK — REVIEW POSITION"
+        advice = "Note: Strong warning. নতুন entry নিও না, চলমান trade দ্রুত review করো।"
+    else:  # 3
+        title = "🔴 ACTION: EXIT NOW — PROTECT CAPITAL"
+        advice = "Note: Aggressive scalper rule — সাথে সাথে exit নিলে বড় ক্ষতি থেকে বাঁচা যাবে।"
+
+    return f"{title}\n{detail}\n{advice}"
+
+# -------------------------------------------------------------
+# MAIN OVERRIDE WATCHER
+# -------------------------------------------------------------
+
 async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str]:
+    """
+    Main override watcher:
+    - নতুন signal থেকে ACTIVE_TRADES আপডেট করে
+    - প্রতি active trade এর জন্য market double-check
+    - condition গুলো থেকে ৩-লেভেলের alert return করে (string list)
+    """
     alerts: List[str] = []
-    if not active_signals:
+
+    # 1) active trade আপডেট
+    if isinstance(active_signals, list):
+        _update_active_trades(active_signals)
+
+    if not ACTIVE_TRADES:
         return alerts
 
+    # 2) একবারই BTC stable check
     try:
-        sl_info_map = await sl_before_touch_check(active_signals)
+        btc_info = await btc_stable()
+        btc_ok = bool(btc_info.get("ok", True))
+    except Exception:
+        btc_ok = True
 
-        for sig in active_signals:
-            try:
-                symbol = sig.get("symbol") or sig.get("pair") or sig.get("market")
-                if not symbol:
-                    continue
+    now = time.time()
 
-                issues: List[str] = []
-                detail_lines: List[str] = []
+    # 3) প্রতি trade এর জন্য check
+    for trade in list(ACTIVE_TRADES):
+        try:
+            symbol = trade["symbol"]
+            mode = trade.get("mode", "mid")
+            age_sec = now - trade.get("start_ts", now)
+            entry = float(trade.get("entry", 0.0))
+            sl = float(trade.get("sl", 0.0))
 
-                # SL distance
-                sl_info = sl_info_map.get(symbol)
-                if sl_info and sl_info["dist_pct"] <= 0.006:
-                    issues.append("SL_CLOSE")
-                    detail_lines.append(f"SL distance: {sl_info['dist_pct']:.4f}")
-                    if sl_info["low_liq"]:
-                        issues.append("LOW_BOOK_LIQUIDITY")
-                        detail_lines.append("Orderbook top liquidity low")
-
-                # OHLCV load
-                ohlcv_1m = ohlcv_15m = ohlcv_1h = None
-                if fetch_ohlcv:
-                    try:
-                        ohlcv_1m = await fetch_ohlcv(symbol, "1m", 80)
-                        ohlcv_15m = await fetch_ohlcv(symbol, "15m", 80)
-                        ohlcv_1h = await fetch_ohlcv(symbol, "1h", 80)
-                    except Exception:
-                        pass
-
-                # HTF misalign
-                if ohlcv_15m is not None and ohlcv_1h is not None:
-                    if not htf_alignment(ohlcv_15m, ohlcv_1h):
-                        issues.append("HTF_MISALIGN")
-                        detail_lines.append("15m vs 1h EMA conflict")
-
-                # Liquidity sweep
-                if ohlcv_1m is not None:
-                    sweep = detect_liquidity_sweep(ohlcv_1m)
-                    if sweep.get("sweep"):
-                        issues.append("LIQ_SWEEP")
-                        detail_lines.append(f"Sweep: {sweep.get('reason')}")
-
-                # Sudden spike
-                if ohlcv_1m is not None:
-                    spike = detect_sudden_spike(ohlcv_1m)
-                    if spike.get("spike"):
-                        issues.append("SUDDEN_SPIKE")
-                        detail_lines.append(f"Spike: {spike.get('reason')}")
-
-                if not issues:
-                    continue
-
-                parts = [
-                    "🚨 ACTION: EXIT NOW — PROTECT CAPITAL",
-                    f"Pair: {symbol}",
-                    f"Issues: {', '.join(issues)}",
-                    f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
-                ]
-
-                entry = sig.get("entry")
-                tp = sig.get("tp") or sig.get("tps")
-                sl = sig.get("sl")
-                if entry is not None:
-                    parts.append(f"Entry: {entry}")
-                if tp is not None:
-                    parts.append(f"TP: {tp}")
-                if sl is not None:
-                    parts.append(f"SL: {sl}")
-
-                if detail_lines:
-                    parts.append("Details:")
-                    parts.extend(detail_lines)
-
-                alert_text = "\n".join(parts)
-
-                if alert_text not in alerts:
-                    alerts.append(alert_text)
-
-            except Exception:
+            # fresh price data
+            ohlcv_1m = await fetch_ohlcv(symbol, "1m", 80)
+            if ohlcv_1m is None or ohlcv_1m.empty:
                 continue
 
-        return alerts
-    except Exception:
-        return alerts
+            df1 = _to_pd(ohlcv_1m)
+            if df1 is None or len(df1) < 5:
+                continue
+
+            current_price = float(df1["close"].iloc[-1])
+
+            if sl > 0:
+                dist_to_sl = abs(current_price - sl) / (current_price + 1e-12)
+            else:
+                dist_to_sl = 1.0  # দূরে ধরে নিলাম
+
+            close_th, very_th = _sl_thresholds(mode, age_sec)
+            sl_close = dist_to_sl <= close_th
+            sl_very_close = dist_to_sl <= very_th
+
+            # HTF data
+            ohlcv_15m = await fetch_ohlcv(symbol, "15m", 80)
+            ohlcv_1h = await fetch_ohlcv(symbol, "1h", 80)
+            htf_ok = True
+            if (
+                ohlcv_15m is not None
+                and not ohlcv_15m.empty
+                and ohlcv_1h is not None
+                and not ohlcv_1h.empty
+            ):
+                htf_ok = htf_alignment(ohlcv_15m, ohlcv_1h)
+
+            # sweep + spike
+            sweep_info = detect_liquidity_sweep(ohlcv_1m)
+            spike_info = detect_sudden_spike(ohlcv_1m)
+
+            sweep = bool(sweep_info.get("sweep"))
+            big_spike = bool(spike_info.get("spike")) and float(
+                spike_info.get("price_move", 0.0)
+            ) >= 0.02  # >= 2% move
+            small_spike = bool(spike_info.get("spike")) and not big_spike
+
+            # funding spike
+            funding_bad = False
+            try:
+                f = await fetch_funding(symbol)
+                funding_bad = abs(f) > 0.03
+            except Exception:
+                funding_bad = False
+
+            # --- issue list বানাও ---
+            issues: List[str] = []
+            level = 0
+
+            if not htf_ok:
+                issues.append("HTF_MISALIGN")
+            if sweep:
+                issues.append("LIQ_SWEEP")
+            if big_spike:
+                issues.append("BIG_SPIKE")
+            elif small_spike:
+                issues.append("SMALL_SPIKE")
+            if sl_very_close:
+                issues.append("SL_VERY_CLOSE")
+            elif sl_close:
+                issues.append("SL_CLOSE")
+            if not btc_ok:
+                issues.append("BTC_UNSTABLE")
+            if funding_bad:
+                issues.append("FUNDING_SPIKE")
+
+            if not issues:
+                LAST_ISSUES.pop(symbol, None)
+                continue
+
+            # ---- level decide ----
+            if (
+                sl_very_close
+                and (sweep or big_spike or not btc_ok or not htf_ok)
+            ) or (
+                (not htf_ok and (sweep or big_spike))
+            ) or (
+                not btc_ok and (big_spike or sl_close)
+            ):
+                level = 3
+            elif (
+                sl_close
+                or sweep
+                or big_spike
+                or (not htf_ok)
+                or (not btc_ok)
+                or funding_bad
+            ):
+                level = 2
+            else:
+                level = 1
+
+            if level == 0:
+                continue
+
+            issue_set = set(issues)
+            prev = LAST_ISSUES.get(symbol)
+
+            # ডুপ্লিকেট কমানোর জন্য:
+            if prev:
+                prev_level = prev.get("level", 0)
+                prev_issues = prev.get("issues", set())
+                if prev_level >= level and issue_set.issubset(prev_issues):
+                    continue
+
+            LAST_ISSUES[symbol] = {"level": level, "issues": issue_set}
+
+            msg = _build_override_message(
+                symbol=symbol,
+                mode=mode,
+                level=level,
+                issues=issues,
+                price=current_price,
+                dist_to_sl=dist_to_sl,
+                trade=trade,
+                btc_ok=btc_ok,
+            )
+            alerts.append(msg)
+
+        except Exception:
+            continue
+
+    return alerts
 
 # -------------------------------------------------------------
-# EXPORTS
+# EXPORT SYMBOLS
 # -------------------------------------------------------------
-__all__ = [
-    "scan_coin",
-    "run_mode",
-    "run_all_modes",
-    "multi_override_watch",
-    "format_signal",
-    "format_exit_alert",
-]
+try:
+    __all__  # type: ignore
+except NameError:
+    __all__ = []
+
+for name in ["scan_coin", "run_mode", "run_all_modes", "multi_override_watch", "format_signal"]:
+    if name not in __all__:
+        __all__.append(name)
