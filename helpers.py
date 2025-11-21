@@ -902,164 +902,221 @@ def cleanup_active_trades(max_age_sec: int = 3600) -> None:
         if now - ts <= max_age_sec:
             keep.append(t)
     ACTIVE_TRADES[:] = keep
+# -------------------------------------------------------------
+# R-BASED OVERRIDE DANGER LAYER (NO API) 
+# -------------------------------------------------------------
 
-# -------------------------------------------------------------
-# OVERRIDE WATCH (DANGER LAYER - MULTI LEVEL)
-# -------------------------------------------------------------
+def _compute_r_used(entry: float, sl: float, price: float, side: str) -> Tuple[float, bool]:
+    """
+    R = full SL risk.
+    returns (R_used, in_loss)
+    """
+    side = side.upper()
+    if entry <= 0 or sl <= 0 or price <= 0:
+        return 0.0, False
+
+    if side == "SELL":
+        total_risk_pct = abs(sl - entry) / entry
+        current_loss_pct = max(0.0, (price - entry) / entry)
+    else:  # BUY
+        total_risk_pct = abs(entry - sl) / entry
+        current_loss_pct = max(0.0, (entry - price) / entry)
+
+    if total_risk_pct <= 0:
+        return 0.0, False
+
+    r_used = current_loss_pct / total_risk_pct
+    in_loss = current_loss_pct > 0
+    return float(r_used), bool(in_loss)
+
+
+def _structure_flags(df: pd.DataFrame, side: str) -> Dict[str, bool]:
+    """
+    Very simple structure check using EMA20/50 and recent highs/lows.
+    """
+    flags = {
+        "trend_good": False,
+        "trend_bad": False,
+        "making_lower_lows": False,
+        "making_higher_highs": False,
+        "big_red_candle": False,
+    }
+    try:
+        if df is None or df.empty:
+            return flags
+
+        side = side.upper()
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        open_ = df["open"]
+
+        if len(close) < 25:
+            return flags
+
+        e20 = ema(close, 20).iloc[-1]
+        e50 = ema(close, 50).iloc[-1]
+        price = close.iloc[-1]
+
+        # trend direction (very simple)
+        if side == "BUY":
+            if price > e20 > e50:
+                flags["trend_good"] = True
+            if price < e20 and e20 < e50:
+                flags["trend_bad"] = True
+        else:  # SELL
+            if price < e20 < e50:
+                flags["trend_good"] = True
+            if price > e20 and e20 > e50:
+                flags["trend_bad"] = True
+
+        # recent HH/LL
+        recent_closes = close.tail(6).tolist()
+        if len(recent_closes) >= 4:
+            # simple lower-lows / higher-highs check
+            if recent_closes[-1] < recent_closes[-2] < recent_closes[-3]:
+                flags["making_lower_lows"] = True
+            if recent_closes[-1] > recent_closes[-2] > recent_closes[-3]:
+                flags["making_higher_highs"] = True
+
+        # big red candle (momentum against us)
+        last_o = float(open_.iloc[-1])
+        last_c = float(close.iloc[-1])
+        last_h = float(high.iloc[-1])
+        last_l = float(low.iloc[-1])
+        body = abs(last_c - last_o)
+        rng = last_h - last_l
+        if rng > 0 and body > rng * 0.5 and last_c < last_o:
+            # large bearish body
+            flags["big_red_candle"] = True
+
+        return flags
+    except Exception as e:
+        logger.error("structure_flags error: %s", e)
+        return flags
+
+
 async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str]:
     """
-    Decision layer / danger layer.
-
-    Every engine cycle:
-      - new signals (active_signals) -> register as ACTIVE_TRADES
-      - cleanup old trades
-      - for each ACTIVE_TRADE:
-          * check price vs SL distance
-          * check sudden wick/spike
-          * check BTC stability
-      - return alert texts (strings)
-
-    NOTE:
-      - This does NOT auto-close anything.
-      - You use the alerts to exit/hold manually.
+    R-based danger layer.
+    - No API, only price vs entry/SL + BTC mood + structure.
+    - Returns list of text alerts to send to Telegram.
     """
     alerts: List[str] = []
-
-    # 1) Register latest signals as active trades
-    try:
-        if isinstance(active_signals, list):
-            for sig in active_signals:
-                if sig.get("ok"):
-                    register_trade(sig)
-    except Exception as e:
-        logger.debug("multi_override_watch register error: %s", str(e))
-
-    # 2) Cleanup trades older than ~1 hour
-    cleanup_active_trades(max_age_sec=3600)
-
-    # 3) Snapshot copy
-    trades = list(ACTIVE_TRADES)
-    if not trades:
+    if not active_signals:
         return alerts
 
-    # 4) BTC stability once per cycle
+    # BTC mood (1m)
     try:
         btc_info = await btc_stable()
     except Exception as e:
-        logger.debug("btc_stable error: %s", str(e))
+        logger.error("btc_stable error in override: %s", e)
         btc_info = {"ok": True, "vol": 0.0, "wick": 0.0}
 
     btc_ok = bool(btc_info.get("ok", True))
 
-    # 5) Per-trade checks
-    for trade in trades:
+    for sig in active_signals:
         try:
-            symbol = trade.get("symbol")
+            if not isinstance(sig, dict):
+                continue
+            if not sig.get("ok"):
+                continue
+
+            symbol = sig.get("symbol") or sig.get("pair")
             if not symbol:
                 continue
 
-            mode = trade.get("mode", "quick").upper()
-            side = trade.get("side", "BUY").upper()
-            entry = float(trade.get("entry", 0.0))
-            sl = float(trade.get("sl", 0.0))
-            tp = float(trade.get("tp", 0.0))
+            entry = float(sig.get("entry", 0.0))
+            sl = float(sig.get("sl", 0.0))
+            tp = float(sig.get("tp", 0.0))
+            side = str(sig.get("side", "BUY")).upper()
+            mode = str(sig.get("mode", "quick")).upper()
 
             if entry <= 0 or sl <= 0:
                 continue
 
-            df = await fetch_ohlcv(symbol, "1m", 20)
+            # latest 1m candles
+            df = await fetch_ohlcv(symbol, "1m", 60)
             if df.empty:
                 continue
 
             price = float(df["close"].iloc[-1])
-            prev_close = float(df["close"].iloc[-2]) if len(df["close"]) > 1 else price
-            high_last = float(df["high"].iloc[-1])
-            low_last = float(df["low"].iloc[-1])
-            vol_last = float(df["volume"].iloc[-1])
-            vol_mean = float(df["volume"].tail(10).mean() or 0.0)
 
-            # distance to SL
-            dist_to_sl = abs(price - sl) / max(price, 1e-8)
+            # R-based loss usage
+            r_used, in_loss = _compute_r_used(entry, sl, price, side)
+            struct = _structure_flags(df, side)
 
-            # in loss?
-            if side == "SELL":
-                in_loss = price > entry
-            else:
-                in_loss = price < entry
+            level = None
+            reasons: List[str] = []
 
-            issues: List[str] = []
+            # Base level by R usage
+            if in_loss:
+                if r_used >= 0.9:
+                    level = "RED"
+                    reasons.append("Loss ~90-100% of SL (1R almost used)")
+                elif r_used >= 0.6:
+                    level = "ORANGE"
+                    reasons.append("Loss ~60% of SL")
+                elif r_used >= 0.3:
+                    level = "YELLOW"
+                    reasons.append("Loss ~30% of SL")
 
-            # 5.1 SL very close (within ~0.6%)
-            if in_loss and dist_to_sl <= 0.006:
-                issues.append(f"SL_VERY_CLOSE ({dist_to_sl*100:.2f}%)")
+            # Structure boosters
+            if in_loss and struct.get("trend_bad"):
+                reasons.append("Trend now against position (EMA)")
+                if level == "YELLOW":
+                    level = "ORANGE"
+            if in_loss and struct.get("making_lower_lows") and side == "BUY":
+                reasons.append("Making lower lows")
+                if level == "YELLOW":
+                    level = "ORANGE"
+            if in_loss and struct.get("big_red_candle"):
+                reasons.append("Strong red candle against position")
+                if level != "RED":
+                    level = "ORANGE" if level == "YELLOW" else "RED"
 
-            # 5.2 heavy wick (liquidity sweep style)
-            wick_pct = (high_last - low_last) / max(price, 1e-8) * 100.0
-            if wick_pct >= 1.5:
-                issues.append(f"HEAVY_WICK ({wick_pct:.2f}%)")
+            # BTC mood
+            if in_loss and not btc_ok:
+                reasons.append("BTC unstable")
+                if level == "YELLOW":
+                    level = "ORANGE"
+                elif level == "ORANGE":
+                    level = "RED"
 
-            # 5.3 sudden spike (price + volume)
-            move_pct = abs(price - prev_close) / max(prev_close, 1e-8) * 100.0
-            if vol_mean > 0 and vol_last > vol_mean * 1.5 and move_pct >= 0.7:
-                issues.append(f"SUDDEN_SPIKE ({move_pct:.2f}%, vol x{vol_last/max(vol_mean,1e-8):.2f})")
-
-            # 5.4 BTC unstable
-            if (not btc_ok) and in_loss:
-                issues.append("BTC_UNSTABLE")
-
-            if not issues:
+            # If no danger level, skip
+            if not level:
                 continue
 
-            # determine danger level
-            level = 1  # default: yellow
-            # strong red conditions
-            if dist_to_sl <= 0.003 and in_loss:
-                level = 3
-            if "HEAVY_WICK" in " ".join(issues) and "SL_VERY_CLOSE" in " ".join(issues):
-                level = 3
-            # orange
-            elif any(k in " ".join(issues) for k in ["HEAVY_WICK", "BTC_UNSTABLE", "SUDDEN_SPIKE"]) and level != 3:
-                level = 2
+            reason_txt = ", ".join(reasons) if reasons else "Risk high"
 
-            # build text
-            base_lines = [
-                f"Pair: {symbol}",
-                f"Mode: {mode}",
-                f"Side: {side}",
-                f"Issues: {', '.join(issues)}",
-                f"Price: {price}",
-                f"Entry: {entry}",
-                f"TP: {tp}",
-                f"SL: {sl}",
-                f"SL distance: {dist_to_sl*100:.2f}%",
-                f"BTC_ok: {btc_ok} (vol={btc_info.get('vol',0):.3f}%, wick={btc_info.get('wick',0):.3f}%)",
-                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
-            ]
-            detail = "\n".join(base_lines)
+            if level == "YELLOW":
+                title = "🟡 CAUTION ALERT"
+                action = "Closely watch the trade. Partial exit or tighter SL is safe."
+            elif level == "ORANGE":
+                title = "🟠 HIGH RISK ALERT"
+                action = "New entry avoid. Consider exiting or reducing size."
+            else:  # RED
+                title = "🔴 DANGER EXIT ALERT"
+                action = "Exit now if you want to avoid full SL (1R) loss."
 
-            if level == 1:
-                title = "🟡 CAUTION — WATCH CLOSELY"
-                advice = "Note: Risk barche. Ichchha hole SL tighten / partial exit korte paro."
-            elif level == 2:
-                title = "🟠 HIGH RISK — REVIEW POSITION"
-                advice = "Note: Strong warning. Notun entry niyo na, chaloman trade taratari review koro."
-            else:
-                title = "🔴 ACTION: EXIT NOW — PROTECT CAPITAL"
-                advice = "Note: Aggressive scalper rule — ekhuni exit nile boro khoti theke bachbe."
-
-            text = f"{title}\n{detail}\n{advice}"
-            alerts.append(text)
-
-            # email only for level 2/3 if SMTP configured
-            if level >= 2:
-                try:
-                    await send_email_async(f"Override Alert {symbol} ({title})", text)
-                except Exception:
-                    pass
+            msg = f"""{title}
+Pair: {symbol}
+Mode: {mode}
+Side: {side}
+Reason: {reason_txt}
+ENTRY: {entry}
+TP:    {tp}
+SL:    {sl}
+Price now: {price}
+Action: {action}
+"""
+            alerts.append(msg)
 
         except Exception as e:
-            logger.debug("multi_override_watch per-trade error: %s", str(e))
+            logger.error("multi_override_watch item error: %s", e)
             continue
+
+    return alerts
 
     # deduplicate
     unique: List[str] = []
