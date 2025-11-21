@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import time
+import smtplib
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -46,6 +47,56 @@ MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.015"))       # 1.5% hard cap
 
 # Concurrency limit for async scans (do not spam Binance)
 MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "10"))
+
+# -------------------------------------------------------------
+# EMAIL ALERT CONFIG / HELPER
+# -------------------------------------------------------------
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
+SMTP_TO = os.getenv("SMTP_TO", "")
+SMTP_TLS = os.getenv("SMTP_TLS", "1")  # "1" -> use starttls
+
+
+async def send_email_async(subject: str, body: str) -> None:
+    """
+    Simple async email sender for danger alerts.
+    If SMTP env not set, it silently skips.
+    """
+    if not (SMTP_HOST and SMTP_TO):
+        # no smtp configured, skip
+        return
+
+    def _send() -> None:
+        try:
+            msg = (
+                f"From: {SMTP_FROM}\r\n"
+                f"To: {SMTP_TO}\r\n"
+                f"Subject: {subject}\r\n"
+                "\r\n"
+                f"{body}"
+            )
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+                try:
+                    if SMTP_TLS == "1":
+                        server.starttls()
+                except Exception:
+                    pass
+                if SMTP_USER and SMTP_PASS:
+                    try:
+                        server.login(SMTP_USER, SMTP_PASS)
+                    except Exception:
+                        pass
+                server.sendmail(SMTP_FROM or SMTP_USER, [SMTP_TO], msg.encode("utf-8", "ignore"))
+        except Exception as e:
+            logger.warning("send_email_async inner error: %s", str(e))
+
+    try:
+        await asyncio.to_thread(_send)
+    except Exception as e:
+        logger.warning("send_email_async failed: %s", str(e))
 
 # -------------------------------------------------------------
 # BINANCE HTTP SESSION
@@ -179,6 +230,7 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
 def vwap(df: pd.DataFrame) -> pd.Series:
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
     return (typical * df["volume"]).cumsum() / df["volume"].cumsum()
+
 # -------------------------------------------------------------
 # BTC STABILITY + HTF PATTERN
 # -------------------------------------------------------------
@@ -418,6 +470,7 @@ def cooldown_ok(symbol: str) -> bool:
 
 def set_cooldown(symbol: str) -> None:
     COOLDOWN[symbol] = int(time.time())
+
 # -------------------------------------------------------------
 # COIN LIST (50) + GROUPS + WEIGHTS
 # -------------------------------------------------------------
@@ -585,6 +638,7 @@ async def calc_tp_sl(entry: float, symbol: str, mode: str, side: str = "BUY") ->
         "tp_pct": tp_pct,
         "sl_pct": sl_pct,
     }
+
 # -------------------------------------------------------------
 # BUILD SIGNAL (CORE LOGIC)
 # -------------------------------------------------------------
@@ -707,6 +761,7 @@ async def run_all_modes() -> Dict[str, List[Dict[str, Any]]]:
     out["mid"] = await run_mode("mid")
     out["trend"] = await run_mode("trend")
     return out
+
 # -------------------------------------------------------------
 # TIME HELPERS (UTC -> IST)
 # -------------------------------------------------------------
@@ -818,78 +873,202 @@ SL:    {sl}
     return text
 
 # -------------------------------------------------------------
-# SIMPLE OVERRIDE WATCH (DANGER HINT)
+# ACTIVE TRADES STORE (FOR OVERRIDE MONITORING)
+# -------------------------------------------------------------
+ACTIVE_TRADES: List[Dict[str, Any]] = []
+
+
+def register_trade(sig: Dict[str, Any]) -> None:
+    """
+    Register a signal as an active trade.
+    We assume: signal alert == you took the trade.
+    """
+    if not isinstance(sig, dict):
+        return
+    item = dict(sig)
+    item["activated_at"] = int(time.time())
+    ACTIVE_TRADES.append(item)
+
+
+def cleanup_active_trades(max_age_sec: int = 3600) -> None:
+    """
+    Keep only trades opened within last max_age_sec seconds.
+    Default ~1 hour.
+    """
+    now = int(time.time())
+    keep: List[Dict[str, Any]] = []
+    for t in ACTIVE_TRADES:
+        ts = t.get("activated_at", now)
+        if now - ts <= max_age_sec:
+            keep.append(t)
+    ACTIVE_TRADES[:] = keep
+
+# -------------------------------------------------------------
+# OVERRIDE WATCH (DANGER LAYER - MULTI LEVEL)
 # -------------------------------------------------------------
 async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str]:
     """
-    Very lightweight danger layer.
-    For each active signal dict:
-      - check price vs SL distance
-      - check BTC stability
-    Returns list of alert messages (strings).
+    Decision layer / danger layer.
+
+    Every engine cycle:
+      - new signals (active_signals) -> register as ACTIVE_TRADES
+      - cleanup old trades
+      - for each ACTIVE_TRADE:
+          * check price vs SL distance
+          * check sudden wick/spike
+          * check BTC stability
+      - return alert texts (strings)
+
+    NOTE:
+      - This does NOT auto-close anything.
+      - You use the alerts to exit/hold manually.
     """
     alerts: List[str] = []
-    if not active_signals:
+
+    # 1) Register latest signals as active trades
+    try:
+        if isinstance(active_signals, list):
+            for sig in active_signals:
+                if sig.get("ok"):
+                    register_trade(sig)
+    except Exception as e:
+        logger.debug("multi_override_watch register error: %s", str(e))
+
+    # 2) Cleanup trades older than ~1 hour
+    cleanup_active_trades(max_age_sec=3600)
+
+    # 3) Snapshot copy
+    trades = list(ACTIVE_TRADES)
+    if not trades:
         return alerts
 
-    btc_info = await btc_stable()
+    # 4) BTC stability once per cycle
+    try:
+        btc_info = await btc_stable()
+    except Exception as e:
+        logger.debug("btc_stable error: %s", str(e))
+        btc_info = {"ok": True, "vol": 0.0, "wick": 0.0}
 
-    for sig in active_signals:
+    btc_ok = bool(btc_info.get("ok", True))
+
+    # 5) Per-trade checks
+    for trade in trades:
         try:
-            if not sig.get("ok"):
+            symbol = trade.get("symbol")
+            if not symbol:
                 continue
-            symbol = sig.get("symbol")
-            mode = sig.get("mode", "quick").upper()
-            entry = float(sig.get("entry"))
-            sl = float(sig.get("sl"))
-            tp = float(sig.get("tp"))
-            side = sig.get("side", "BUY").upper()
 
-            df = await fetch_ohlcv(symbol, "1m", 5)
+            mode = trade.get("mode", "quick").upper()
+            side = trade.get("side", "BUY").upper()
+            entry = float(trade.get("entry", 0.0))
+            sl = float(trade.get("sl", 0.0))
+            tp = float(trade.get("tp", 0.0))
+
+            if entry <= 0 or sl <= 0:
+                continue
+
+            df = await fetch_ohlcv(symbol, "1m", 20)
             if df.empty:
                 continue
-            price = float(df["close"].iloc[-1])
 
+            price = float(df["close"].iloc[-1])
+            prev_close = float(df["close"].iloc[-2]) if len(df["close"]) > 1 else price
+            high_last = float(df["high"].iloc[-1])
+            low_last = float(df["low"].iloc[-1])
+            vol_last = float(df["volume"].iloc[-1])
+            vol_mean = float(df["volume"].tail(10).mean() or 0.0)
+
+            # distance to SL
+            dist_to_sl = abs(price - sl) / max(price, 1e-8)
+
+            # in loss?
             if side == "SELL":
-                dist_to_sl = abs(price - sl) / max(price, 1e-8)
                 in_loss = price > entry
             else:
-                dist_to_sl = abs(price - sl) / max(price, 1e-8)
                 in_loss = price < entry
 
-            danger = False
-            reasons = []
+            issues: List[str] = []
 
-            # near SL
-            if dist_to_sl < 0.003 and in_loss:  # <0.3% and currently in loss
-                danger = True
-                reasons.append("SL very close")
+            # 5.1 SL very close (within ~0.6%)
+            if in_loss and dist_to_sl <= 0.006:
+                issues.append(f"SL_VERY_CLOSE ({dist_to_sl*100:.2f}%)")
 
-            # BTC unstable
-            if not btc_info.get("ok", True) and in_loss:
-                danger = True
-                reasons.append("BTC unstable")
+            # 5.2 heavy wick (liquidity sweep style)
+            wick_pct = (high_last - low_last) / max(price, 1e-8) * 100.0
+            if wick_pct >= 1.5:
+                issues.append(f"HEAVY_WICK ({wick_pct:.2f}%)")
 
-            if not danger:
+            # 5.3 sudden spike (price + volume)
+            move_pct = abs(price - prev_close) / max(prev_close, 1e-8) * 100.0
+            if vol_mean > 0 and vol_last > vol_mean * 1.5 and move_pct >= 0.7:
+                issues.append(f"SUDDEN_SPIKE ({move_pct:.2f}%, vol x{vol_last/max(vol_mean,1e-8):.2f})")
+
+            # 5.4 BTC unstable
+            if (not btc_ok) and in_loss:
+                issues.append("BTC_UNSTABLE")
+
+            if not issues:
                 continue
 
-            reason_txt = ", ".join(reasons) or "Risk high"
+            # determine danger level
+            level = 1  # default: yellow
+            # strong red conditions
+            if dist_to_sl <= 0.003 and in_loss:
+                level = 3
+            if "HEAVY_WICK" in " ".join(issues) and "SL_VERY_CLOSE" in " ".join(issues):
+                level = 3
+            # orange
+            elif any(k in " ".join(issues) for k in ["HEAVY_WICK", "BTC_UNSTABLE", "SUDDEN_SPIKE"]) and level != 3:
+                level = 2
 
-            msg = f"""🚨 DANGER ALERT
-Pair: {symbol}
-Mode: {mode}
-Reason: {reason_txt}
-ENTRY: {entry}
-TP:    {tp}
-SL:    {sl}
-Price now: {price}
-"""
-            alerts.append(msg)
+            # build text
+            base_lines = [
+                f"Pair: {symbol}",
+                f"Mode: {mode}",
+                f"Side: {side}",
+                f"Issues: {', '.join(issues)}",
+                f"Price: {price}",
+                f"Entry: {entry}",
+                f"TP: {tp}",
+                f"SL: {sl}",
+                f"SL distance: {dist_to_sl*100:.2f}%",
+                f"BTC_ok: {btc_ok} (vol={btc_info.get('vol',0):.3f}%, wick={btc_info.get('wick',0):.3f}%)",
+                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+            ]
+            detail = "\n".join(base_lines)
+
+            if level == 1:
+                title = "🟡 CAUTION — WATCH CLOSELY"
+                advice = "Note: Risk barche. Ichchha hole SL tighten / partial exit korte paro."
+            elif level == 2:
+                title = "🟠 HIGH RISK — REVIEW POSITION"
+                advice = "Note: Strong warning. Notun entry niyo na, chaloman trade taratari review koro."
+            else:
+                title = "🔴 ACTION: EXIT NOW — PROTECT CAPITAL"
+                advice = "Note: Aggressive scalper rule — ekhuni exit nile boro khoti theke bachbe."
+
+            text = f"{title}\n{detail}\n{advice}"
+            alerts.append(text)
+
+            # email only for level 2/3 if SMTP configured
+            if level >= 2:
+                try:
+                    await send_email_async(f"Override Alert {symbol} ({title})", text)
+                except Exception:
+                    pass
+
         except Exception as e:
-            logger.error("multi_override_watch item error: %s", e)
+            logger.debug("multi_override_watch per-trade error: %s", str(e))
             continue
 
-    return alerts
+    # deduplicate
+    unique: List[str] = []
+    seen: set = set()
+    for a in alerts:
+        if a not in seen:
+            unique.append(a)
+            seen.add(a)
+    return unique
 
 # -------------------------------------------------------------
 # EXPORTS
