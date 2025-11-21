@@ -1110,7 +1110,9 @@ async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str
         if a not in seen:
             unique.append(a)
             seen.add(a)
-    return unique -------------------------------------------------------------
+    return unique
+EXPORTS
+# -------------------------------------------------------------
 __all__ = [
     "run_all_modes",
     "multi_override_watch",
