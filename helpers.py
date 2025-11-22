@@ -340,6 +340,8 @@ def calc_score_v2(
 
     if bias == "bull":
         score += 10
+    elif bias == "bear":
+        score += 10
 
     if pa.get("sweep"):
         score += 10
@@ -352,9 +354,9 @@ def calc_score_v2(
     if pa.get("fvg") != "none":
         score += 10
 
-    if htf.get("15m") in ("bull_engulf", "hammer"):
+    if htf.get("15m") in ("bull_engulf", "hammer", "bear_engulf", "shooting_star"):
         score += 10
-    if htf.get("1h") in ("bull_engulf", "hammer"):
+    if htf.get("1h") in ("bull_engulf", "hammer", "bear_engulf", "shooting_star"):
         score += 10
 
     if spr_ok:
@@ -438,6 +440,8 @@ async def build_signal_v2(symbol: str, mode: str) -> Dict[str, Any]:
     if bias == "none":
         return {"ok": False, "reason": "bias_none"}
 
+    side = "BUY" if bias == "bull" else "SELL"
+
     htf = {
         "15m": detect_pattern(await fetch_ohlcv(symbol, "15m", 50)),
         "1h": detect_pattern(await fetch_ohlcv(symbol, "1h", 50)),
@@ -459,7 +463,7 @@ async def build_signal_v2(symbol: str, mode: str) -> Dict[str, Any]:
         return {"ok": False, "reason": "low_score"}
 
     entry = float(df1m["close"].iloc[-1])
-    tpsl = await smart_tp_sl(symbol, entry, "BUY", mode, df1m)
+    tpsl = await smart_tp_sl(symbol, entry, side, mode, df1m)
     pos = await calc_position_size(symbol, entry, tpsl["sl"], mode)
 
     set_cooldown(symbol)
@@ -467,7 +471,7 @@ async def build_signal_v2(symbol: str, mode: str) -> Dict[str, Any]:
         "ok": True,
         "symbol": symbol,
         "mode": mode,
-        "side": "BUY",
+        "side": side,
         "entry": entry,
         "tp": tpsl["tp"],
         "sl": tpsl["sl"],
