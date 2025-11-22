@@ -7,7 +7,6 @@ Exposed:
   format_signal()
   send_telegram()
   log_signal()
-  backtest_symbol()
   dynamic_risk_pct()
   trailing_tp_sl()
 """
@@ -45,8 +44,8 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID   = os.getenv("TG_CHAT_ID")
 
 # ----------------- CONST -----------------
-BINANCE_BASE    = "https://api.binance.com"
-BINANCE_FUTURES = "https://fapi.binance.com"
+BINANCE_BASE    = "https://api.binance.com "
+BINANCE_FUTURES = "https://fapi.binance.com "
 
 KILLZONES = {
     "asia":   (0, 8),
@@ -566,7 +565,7 @@ async def run_all_modes() -> Dict[str, List[Dict[str, Any]]]:
 async def send_telegram(text: str) -> None:
     if not (TG_BOT_TOKEN and TG_CHAT_ID):
         return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot {TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
         async with aiohttp.ClientSession() as s:
@@ -766,49 +765,6 @@ async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str
 
     return alerts
 
-# ----------------- BACKTEST ENGINE -----------------
-async def backtest_symbol(symbol: str, mode: str, csv_path: str) -> List[Dict[str, Any]]:
-    df = pd.read_csv(csv_path)
-    df["open_time"] = pd.to_datetime(df["open_time"])
-
-    results = []
-    for i in range(50, len(df)):
-        chunk = df.iloc[i-50:i]
-        # mock last row as "live"
-        sig = await build_signal_v2(symbol, mode)
-        if not sig.get("ok"):
-            continue
-
-        entry = sig["entry"]
-        sl = sig["sl"]
-        tp = sig["tp"]
-        side = sig["side"]
-
-        # check next 10 candles for hit
-        future = df.iloc[i:i+10]
-        for _, row in future.iterrows():
-            price = row["close"]
-            if side == "BUY":
-                if price <= sl:
-                    pnl = (sl - entry) / entry * 100
-                    results.append({"symbol": symbol, "side": side, "pnl": pnl, "hit": "SL"})
-                    break
-                if price >= tp:
-                    pnl = (tp - entry) / entry * 100
-                    results.append({"symbol": symbol, "side": side, "pnl": pnl, "hit": "TP"})
-                    break
-            else:  # SELL
-                if price >= sl:
-                    pnl = (entry - sl) / entry * 100
-                    results.append({"symbol": symbol, "side": side, "pnl": pnl, "hit": "SL"})
-                    break
-                if price <= tp:
-                    pnl = (entry - tp) / entry * 100
-                    results.append({"symbol": symbol, "side": side, "pnl": pnl, "hit": "TP"})
-                    break
-
-    return results
-
 # ----------------- COIN LIST -----------------
 COIN_LIST: List[str] = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT",
@@ -827,7 +783,6 @@ __all__ = [
     "format_signal",
     "send_telegram",
     "log_signal",
-    "backtest_symbol",
     "dynamic_risk_pct",
     "trailing_tp_sl",
 ]
