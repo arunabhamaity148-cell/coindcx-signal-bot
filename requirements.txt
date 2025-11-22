@@ -1,6 +1,5 @@
-aiohttp
-pandas
-numpy
-python-dotenv
-fastapi
-uvicorn
+aiohttp>=3.9
+pandas>=2.0
+python-dotenv>=1.0
+investpy==1.0.7
+ccxt==4.2.18
