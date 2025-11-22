@@ -1,6 +1,6 @@
 """
 helpers.py – Sniper-grade Binance scalper engine
-ASCII-only, async, ICT-aware, ADR-aware, news-aware.
+Live news, dynamic size, emoji TG, zero-error.
 Exposed:
   run_all_modes()
   multi_override_watch()
@@ -22,10 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 load_dotenv()
 
-# ----------- auto-create log dir -----------
 os.makedirs("logs", exist_ok=True)
-
-# ----------- logging -----------
 logging.basicConfig(
     filename="logs/signals.log",
     level=logging.INFO,
@@ -111,7 +108,6 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.rolling(n).mean()
 
 async def adr(symbol: str) -> float:
-    """14-day average daily range in %"""
     df1d = await fetch_ohlcv(symbol, "1d", 15)
     if df1d.empty: return 3.0
     ranges = (df1d["high"] - df1d["low"]) / df1d["close"] * 100
@@ -130,13 +126,21 @@ def killzone_active(mode: str) -> bool:
     start, end = KILLZONES[sess]
     return start <= datetime.utcnow().hour < end
 
-# ----------------- NEWS DUMMY FILTER -----------------
-HIGH_IMPACT = [(12,30), (14,30), (12,0)]  # UTC (h,m)
-def news_block() -> bool:
-    now = datetime.utcnow()
-    for h,m in HIGH_IMPACT:
-        t = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if abs((now-t).total_seconds()) < 900: return True
+# ----------------- LIVE NEWS (investpy) -----------------
+def high_impact_now(minutes: int = 15) -> bool:
+    try:
+        import investpy
+        today = datetime.utcnow().strftime("%d/%m/%Y")
+        cal = investpy.economic_calendar(time_zone='GMT', countries=['united states', 'euro zone', 'united kingdom'],
+                                         from_date=today, to_date=today)
+        if cal.empty: return False
+        cal['time'] = pd.to_datetime(cal['time'], format='%H:%M:%S').dt.tz_localize(None)
+        now = datetime.utcnow()
+        for _, row in cal.iterrows():
+            if row['impact'] == 'High' and abs((row['time'] - now).total_seconds()) < minutes*60:
+                return True
+    except Exception as e:
+        logger.warning("news check fail: %s", e)
     return False
 
 # ----------------- BIAS -----------------
@@ -235,6 +239,30 @@ def calc_score_v2(symbol: str, df: pd.DataFrame, htf: Dict, pa: Dict, spr_ok: bo
     if fund_ok: score += 5
     return min(score, 100)
 
+# ----------------- DYNAMIC POSITION SIZE -----------------
+async def fetch_balance_usdt() -> float:
+    """Binance futures USDT balance via ccxt (read-only API)"""
+    try:
+        import ccxt
+        exchange = ccxt.binance({
+            'apiKey': os.getenv('BINANCE_KEY', ''),
+            'secret': os.getenv('BINANCE_SECRET', ''),
+            'options': {'defaultType': 'future'}
+        })
+        bal = exchange.fetch_balance()
+        return float(bal['USDT']['free'])
+    except Exception as e:
+        logger.warning("balance fetch fail: %s, using BASE_CAPITAL")
+        return BASE_CAPITAL
+
+async def calc_position_size(symbol: str, entry: float, sl: float, mode: str) -> Dict[str, float]:
+    balance = await fetch_balance_usdt()
+    risk_amt = balance * BASE_RISK_PCT
+    sl_dist = abs(entry - sl)
+    if sl_dist == 0: return {"pos_size_usdt": 0, "risk_usdt": 0}
+    size = risk_amt / sl_dist * entry
+    return {"pos_size_usdt": round(size, 2), "risk_usdt": round(risk_amt, 2)}
+
 # ----------------- BUILD SIGNAL v2 -----------------
 COOLDOWN: Dict[str, int] = {}
 def cooldown_ok(sym: str) -> bool:
@@ -244,7 +272,7 @@ def set_cooldown(sym: str): COOLDOWN[sym] = int(time.time())
 async def build_signal_v2(symbol: str, mode: str) -> Dict[str, Any]:
     mode = mode.lower()
     if not cooldown_ok(symbol): return {"ok": False, "reason": "cooldown"}
-    if news_block(): return {"ok": False, "reason": "news_block"}
+    if high_impact_now(): return {"ok": False, "reason": "news_block"}
     if not killzone_active(mode): return {"ok": False, "reason": "killzone"}
 
     df1m = await fetch_ohlcv(symbol, "1m", 200)
@@ -275,11 +303,13 @@ async def build_signal_v2(symbol: str, mode: str) -> Dict[str, Any]:
 
     entry = float(df1m["close"].iloc[-1])
     tpsl = await smart_tp_sl(symbol, entry, "BUY", mode, df1m)
+    pos = await calc_position_size(symbol, entry, tpsl["sl"], mode)
 
     set_cooldown(symbol)
     return {"ok": True, "symbol": symbol, "mode": mode, "side": "BUY",
             "entry": entry, "tp": tpsl["tp"], "sl": tpsl["sl"],
             "score": score, "htf": htf, "pa": pa,
+            "pos": pos,
             "time_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}
 
 # ----------------- RUNNER -----------------
@@ -305,7 +335,7 @@ async def run_all_modes() -> Dict[str, List[Dict]]:
 async def send_telegram(text: str):
     if not (TG_BOT_TOKEN and TG_CHAT_ID): return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text}
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
         async with aiohttp.ClientSession() as s:
             await s.post(url, json=payload)
@@ -318,15 +348,42 @@ def log_signal(sig: Dict):
         writer.writerow([sig["time_utc"], sig["symbol"], sig["side"], sig["entry"],
                          sig["tp"], sig["sl"], sig["score"], sig["mode"]])
 
-# ----------------- FORMATTER -----------------
+# ----------------- EMOJI RICH TG FORMATTER -----------------
 def format_signal(sig: Dict, no: int) -> str:
-    return f"""🔥 {sig['side']} {sig['mode'].upper()} #{no}
-Pair: {sig['symbol']}
-Score: {sig['score']}
-Entry: {sig['entry']}
-TP: {sig['tp']}
-SL: {sig['sl']}
-UTC: {sig['time_utc']}"""
+    symbol = sig["symbol"]
+    mode   = sig["mode"].upper()
+    side   = sig["side"]
+    score  = sig["score"]
+    entry  = sig["entry"]
+    tp     = sig["tp"]
+    sl     = sig["sl"]
+    pos    = sig.get("pos", {})
+    time_utc = sig["time_utc"]
+    htf    = sig.get("htf", {})
+    pa     = sig.get("pa", {})
+
+    ist_time = (datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S") + timedelta(hours=5, minutes=30)).strftime("%I:%M %p")
+    hold_till = (datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S") + timedelta(minutes={"quick":15,"mid":45,"trend":120}[mode])).strftime("%I:%M %p")
+
+    emoji_side = "🟢" if side == "BUY" else "🔴"
+    emoji_mode = {"QUICK": "⚡", "MID": "🎯", "TREND": "📈"}.get(mode, "🎯")
+
+    return f"""
+{emoji_side} <b>{side} {emoji_mode} {mode}</b>  #{no}
+┏━━━━━━━━━━━━━━━━━━━━
+┃ 📌 <b>{symbol}</b>  |  Score: <b>{score}/100</b>
+┗━━━━━━━━━━━━━━━━━━━━
+🔍 HTF 15m: <code>{htf.get('15m','none')}</code>  |  1h: <code>{htf.get('1h','none')}</code>
+📊 PA: Sweep {pa.get('sweep')}  |  OB: {pa.get('ob')}  |  FVG: {pa.get('fvg')}
+💰 Size: <b>{pos.get('pos_size_usdt',0)} USDT</b>  |  Risk: {pos.get('risk_usdt',0)} USDT
+🕐 IST: {ist_time}  |  Hold till: {hold_till}
+┏━━━━━━━━━━━━━━━━━━━━
+┃ 💥 COPY BLOCK
+┃ Entry: <code>{entry}</code>
+┃ TP:    <code>{tp}</code>
+┃ SL:    <code>{sl}</code>
+┗━━━━━━━━━━━━━━━━━━━━
+"""
 
 # ----------------- OVERRIDE WATCH (short) -----------------
 ACTIVE_TRADES: List[Dict] = []
@@ -375,8 +432,8 @@ async def multi_override_watch(active_signals: List[Dict]) -> List[str]:
         if not level: continue
 
         emoji = {"EMERGENCY": "🔴", "HIGH": "🟠", "CAUTION": "🟡"}.get(level, "⚠️")
-        alerts.append(f"{emoji} {level} ALERT\nPair: {symbol}\nReasons:\n- " + "\n- ".join(reasons) +
-                      f"\nEntry: {entry}\nTP: {tp}\nSL: {sl}\nNow: {price:.4f} ({move_pct:+.2f}%)")
+        alerts.append(f"{emoji} <b>{level} ALERT</b>\n📌 <b>{symbol}</b>\nReasons:\n- " + "\n- ".join(reasons) +
+                      f"\nEntry: <code>{entry}</code>\nTP: <code>{tp}</code>\nSL: <code>{sl}</code>\nNow: <code>{price:.4f}</code> ({move_pct:+.2f}%)")
     return alerts
 
 # ----------------- COIN LIST -----------------
