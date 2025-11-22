@@ -1,12 +1,15 @@
 """
 helpers.py – Sniper-grade Binance scalper engine
-Live news, dynamic size, emoji TG, zero-error.
+Backtest, dynamic risk, trailing TP, emoji TG, zero-error.
 Exposed:
   run_all_modes()
   multi_override_watch()
   format_signal()
   send_telegram()
   log_signal()
+  backtest_symbol()
+  dynamic_risk_pct()
+  trailing_tp_sl()
 """
 
 import asyncio
@@ -203,7 +206,32 @@ async def ssl_hybrid_bias(symbol: str) -> str:
         return "bear"
     return "none"
 
-# ----------------- SMART TP/SL -----------------
+# ----------------- DYNAMIC RISK % -----------------
+async def dynamic_risk_pct(symbol: str, mode: str) -> float:
+    adr_val = await adr(symbol)
+    spr = await fetch_spread(symbol)
+    fund = abs(await fetch_funding(symbol))
+
+    # Base risk
+    risk = BASE_RISK_PCT
+
+    # ADR based
+    if adr_val > 8:
+        risk *= 0.7
+    elif adr_val < 4:
+        risk *= 1.2
+
+    # Spread based
+    if spr > 0.05:
+        risk *= 0.8
+
+    # Funding based
+    if fund > 0.05:
+        risk *= 0.8
+
+    return min(risk, MAX_RISK_PCT)
+
+# ----------------- SMART TP/SL + TRAILING -----------------
 async def smart_tp_sl(
     symbol: str,
     entry: float,
@@ -225,6 +253,37 @@ async def smart_tp_sl(
         tp = entry - sl_dist * rrr
 
     return {"tp": round(tp, 8), "sl": round(sl, 8), "atr": float(atrv)}
+
+# ----------------- TRAILING TP/SL MONITOR -----------------
+async def trailing_tp_sl(
+    symbol: str,
+    side: str,
+    entry: float,
+    tp: float,
+    sl: float,
+    df: pd.DataFrame,
+) -> Dict[str, float]:
+    price = df["close"].iloc[-1]
+    side = side.upper()
+
+    if side == "BUY":
+        move = (price - entry) / entry * 100
+        dist_tp = (tp - price) / price * 100
+        if move >= 0.8 and dist_tp <= 0.3:
+            # Trail SL to entry
+            sl = entry
+        if move >= 1.2 and dist_tp <= 0.2:
+            # Trail TP closer
+            tp = price + (tp - price) * 0.5
+    else:
+        move = (entry - price) / entry * 100
+        dist_tp = (price - tp) / price * 100
+        if move >= 0.8 and dist_tp <= 0.3:
+            sl = entry
+        if move >= 1.2 and dist_tp <= 0.2:
+            tp = price - (price - tp) * 0.5
+
+    return {"tp": round(tp, 8), "sl": round(sl, 8)}
 
 # ----------------- PATTERN -----------------
 def detect_pattern(df: pd.DataFrame) -> str:
@@ -338,9 +397,7 @@ def calc_score_v2(
         if ema(close, 20).iloc[-1] > ema(close, 50).iloc[-1]:
             score += 15
 
-    if bias == "bull":
-        score += 10
-    elif bias == "bear":
+    if bias in ("bull", "bear"):
         score += 10
 
     if pa.get("sweep"):
@@ -393,7 +450,7 @@ async def calc_position_size(
     mode: str,
 ) -> Dict[str, float]:
     balance = await fetch_balance_usdt()
-    risk_pct = BASE_RISK_PCT
+    risk_pct = await dynamic_risk_pct(symbol, mode)
     risk_amt = balance * risk_pct
     sl_dist = abs(entry - sl)
     if sl_dist == 0:
@@ -615,6 +672,11 @@ async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str
             datetime.utcnow() - datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")
         ).total_seconds() / 60
 
+        # Trailing update
+        trail = await trailing_tp_sl(symbol, side, entry, tp, sl, df)
+        tp = trail["tp"]
+        sl = trail["sl"]
+
         if side == "BUY":
             move_pct = (price - entry) / entry * 100
             dist_sl = abs(price - sl) / price * 100
@@ -703,6 +765,49 @@ async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str
 
     return alerts
 
+# ----------------- BACKTEST ENGINE -----------------
+async def backtest_symbol(symbol: str, mode: str, csv_path: str) -> List[Dict[str, Any]]:
+    df = pd.read_csv(csv_path)
+    df["open_time"] = pd.to_datetime(df["open_time"])
+
+    results = []
+    for i in range(50, len(df)):
+        chunk = df.iloc[i-50:i]
+        # mock last row as "live"
+        sig = await build_signal_v2(symbol, mode)
+        if not sig.get("ok"):
+            continue
+
+        entry = sig["entry"]
+        sl = sig["sl"]
+        tp = sig["tp"]
+        side = sig["side"]
+
+        # check next 10 candles for hit
+        future = df.iloc[i:i+10]
+        for _, row in future.iterrows():
+            price = row["close"]
+            if side == "BUY":
+                if price <= sl:
+                    pnl = (sl - entry) / entry * 100
+                    results.append({"symbol": symbol, "side": side, "pnl": pnl, "hit": "SL"})
+                    break
+                if price >= tp:
+                    pnl = (tp - entry) / entry * 100
+                    results.append({"symbol": symbol, "side": side, "pnl": pnl, "hit": "TP"})
+                    break
+            else:  # SELL
+                if price >= sl:
+                    pnl = (entry - sl) / entry * 100
+                    results.append({"symbol": symbol, "side": side, "pnl": pnl, "hit": "SL"})
+                    break
+                if price <= tp:
+                    pnl = (entry - tp) / entry * 100
+                    results.append({"symbol": symbol, "side": side, "pnl": pnl, "hit": "TP"})
+                    break
+
+    return results
+
 # ----------------- COIN LIST -----------------
 COIN_LIST: List[str] = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT",
@@ -711,6 +816,7 @@ COIN_LIST: List[str] = [
     "RUNEUSDT", "ALGOUSDT", "EGLDUSDT", "IMXUSDT", "INJUSDT", "OPUSDT", "ARBUSDT", "SUIUSDT",
     "TIAUSDT", "PEPEUSDT", "TRBUSDT", "SEIUSDT", "JTOUSDT", "PYTHUSDT", "RAYUSDT", "GMTUSDT",
     "MINAUSDT", "WLDUSDT", "ZKUSDT", "STRKUSDT", "DYDXUSDT", "VETUSDT", "GALAUSDT", "KAVAUSDT",
+    "FETUSDT", "RNDRUSDT", "ARUSDT", "AAVEUSDT"
 ]
 
 # ----------------- EXPORT -----------------
@@ -720,4 +826,7 @@ __all__ = [
     "format_signal",
     "send_telegram",
     "log_signal",
+    "backtest_symbol",
+    "dynamic_risk_pct",
+    "trailing_tp_sl",
 ]
