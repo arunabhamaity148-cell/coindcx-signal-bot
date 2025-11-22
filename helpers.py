@@ -1,6 +1,6 @@
 """
 helpers.py – Sniper-grade Binance scalper engine
-Backtest, dynamic risk, trailing TP, emoji TG, zero-error.
+Dynamic risk, trailing TP, emoji TG, zero-error.
 Exposed:
   run_all_modes()
   multi_override_watch()
@@ -40,12 +40,12 @@ BASE_RISK_PCT        = float(os.getenv("BASE_RISK_PCT", "0.01"))
 MAX_RISK_PCT         = float(os.getenv("MAX_RISK_PCT", "0.015"))
 MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "10"))
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID   = os.getenv("TG_CHAT_ID")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID   = os.getenv("TG_CHAT_ID", "").strip()
 
 # ----------------- CONST -----------------
-BINANCE_BASE    = "https://api.binance.com "
-BINANCE_FUTURES = "https://fapi.binance.com "
+BINANCE_BASE    = "https://api.binance.com"
+BINANCE_FUTURES = "https://fapi.binance.com"
 
 KILLZONES = {
     "asia":   (0, 8),
@@ -165,7 +165,6 @@ def killzone_active(mode: str) -> bool:
 def high_impact_now(minutes: int = 15) -> bool:
     try:
         import investpy
-
         today = datetime.utcnow().strftime("%d/%m/%Y")
         cal = investpy.economic_calendar(
             time_zone="GMT",
@@ -175,9 +174,7 @@ def high_impact_now(minutes: int = 15) -> bool:
         )
         if cal.empty:
             return False
-        cal["time"] = pd.to_datetime(
-            cal["time"], format="%H:%M:%S"
-        ).dt.tz_localize(None)
+        cal["time"] = pd.to_datetime(cal["time"], format="%H:%M:%S").dt.tz_localize(None)
         now = datetime.utcnow()
         for _, row in cal.iterrows():
             if (
@@ -195,10 +192,8 @@ async def ssl_hybrid_bias(symbol: str) -> str:
     df15 = await fetch_ohlcv(symbol, "15m", 50)
     if df1h.empty or df15.empty:
         return "none"
-
     bias1h = "bull" if df1h["close"].iloc[-1] > ema(df1h["close"], 20).iloc[-1] else "bear"
     bias15 = "bull" if df15["close"].iloc[-1] > ema(df15["close"], 20).iloc[-1] else "bear"
-
     if bias1h == bias15 == "bull":
         return "bull"
     if bias1h == bias15 == "bear":
@@ -210,69 +205,46 @@ async def dynamic_risk_pct(symbol: str, mode: str) -> float:
     adr_val = await adr(symbol)
     spr = await fetch_spread(symbol)
     fund = abs(await fetch_funding(symbol))
-
-    # Base risk
     risk = BASE_RISK_PCT
-
-    # ADR based
     if adr_val > 8:
         risk *= 0.7
     elif adr_val < 4:
         risk *= 1.2
-
-    # Spread based
     if spr > 0.05:
         risk *= 0.8
-
-    # Funding based
     if fund > 0.05:
         risk *= 0.8
-
     return min(risk, MAX_RISK_PCT)
 
 # ----------------- SMART TP/SL + TRAILING -----------------
 async def smart_tp_sl(
-    symbol: str,
-    entry: float,
-    side: str,
-    mode: str,
-    df1m: pd.DataFrame,
+    symbol: str, entry: float, side: str, mode: str, df1m: pd.DataFrame
 ) -> Dict[str, float]:
     atrv = atr(df1m, 14).iloc[-1]
     mult = MODE_ATR_MULT[mode]
     sl_dist = atrv * mult
     rrr = MODE_RRR[mode]
     side = side.upper()
-
     if side == "BUY":
         sl = entry - sl_dist
         tp = entry + sl_dist * rrr
     else:
         sl = entry + sl_dist
         tp = entry - sl_dist * rrr
-
     return {"tp": round(tp, 8), "sl": round(sl, 8), "atr": float(atrv)}
 
-# ----------------- TRAILING TP/SL MONITOR -----------------
+
 async def trailing_tp_sl(
-    symbol: str,
-    side: str,
-    entry: float,
-    tp: float,
-    sl: float,
-    df: pd.DataFrame,
+    symbol: str, side: str, entry: float, tp: float, sl: float, df: pd.DataFrame
 ) -> Dict[str, float]:
     price = df["close"].iloc[-1]
     side = side.upper()
-
     if side == "BUY":
         move = (price - entry) / entry * 100
         dist_tp = (tp - price) / price * 100
         if move >= 0.8 and dist_tp <= 0.3:
-            # Trail SL to entry
             sl = entry
         if move >= 1.2 and dist_tp <= 0.2:
-            # Trail TP closer
             tp = price + (tp - price) * 0.5
     else:
         move = (entry - price) / entry * 100
@@ -281,28 +253,19 @@ async def trailing_tp_sl(
             sl = entry
         if move >= 1.2 and dist_tp <= 0.2:
             tp = price - (price - tp) * 0.5
-
     return {"tp": round(tp, 8), "sl": round(sl, 8)}
 
 # ----------------- PATTERN -----------------
 def detect_pattern(df: pd.DataFrame) -> str:
     if len(df) < 3:
         return "none"
-    o = df["open"].iloc[-1]
-    c = df["close"].iloc[-1]
-    h = df["high"].iloc[-1]
-    l = df["low"].iloc[-1]
-
-    body = abs(c - o)
-    rng = h - l
+    o, c, h, l = df["open"].iloc[-1], df["close"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1]
+    body, rng = abs(c - o), h - l
     if rng <= 0:
         return "none"
-
     if body > rng * 0.6:
         return "bull_engulf" if c > o else "bear_engulf"
-
-    upper = h - max(o, c)
-    lower = min(o, c) - l
+    upper, lower = h - max(o, c), min(o, c) - l
     if upper > body * 2:
         return "shooting_star"
     if lower > body * 2:
@@ -313,51 +276,31 @@ def detect_pattern(df: pd.DataFrame) -> str:
 def liquidity_sweep(df: pd.DataFrame) -> bool:
     if len(df) < 5:
         return False
-    o = df["open"].iloc[-1]
-    c = df["close"].iloc[-1]
-    h = df["high"].iloc[-1]
-    l = df["low"].iloc[-1]
-
-    body = abs(c - o)
-    rng = h - l
+    o, c, h, l = df["open"].iloc[-1], df["close"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1]
+    body, rng = abs(c - o), h - l
     if rng <= 0:
         return False
-    wick = rng - body
-    return wick > body * 2.5
+    return (rng - body) > body * 2.5
 
 
 def ema21_pullback(df: pd.DataFrame) -> bool:
     if len(df) < 22:
         return False
-    return (
-        abs(df["close"].iloc[-1] - ema(df["close"], 21).iloc[-1])
-        / df["close"].iloc[-1]
-        < 0.002
-    )
+    return abs(df["close"].iloc[-1] - ema(df["close"], 21).iloc[-1]) / df["close"].iloc[-1] < 0.002
 
 
 def range_break_retest(df: pd.DataFrame) -> bool:
     if len(df) < 40:
         return False
-    recent = df.tail(20)
-    high_line = recent["high"].max()
-    low_line = recent["low"].min()
-    close_last = df["close"].iloc[-1]
-    low_last = df["low"].iloc[-1]
-
-    broke_up = close_last > high_line and low_last <= high_line
-    broke_down = close_last < low_line and low_last >= low_line
-    return broke_up or broke_down
+    recent, high_line, low_line = df.tail(20), df["high"].max(), df["low"].min()
+    close_last, low_last = df["close"].iloc[-1], df["low"].iloc[-1]
+    return (close_last > high_line and low_last <= high_line) or (close_last < low_line and low_last >= low_line)
 
 
 def detect_order_block(df: pd.DataFrame) -> str:
     if len(df) < 3:
         return "none"
-    o1 = df["open"].iloc[-2]
-    c1 = df["close"].iloc[-2]
-    o2 = df["open"].iloc[-1]
-    c2 = df["close"].iloc[-1]
-
+    o1, c1, o2, c2 = df["open"].iloc[-2], df["close"].iloc[-2], df["open"].iloc[-1], df["close"].iloc[-1]
     if c1 < o1 and c2 > o2:
         return "bull_OB"
     if c1 > o1 and c2 < o2:
@@ -368,11 +311,7 @@ def detect_order_block(df: pd.DataFrame) -> str:
 def detect_fvg(df: pd.DataFrame) -> str:
     if len(df) < 3:
         return "none"
-    h1 = df["high"].iloc[-3]
-    l1 = df["low"].iloc[-3]
-    h3 = df["high"].iloc[-1]
-    l3 = df["low"].iloc[-1]
-
+    h1, l1, h3, l3 = df["high"].iloc[-3], df["low"].iloc[-3], df["high"].iloc[-1], df["low"].iloc[-1]
     if l1 > h3:
         return "bull_FVG"
     if h1 < l3:
@@ -391,14 +330,10 @@ def calc_score_v2(
 ) -> int:
     score = 0
     close = df["close"]
-
-    if len(close) > 50:
-        if ema(close, 20).iloc[-1] > ema(close, 50).iloc[-1]:
-            score += 15
-
+    if len(close) > 50 and ema(close, 20).iloc[-1] > ema(close, 50).iloc[-1]:
+        score += 15
     if bias in ("bull", "bear"):
         score += 10
-
     if pa.get("sweep"):
         score += 10
     if pa.get("pullback"):
@@ -409,32 +344,25 @@ def calc_score_v2(
         score += 10
     if pa.get("fvg") != "none":
         score += 10
-
     if htf.get("15m") in ("bull_engulf", "hammer", "bear_engulf", "shooting_star"):
         score += 10
     if htf.get("1h") in ("bull_engulf", "hammer", "bear_engulf", "shooting_star"):
         score += 10
-
     if spr_ok:
         score += 5
     if fund_ok:
         score += 5
-
     return min(score, 100)
 
 # ----------------- DYNAMIC POSITION SIZE -----------------
 async def fetch_balance_usdt() -> float:
-    """Binance futures USDT balance via ccxt (read-only API)."""
     try:
         import ccxt
-
-        exchange = ccxt.binance(
-            {
-                "apiKey": os.getenv("BINANCE_KEY", ""),
-                "secret": os.getenv("BINANCE_SECRET", ""),
-                "options": {"defaultType": "future"},
-            }
-        )
+        exchange = ccxt.binance({
+            "apiKey": os.getenv("BINANCE_KEY", ""),
+            "secret": os.getenv("BINANCE_SECRET", ""),
+            "options": {"defaultType": "future"},
+        })
         bal = exchange.fetch_balance()
         return float(bal["USDT"]["free"])
     except Exception as e:
@@ -443,10 +371,7 @@ async def fetch_balance_usdt() -> float:
 
 
 async def calc_position_size(
-    symbol: str,
-    entry: float,
-    sl: float,
-    mode: str,
+    symbol: str, entry: float, sl: float, mode: str
 ) -> Dict[str, float]:
     balance = await fetch_balance_usdt()
     risk_pct = await dynamic_risk_pct(symbol, mode)
@@ -471,7 +396,6 @@ def set_cooldown(sym: str) -> None:
 
 async def build_signal_v2(symbol: str, mode: str) -> Dict[str, Any]:
     mode = mode.lower()
-
     if not cooldown_ok(symbol):
         return {"ok": False, "reason": "cooldown"}
     if high_impact_now():
@@ -537,6 +461,7 @@ async def build_signal_v2(symbol: str, mode: str) -> Dict[str, Any]:
         "pos": pos,
         "time_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
 # ----------------- RUNNER -----------------
 _scan_sem = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
 
@@ -564,14 +489,17 @@ async def run_all_modes() -> Dict[str, List[Dict[str, Any]]]:
 # ----------------- TG / LOG -----------------
 async def send_telegram(text: str) -> None:
     if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        logger.debug("TG credentials missing – skip send")
         return
-    url = f"https://api.telegram.org/bot {TG_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
         async with aiohttp.ClientSession() as s:
-            await s.post(url, json=payload)
+            async with s.post(url, json=payload) as r:
+                r.raise_for_status()
+                logger.debug("TG msg sent, status %s", r.status)
     except Exception as e:
-        logger.warning("tg send fail: %s", e)
+        logger.warning("TG send fail: %s", e)
 
 
 def log_signal(sig: Dict[str, Any]) -> None:
@@ -606,10 +534,8 @@ def format_signal(sig: Dict[str, Any], no: int) -> str:
     pa = sig.get("pa", {})
 
     ist_time = (
-        datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")
-        + timedelta(hours=5, minutes=30)
+        datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S") + timedelta(hours=5, minutes=30)
     ).strftime("%I:%M %p")
-    # 🔧 KeyError fix: mode.lower()
     hold_till = (
         datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")
         + timedelta(minutes={"quick": 15, "mid": 45, "trend": 120}[mode.lower()])
@@ -636,9 +562,6 @@ def format_signal(sig: Dict[str, Any], no: int) -> str:
 """
 
 # ----------------- OVERRIDE WATCH (SL + TP alerts) -----------------
-ACTIVE_TRADES: List[Dict[str, Any]] = []
-
-
 async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str]:
     alerts: List[str] = []
     if not active_signals:
@@ -647,14 +570,11 @@ async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str
     btc_df = await fetch_ohlcv("BTCUSDT", "1m", 12)
     btc_move = 0.0
     if not btc_df.empty and len(btc_df) >= 10:
-        btc_move = (
-            btc_df["close"].iloc[-1] - btc_df["close"].iloc[-10]
-        ) / btc_df["close"].iloc[-10] * 100
+        btc_move = (btc_df["close"].iloc[-1] - btc_df["close"].iloc[-10]) / btc_df["close"].iloc[-10] * 100
 
     for sig in active_signals:
         if not sig.get("ok"):
             continue
-
         symbol = sig["symbol"]
         side = sig.get("side", "BUY")
         entry = float(sig["entry"])
@@ -666,32 +586,19 @@ async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str
         df = await fetch_ohlcv(symbol, "1m", 20)
         if df.empty or len(df) < 6:
             continue
-
         price = float(df["close"].iloc[-1])
-        age_min = (
-            datetime.utcnow() - datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")
-        ).total_seconds() / 60
+        age_min = (datetime.utcnow() - datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
 
-        # Trailing update
         trail = await trailing_tp_sl(symbol, side, entry, tp, sl, df)
-        tp = trail["tp"]
-        sl = trail["sl"]
+        tp, sl = trail["tp"], trail["sl"]
 
-        if side == "BUY":
-            move_pct = (price - entry) / entry * 100
-            dist_sl = abs(price - sl) / price * 100
-            dist_tp = abs(tp - price) / price * 100
-            in_loss = price < entry
-        else:
-            move_pct = (entry - price) / entry * 100
-            dist_sl = abs(price - sl) / price * 100
-            dist_tp = abs(price - tp) / price * 100
-            in_loss = price > entry
+        move_pct = (price - entry) / entry * 100 if side == "BUY" else (entry - price) / entry * 100
+        dist_sl = abs(price - sl) / price * 100
+        dist_tp = abs(tp - price) / price * 100
+        in_loss = (side == "BUY" and price < entry) or (side == "SELL" and price > entry)
 
         reasons: List[str] = []
         strong = 0
-
-        # ----- SL danger -----
         if dist_sl < 0.3 and in_loss:
             strong += 1
             reasons.append(f"SL very close (~{dist_sl:.2f}%)")
@@ -728,18 +635,14 @@ async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str
                 f"Now: <code>{price:.4f}</code> ({move_pct:+.2f}%)"
             )
 
-        # ----- TP side (profit management) -----
         tp_reasons: List[str] = []
         tp_level = None
-
         if move_pct >= 0.8 and dist_tp < 0.3:
             tp_level = "TP_HIT_CHANCE"
             tp_reasons.append(f"Price very close to TP (~{dist_tp:.2f}%)")
         elif move_pct >= 0.6 and dist_tp < 0.6:
             tp_level = "TP_NEAR"
-            tp_reasons.append(
-                f"Good profit and close to TP (pnl ~{move_pct:.2f}%, dist ~{dist_tp:.2f}%)"
-            )
+            tp_reasons.append(f"Good profit and close to TP (pnl ~{move_pct:.2f}%, dist ~{dist_tp:.2f}%)")
         elif move_pct >= 1.2:
             tp_level = "TP_STRONG_PROFIT"
             tp_reasons.append(f"Strong profit (~{move_pct:.2f}%)")
@@ -747,9 +650,7 @@ async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str
         if mode == "trend" and age_min >= 90 and move_pct >= 0.5:
             if tp_level is None:
                 tp_level = "TP_TRAIL_IDEA"
-            tp_reasons.append(
-                f"Old trend position (~{age_min:.1f} min) with profit (~{move_pct:.2f}%)"
-            )
+            tp_reasons.append(f"Old trend position (~{age_min:.1f} min) with profit (~{move_pct:.2f}%)")
 
         if tp_level and tp_reasons:
             tp_emoji = "✅" if tp_level == "TP_HIT_CHANCE" else "🟢"
