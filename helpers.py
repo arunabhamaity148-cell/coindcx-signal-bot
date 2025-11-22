@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------- ENV -----------------
-SCORE_MIN            = int(os.getenv("SCORE_MIN", "90"))
+SCORE_MIN            = int(os.getenv("SCORE_MIN", "30"))
 BASE_CAPITAL         = float(os.getenv("BASE_CAPITAL", "100000"))
 BASE_RISK_PCT        = float(os.getenv("BASE_RISK_PCT", "0.01"))
 MAX_RISK_PCT         = float(os.getenv("MAX_RISK_PCT", "0.015"))
