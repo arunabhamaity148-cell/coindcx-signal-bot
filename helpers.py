@@ -28,7 +28,21 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+# helpers.py
+import os, logging, ...
+from dotenv import load_dotenv
+load_dotenv()
 
+# ------ ensure log dir exists ------
+os.makedirs("logs", exist_ok=True)
+
+# ------ now logging ------
+logging.basicConfig(
+    filename="logs/signals.log",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 # ----------------- ENV -----------------
 SCORE_MIN            = int(os.getenv("SCORE_MIN", "90"))
 BASE_CAPITAL         = float(os.getenv("BASE_CAPITAL", "100000"))
