@@ -38,11 +38,11 @@ load_dotenv()
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
-    level=logging.DEBUG,          # সব লেভেল দেখাবে
+    level=logging.DEBUG,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
         logging.FileHandler("logs/signals.log"),
-        logging.StreamHandler(),  # Railway console
+        logging.StreamHandler(),
     ],
 )
 logger = logging.getLogger("sniper-engine")
@@ -58,7 +58,7 @@ async def test_telegram():
         await send_telegram(txt)
         logger.info("Telegram boot ping sent (score_min=%s)", os.getenv("SCORE_MIN", "90"))
     except Exception as e:
-        logger.exception("Boot ping failed: %s", e)   # পূর্ণ traceback
+        logger.exception("Boot ping failed: %s", e)
 
 # -------------------- KEEPALIVE PING (Railway) --------------------
 async def ping_forever():
@@ -133,7 +133,7 @@ async def engine_cycle() -> None:
 # -------------------- ENGINE LOOP --------------------
 async def engine_loop() -> None:
     logger.info("===== BOT BOOTING =====")
-    await test_telegram()   # এখানে কল হবে
+    await test_telegram()
     while True:
         try:
             await engine_cycle()
