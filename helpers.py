@@ -22,27 +22,17 @@ from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 load_dotenv()
 
-logging.basicConfig(
-    filename="logs/signals.log",
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-logger = logging.getLogger(__name__)
-# helpers.py
-import os, logging, ...
-from dotenv import load_dotenv
-load_dotenv()
-
-# ------ ensure log dir exists ------
+# ----------- auto-create log dir -----------
 os.makedirs("logs", exist_ok=True)
 
-# ------ now logging ------
+# ----------- logging -----------
 logging.basicConfig(
     filename="logs/signals.log",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+
 # ----------------- ENV -----------------
 SCORE_MIN            = int(os.getenv("SCORE_MIN", "90"))
 BASE_CAPITAL         = float(os.getenv("BASE_CAPITAL", "100000"))
@@ -63,8 +53,8 @@ KILLZONES = {
     "ny":     (12, 17),
 }
 
-MODE_RRR       = {"quick": 1.5, "mid": 2.0, "trend": 3.0}
-MODE_ATR_MULT  = {"quick": 1.0, "mid": 1.5, "trend": 2.0}
+MODE_RRR      = {"quick": 1.5, "mid": 2.0, "trend": 3.0}
+MODE_ATR_MULT = {"quick": 1.0, "mid": 1.5, "trend": 2.0}
 
 # ----------------- HTTP -----------------
 class HTTPSession:
@@ -95,6 +85,24 @@ async def fetch_ohlcv(symbol: str, interval: str = "1m", limit: int = 200) -> pd
     df = pd.DataFrame(data, columns=["open_time","open","high","low","close","volume","close_time","qav","trades","tb","tq","ignore"])
     df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
     return df
+
+async def fetch_spread(symbol: str) -> float:
+    url = f"{BINANCE_BASE}/api/v3/ticker/bookTicker?symbol={symbol}"
+    data = await HTTPSession.get(url)
+    try:
+        bid = float(data["bidPrice"])
+        ask = float(data["askPrice"])
+        return (ask - bid) / bid * 100.0
+    except Exception:
+        return 999.0
+
+async def fetch_funding(symbol: str) -> float:
+    url = f"{BINANCE_FUTURES}/fapi/v1/premiumIndex?symbol={symbol}"
+    data = await HTTPSession.get(url)
+    try:
+        return float(data.get("lastFundingRate", 0.0)) * 100.0
+    except Exception:
+        return 0.0
 
 # ----------------- INDICATORS -----------------
 def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
@@ -131,7 +139,7 @@ def news_block() -> bool:
         if abs((now-t).total_seconds()) < 900: return True
     return False
 
-# ----------------- SWEEP / BIAS -----------------
+# ----------------- BIAS -----------------
 async def ssl_hybrid_bias(symbol: str) -> str:
     df1h = await fetch_ohlcv(symbol, "1h", 50)
     df15 = await fetch_ohlcv(symbol, "15m", 50)
@@ -147,7 +155,7 @@ async def smart_tp_sl(symbol: str, entry: float, side: str, mode: str, df1m: pd.
     atrv = atr(df1m, 14).iloc[-1]
     mult = MODE_ATR_MULT[mode]
     sl_dist = atrv * mult
-    rrr = MODE_RRR[mode]
+    rrr   = MODE_RRR[mode]
     side = side.upper()
     if side == "BUY":
         sl = entry - sl_dist
@@ -284,7 +292,6 @@ async def scan_coin(sym: str, mode: str) -> Dict:
             return {"ok": False, "error": str(e)}
 
 async def run_mode(mode: str) -> List[Dict]:
-    from helpers import COIN_LIST
     tasks = [scan_coin(sym, mode) for sym in COIN_LIST]
     results = await asyncio.gather(*tasks)
     valid = [r for r in results if r.get("ok")]
@@ -321,7 +328,7 @@ TP: {sig['tp']}
 SL: {sig['sl']}
 UTC: {sig['time_utc']}"""
 
-# ----------------- OVERRIDE WATCH (short version) -----------------
+# ----------------- OVERRIDE WATCH (short) -----------------
 ACTIVE_TRADES: List[Dict] = []
 
 async def multi_override_watch(active_signals: List[Dict]) -> List[str]:
