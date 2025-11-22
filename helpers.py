@@ -521,94 +521,167 @@ def format_signal(sig: Dict[str, Any], no: int) -> str:
 ┃ TP:    <code>{tp}</code>
 ┃ SL:    <code>{sl}</code>
 ┗━━━━━━━━━━━━━━━━━━━━
-"""
+# ----------------- OVERRIDE WATCH (Danger + TP Chance) -----------------
+async def multi_override_watch(active_signals: List[Dict]) -> List[str]:
+    """
+    Override layer:
+      - DANGER side:
+          • SL খুব কাছে + trade loss এ
+          • Fast loss শুরু
+          • Big loss
+          • BTC dump + loss
+          • Long time ধরে stuck (time trap)
+      - TP CHANCE side:
+          • TP এর খুব কাছে
+          • ভালো profit এ চলে গেছে
+          • BTC support করছে
 
-# ----------------- OVERRIDE WATCH (short) -----------------
-ACTIVE_TRADES: List[Dict[str, Any]] = []
-
-async def multi_override_watch(active_signals: List[Dict[str, Any]]) -> List[str]:
+    Returns: list of Telegram-ready alert strings (HTML formatted)
+    """
     alerts: List[str] = []
     if not active_signals:
         return alerts
 
+    # BTC context (panic dump / support আছে কি না দেখার জন্য)
     btc_df = await fetch_ohlcv("BTCUSDT", "1m", 12)
     btc_move = 0.0
     if not btc_df.empty and len(btc_df) >= 10:
         btc_move = (
-            (btc_df["close"].iloc[-1] - btc_df["close"].iloc[-10])
-            / btc_df["close"].iloc[-10]
-            * 100
-        )
+            btc_df["close"].iloc[-1] - btc_df["close"].iloc[-10]
+        ) / max(btc_df["close"].iloc[-10], 1e-8) * 100.0
 
     for sig in active_signals:
-        if not sig.get("ok"):
+        try:
+            if not sig.get("ok"):
+                continue
+
+            symbol   = sig["symbol"]
+            side     = sig.get("side", "BUY").upper()
+            entry    = float(sig["entry"])
+            sl       = float(sig["sl"])
+            tp       = float(sig["tp"])
+            time_utc = sig["time_utc"]
+
+            df = await fetch_ohlcv(symbol, "1m", 20)
+            if df.empty or len(df) < 6:
+                continue
+
+            price   = float(df["close"].iloc[-1])
+            dt_sig  = datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")
+            age_min = (datetime.utcnow() - dt_sig).total_seconds() / 60.0
+
+            # move_pct: BUY হলে up হলে +ve, SELL হলে down হলে +ve
+            if side == "BUY":
+                move_pct = (price - entry) / entry * 100.0
+            else:
+                move_pct = (entry - price) / entry * 100.0
+
+            dist_sl = abs(price - sl) / max(price, 1e-8) * 100.0
+            dist_tp = abs(tp - price) / max(price, 1e-8) * 100.0
+
+            in_loss   = (side == "BUY" and price < entry) or (side == "SELL" and price > entry)
+            in_profit = (side == "BUY" and price > entry) or (side == "SELL" and price < entry)
+
+            # --------- DANGER SIDE ---------
+            danger_reasons: List[str] = []
+            danger_score = 0
+
+            # SL very close + loss
+            if dist_sl < 0.3 and in_loss:
+                danger_score += 1
+                danger_reasons.append(f"SL very close (~{dist_sl:.2f}%)")
+
+            # Very fast loss (entry নেওয়ার পর 5 min এর মধ্যে বড় negative move)
+            if age_min <= 5 and move_pct <= -0.7:
+                danger_score += 1
+                danger_reasons.append(f"Fast loss (~{move_pct:.2f}%)")
+
+            # বড় loss overall
+            if move_pct <= -1.0:
+                danger_score += 1
+                danger_reasons.append(f"Big loss (~{move_pct:.2f}%)")
+
+            # BTC dump + তোমার trade loss এ
+            if btc_move < -0.7 and in_loss:
+                danger_score += 1
+                danger_reasons.append(f"BTC pressure (~{btc_move:.2f}%)")
+
+            # Time trap – অনেকক্ষণ ধরে kichu হচ্ছে না
+            if age_min >= 30 and abs(move_pct) < 0.2:
+                # time trap টা strong danger না, নিচু লেভেলের caution
+                danger_reasons.append(f"Time trap (~{age_min:.1f} min almost flat)")
+
+            # Danger level নির্বাচন
+            danger_level: Optional[str] = None
+            danger_emoji: str = "⚠️"
+            if danger_score >= 2:
+                danger_level = "EMERGENCY"
+                danger_emoji = "🔴"
+            elif danger_score == 1:
+                danger_level = "HIGH"
+                danger_emoji = "🟠"
+            elif danger_reasons:
+                danger_level = "CAUTION"
+                danger_emoji = "🟡"
+
+            # যদি Danger detect হয়, TP chance check না করেই direct alert পাঠাই
+            if danger_level:
+                msg = (
+                    f"{danger_emoji} <b>{danger_level} ALERT</b>\n"
+                    f"📌 <b>{symbol}</b>\n"
+                    "Reasons:\n- " + "\n- ".join(danger_reasons) +
+                    f"\n\nEntry: <code>{entry}</code>\n"
+                    f"TP:    <code>{tp}</code>\n"
+                    f"SL:    <code>{sl}</code>\n"
+                    f"Now:   <code>{price:.4f}</code> ({move_pct:+.2f}%)"
+                )
+                alerts.append(msg)
+                # Danger থাকলে এই signal-এর জন্য আর TP chance পাঠাব না
+                continue
+
+            # --------- TP CHANCE SIDE ---------
+            tp_reasons: List[str] = []
+            tp_score = 0
+
+            # TP অনেক কাছে + already profit side এ
+            if dist_tp < 0.4 and in_profit:
+                tp_score += 1
+                tp_reasons.append(f"TP very close (~{dist_tp:.2f}%)")
+
+            # Decent profit
+            if move_pct >= 0.8:
+                tp_score += 1
+                tp_reasons.append(f"Strong profit (~{move_pct:.2f}%)")
+
+            # BTC support
+            if btc_move > 0.5 and in_profit:
+                tp_score += 1
+                tp_reasons.append(f"BTC supportive (~{btc_move:.2f}%)")
+
+            if tp_score > 0:
+                if tp_score >= 2:
+                    level = "TP CHANCE HIGH"
+                    emoji = "🟢"
+                else:
+                    level = "TP CHANCE"
+                    emoji = "🟩"
+
+                msg = (
+                    f"{emoji} <b>{level}</b>\n"
+                    f"📌 <b>{symbol}</b>\n"
+                    "Reasons:\n- " + "\n- ".join(tp_reasons) +
+                    f"\n\nEntry: <code>{entry}</code>\n"
+                    f"TP:    <code>{tp}</code>\n"
+                    f"SL:    <code>{sl}</code>\n"
+                    f"Now:   <code>{price:.4f}</code> ({move_pct:+.2f}%)\n\n"
+                    "💡 Idea: Hold রাখা যায়, চাইলেই partial book + SL trail করতে পারো।"
+                )
+                alerts.append(msg)
+
+        except Exception as e:
+            logger.error("multi_override_watch item error for %s: %s", sig.get("symbol"), e)
             continue
-        symbol = sig["symbol"]
-        side = sig.get("side", "BUY")
-        entry = float(sig["entry"])
-        sl = float(sig["sl"])
-        tp = float(sig["tp"])
-        time_utc = sig["time_utc"]
 
-        df = await fetch_ohlcv(symbol, "1m", 20)
-        if df.empty or len(df) < 6:
-            continue
-
-        price = float(df["close"].iloc[-1])
-        age_min = (
-            datetime.utcnow() - datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")
-        ).total_seconds() / 60
-
-        move_pct = (
-            (price - entry) / entry * 100
-            if side == "BUY"
-            else (entry - price) / entry * 100
-        )
-        dist_sl = abs(price - sl) / price * 100
-        in_loss = (side == "BUY" and price < entry) or (
-            side == "SELL" and price > entry
-        )
-
-        reasons: List[str] = []
-        strong = 0
-
-        if dist_sl < 0.3 and in_loss:
-            strong += 1
-            reasons.append(f"SL very close (~{dist_sl:.2f}%)")
-        if age_min <= 5 and move_pct <= -0.7:
-            strong += 1
-            reasons.append(f"Fast loss (~{move_pct:.2f}%)")
-        if move_pct <= -1.0:
-            strong += 1
-            reasons.append(f"Big loss (~{move_pct:.2f}%)")
-        if btc_move < -0.7 and in_loss:
-            strong += 1
-            reasons.append(f"BTC pressure (~{btc_move:.2f}%)")
-        if age_min >= 30 and abs(move_pct) < 0.2:
-            reasons.append(f"Time trap (~{age_min:.1f} min)")
-
-        level = (
-            "EMERGENCY"
-            if strong >= 2
-            else "HIGH"
-            if strong == 1
-            else "CAUTION"
-            if strong
-            else None
-        )
-        if not level:
-            continue
-
-        emoji = {"EMERGENCY": "🔴", "HIGH": "🟠", "CAUTION": "🟡"}.get(level, "⚠️")
-        alerts.append(
-            f"{emoji} <b>{level} ALERT</b>\n"
-            f"📌 <b>{symbol}</b>\n"
-            f"Reasons:\n- " + "\n- ".join(reasons) +
-            f"\nEntry: <code>{entry}</code>\n"
-            f"TP: <code>{tp}</code>\n"
-            f"SL: <code>{sl}</code>\n"
-            f"Now: <code>{price:.4f}</code> ({move_pct:+.2f}%)"
-        )
     return alerts
 
 # ----------------- COIN LIST -----------------
