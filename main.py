@@ -38,27 +38,27 @@ load_dotenv()
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.DEBUG,          # সব লেভেল দেখাবে
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
         logging.FileHandler("logs/signals.log"),
-        logging.StreamHandler(),  # Railway console-e show korbe
+        logging.StreamHandler(),  # Railway console
     ],
 )
 logger = logging.getLogger("sniper-engine")
 
 PING_URL = os.getenv("PING_URL", "").strip()
 
-# -------------------- TELEGRAM TEST PING --------------------
+# -------------------- TELEGRAM TEST PING (with exception catch) --------------------
 async def test_telegram():
-    txt = "🟢 <b>Sniper bot online</b>\n<code>Score ≥ {}</code>".format(
-        os.getenv("SCORE_MIN", 90)
-    )
-    await send_telegram(txt)
-    logger.info(
-        "Telegram boot ping sent (score_min=%s)",
-        os.getenv("SCORE_MIN", "90"),
-    )
+    try:
+        txt = "🟢 <b>Sniper bot online</b>\n<code>Score ≥ {}</code>".format(
+            os.getenv("SCORE_MIN", 90)
+        )
+        await send_telegram(txt)
+        logger.info("Telegram boot ping sent (score_min=%s)", os.getenv("SCORE_MIN", "90"))
+    except Exception as e:
+        logger.exception("Boot ping failed: %s", e)   # পূর্ণ traceback
 
 # -------------------- KEEPALIVE PING (Railway) --------------------
 async def ping_forever():
@@ -133,14 +133,14 @@ async def engine_cycle() -> None:
 # -------------------- ENGINE LOOP --------------------
 async def engine_loop() -> None:
     logger.info("===== BOT BOOTING =====")
-    await test_telegram()
+    await test_telegram()   # এখানে কল হবে
     while True:
         try:
             await engine_cycle()
         except Exception as e:
             logger.error("Cycle crash: %s", e)
             traceback.print_exc()
-        await asyncio.sleep(20)   # প্রতি ২০ সেকে একবার full scan
+        await asyncio.sleep(20)
 
 # -------------------- SAFE RUNNER --------------------
 async def safe_runner() -> None:
