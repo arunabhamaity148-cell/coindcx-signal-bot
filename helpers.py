@@ -610,9 +610,10 @@ def format_signal(sig: Dict[str, Any], no: int) -> str:
         datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")
         + timedelta(hours=5, minutes=30)
     ).strftime("%I:%M %p")
+    # 🔧 KeyError fix: mode.lower()
     hold_till = (
         datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")
-        + timedelta(minutes={"quick": 15, "mid": 45, "trend": 120}[mode])
+        + timedelta(minutes={"quick": 15, "mid": 45, "trend": 120}[mode.lower()])
     ).strftime("%I:%M %p")
 
     emoji_side = "🟢" if side == "BUY" else "🔴"
