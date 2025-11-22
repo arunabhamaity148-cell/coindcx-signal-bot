@@ -1,4 +1,6 @@
-import asyncio, pandas as pd, os, aiohttp
+import asyncio
+import pandas as pd
+import os
 from helpers import backtest_symbol, send_telegram
 
 COIN_LIST = [c.strip() for c in """BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,MATICUSDT,
@@ -26,15 +28,16 @@ async def run_all_backtest():
             avg_pnl = df["pnl"].mean()
             summary.append({
                 "coin": coin,
-                "mode": mode,
+                "mode": mode,  # ← KeyError fix
                 "total": total,
                 "win": win,
                 "win_rate": round(win_rate, 2),
                 "avg_pnl": round(avg_pnl, 3)
             })
+
     df_sum = pd.DataFrame(summary)
     for mode in MODES:
-        part = df_sum[df_sum["mode"] == mode]
+        part = df_sum[df_sum["mode"] == mode] if not df_sum.empty else pd.DataFrame()
         if part.empty:
             continue
         msg = f"📊 <b>Backtest ({mode.upper()})</b>\n" \
