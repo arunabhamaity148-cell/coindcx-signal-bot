@@ -5,13 +5,21 @@ Exposed:
   run_all_modes()
   multi_override_watch()
   format_signal()
+  send_telegram()
+  log_signal()
 """
 
-import asyncio, logging, math, os, time, smtplib, csv, aiohttp, pandas as pd
+import asyncio
+import logging
+import os
+import time
+import csv
+import aiohttp
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(
@@ -22,28 +30,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------- ENV -----------------
-SCORE_MIN               = int(os.getenv("SCORE_MIN", "90"))
-BASE_CAPITAL            = float(os.getenv("BASE_CAPITAL", "100000"))
-BASE_RISK_PCT           = float(os.getenv("BASE_RISK_PCT", "0.01"))
-MAX_RISK_PCT            = float(os.getenv("MAX_RISK_PCT", "0.015"))
-MAX_CONCURRENT_SCANS    = int(os.getenv("MAX_CONCURRENT_SCANS", "10"))
-TG_BOT_TOKEN            = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID              = os.getenv("TG_CHAT_ID")
+SCORE_MIN            = int(os.getenv("SCORE_MIN", "90"))
+BASE_CAPITAL         = float(os.getenv("BASE_CAPITAL", "100000"))
+BASE_RISK_PCT        = float(os.getenv("BASE_RISK_PCT", "0.01"))
+MAX_RISK_PCT         = float(os.getenv("MAX_RISK_PCT", "0.015"))
+MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "10"))
+
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHAT_ID   = os.getenv("TG_CHAT_ID")
 
 # ----------------- CONST -----------------
-BINANCE_BASE   = "https://api.binance.com"
-BINANCE_FUTURES= "https://fapi.binance.com"
+BINANCE_BASE    = "https://api.binance.com"
+BINANCE_FUTURES = "https://fapi.binance.com"
 
-# ICT Killzones (UTC)
 KILLZONES = {
-    "asia":  (0, 8),   # 00-08 UTC
-    "london":(7, 11),  # 08-12 BST ≈ 07-11 UTC
-    "ny":    (12, 17), # 08-13 EST ≈ 12-17 UTC
+    "asia":   (0, 8),
+    "london": (7, 11),
+    "ny":     (12, 17),
 }
 
-# Mode-wise RRR and ATR multiplier
-MODE_RRR = {"quick": 1.5, "mid": 2.0, "trend": 3.0}
-MODE_ATR_MULT = {"quick": 1.0, "mid": 1.5, "trend": 2.0}
+MODE_RRR       = {"quick": 1.5, "mid": 2.0, "trend": 3.0}
+MODE_ATR_MULT  = {"quick": 1.0, "mid": 1.5, "trend": 2.0}
 
 # ----------------- HTTP -----------------
 class HTTPSession:
@@ -80,59 +87,41 @@ def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).m
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr = pd.concat([(df["high"]-df["low"]), (df["high"]-df["close"].shift()).abs(), (df["low"]-df["close"].shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
-def adr(df: pd.DataFrame) -> float:
-    """last 14 days (daily) range average in %"""
-    df1d = await fetch_ohlcv(df["symbol"].iloc[0], "1d", 15)  # cached via caller
+
+async def adr(symbol: str) -> float:
+    """14-day average daily range in %"""
+    df1d = await fetch_ohlcv(symbol, "1d", 15)
     if df1d.empty: return 3.0
     ranges = (df1d["high"] - df1d["low"]) / df1d["close"] * 100
     return ranges.iloc[-14:].mean()
 
 # ----------------- ICT / SESSION -----------------
-def utc_now(): return datetime.utcnow()
 def session_now() -> str:
-    h = utc_now().hour
+    h = datetime.utcnow().hour
     if 0 <= h < 8: return "asia"
     if 8 <= h < 16: return "london"
     return "ny"
+
 def killzone_active(mode: str) -> bool:
-    """only allow signals inside killzone for mid/trend"""
-    if mode == "quick": return True  # quick always ok
+    if mode == "quick": return True
     sess = session_now()
-    h = utc_now().hour
     start, end = KILLZONES[sess]
-    return start <= h < end
+    return start <= datetime.utcnow().hour < end
 
 # ----------------- NEWS DUMMY FILTER -----------------
-HIGH_IMPACT_TIMES_UTC = [
-    (12, 30),  # US CPI
-    (14, 30),  # US GDP/PCE
-    (12, 0),   # FOMC
-]
+HIGH_IMPACT = [(12,30), (14,30), (12,0)]  # UTC (h,m)
 def news_block() -> bool:
-    now = utc_now()
-    for h, m in HIGH_IMPACT_TIMES_UTC:
+    now = datetime.utcnow()
+    for h,m in HIGH_IMPACT:
         t = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if abs((now - t).total_seconds()) < 900:  # 15 min block
-            return True
+        if abs((now-t).total_seconds()) < 900: return True
     return False
 
 # ----------------- SWEEP / BIAS -----------------
-def pdh_pdl_sweep(symbol: str, df1d: pd.DataFrame) -> Dict[str, bool]:
-    if df1d.empty: return {"pdh_sweep": False, "pdl_sweep": False}
-    pdh = df1d["high"].iloc[-2]
-    pdl = df1d["low"].iloc[-2]
-    df15 = await fetch_ohlcv(symbol, "15m", 50)
-    if df15.empty: return {"pdh_sweep": False, "pdl_sweep": False}
-    h15 = df15["high"].max()
-    l15 = df15["low"].min()
-    return {"pdh_sweep": h15 > pdh, "pdl_sweep": l15 < pdl}
-
-def ssl_hybrid_bias(symbol: str) -> str:
-    """1h+15m SSL-like bias"""
+async def ssl_hybrid_bias(symbol: str) -> str:
     df1h = await fetch_ohlcv(symbol, "1h", 50)
     df15 = await fetch_ohlcv(symbol, "15m", 50)
     if df1h.empty or df15.empty: return "none"
-    # simple: close above 1h ema20 = bullish
     bias1h = "bull" if df1h["close"].iloc[-1] > ema(df1h["close"], 20).iloc[-1] else "bear"
     bias15 = "bull" if df15["close"].iloc[-1] > ema(df15["close"], 20).iloc[-1] else "bear"
     if bias1h == bias15 == "bull": return "bull"
@@ -144,14 +133,67 @@ async def smart_tp_sl(symbol: str, entry: float, side: str, mode: str, df1m: pd.
     atrv = atr(df1m, 14).iloc[-1]
     mult = MODE_ATR_MULT[mode]
     sl_dist = atrv * mult
-    rrr   = MODE_RRR[mode]
-    if side.upper() == "BUY":
+    rrr = MODE_RRR[mode]
+    side = side.upper()
+    if side == "BUY":
         sl = entry - sl_dist
         tp = entry + sl_dist * rrr
     else:
         sl = entry + sl_dist
         tp = entry - sl_dist * rrr
     return {"tp": round(tp, 8), "sl": round(sl, 8), "atr": atrv}
+
+# ----------------- PATTERN -----------------
+def detect_pattern(df: pd.DataFrame) -> str:
+    if len(df) < 3: return "none"
+    o,c,h,l = df["open"].iloc[-1], df["close"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1]
+    body = abs(c-o)
+    rng = h-l
+    if rng <= 0: return "none"
+    if body > rng * 0.6:
+        return "bull_engulf" if c > o else "bear_engulf"
+    upper = h - max(o,c)
+    lower = min(o,c) - l
+    if upper > body * 2: return "shooting_star"
+    if lower > body * 2: return "hammer"
+    return "none"
+
+# ----------------- PRICE ACTION -----------------
+def liquidity_sweep(df: pd.DataFrame) -> bool:
+    if len(df) < 5: return False
+    o,c,h,l = df["open"].iloc[-1], df["close"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1]
+    body = abs(c-o)
+    rng = h-l
+    if rng <= 0: return False
+    wick = rng - body
+    return wick > body * 2.5
+
+def ema21_pullback(df: pd.DataFrame) -> bool:
+    if len(df) < 22: return False
+    return abs(df["close"].iloc[-1] - ema(df["close"], 21).iloc[-1]) / df["close"].iloc[-1] < 0.002
+
+def range_break_retest(df: pd.DataFrame) -> bool:
+    if len(df) < 40: return False
+    recent = df.tail(20)
+    high_line = recent["high"].max()
+    low_line = recent["low"].min()
+    close_last = df["close"].iloc[-1]
+    low_last = df["low"].iloc[-1]
+    return (close_last > high_line and low_last <= high_line) or (close_last < low_line and low_last >= low_line)
+
+def detect_order_block(df: pd.DataFrame) -> str:
+    if len(df) < 3: return "none"
+    o1,c1,o2,c2 = df["open"].iloc[-2], df["close"].iloc[-2], df["open"].iloc[-1], df["close"].iloc[-1]
+    if c1 < o1 and c2 > o2: return "bull_OB"
+    if c1 > o1 and c2 < o2: return "bear_OB"
+    return "none"
+
+def detect_fvg(df: pd.DataFrame) -> str:
+    if len(df) < 3: return "none"
+    h1,l1,h3,l3 = df["high"].iloc[-3], df["low"].iloc[-3], df["high"].iloc[-1], df["low"].iloc[-1]
+    if l1 > h3: return "bull_FVG"
+    if h1 < l3: return "bear_FVG"
+    return "none"
 
 # ----------------- SCORE v2 -----------------
 def calc_score_v2(symbol: str, df: pd.DataFrame, htf: Dict, pa: Dict, spr_ok: bool, fund_ok: bool, bias: str) -> int:
@@ -185,14 +227,13 @@ async def build_signal_v2(symbol: str, mode: str) -> Dict[str, Any]:
 
     df1m = await fetch_ohlcv(symbol, "1m", 200)
     if df1m.empty: return {"ok": False, "reason": "data"}
-    df1d = await fetch_ohlcv(symbol, "1d", 15)
-    adr_val = adr(df1d)
 
-    # ADR filter
+    df1d = await fetch_ohlcv(symbol, "1d", 15)
+    adr_val = await adr(symbol)
     today_range = (df1d["high"].iloc[-1] - df1d["low"].iloc[-1]) / df1d["close"].iloc[-1] * 100
     if today_range > adr_val * 0.7: return {"ok": False, "reason": "adr_exhaust"}
 
-    bias = ssl_hybrid_bias(symbol)
+    bias = await ssl_hybrid_bias(symbol)
     if bias == "none": return {"ok": False, "reason": "bias_none"}
 
     htf = {"15m": detect_pattern(await fetch_ohlcv(symbol, "15m", 50)),
@@ -229,6 +270,7 @@ async def scan_coin(sym: str, mode: str) -> Dict:
             return {"ok": False, "error": str(e)}
 
 async def run_mode(mode: str) -> List[Dict]:
+    from helpers import COIN_LIST
     tasks = [scan_coin(sym, mode) for sym in COIN_LIST]
     results = await asyncio.gather(*tasks)
     valid = [r for r in results if r.get("ok")]
@@ -239,7 +281,7 @@ async def run_all_modes() -> Dict[str, List[Dict]]:
     return {m: await run_mode(m) for m in ("quick", "mid", "trend")}
 
 # ----------------- TG / LOG -----------------
-async def send_tg_async(text: str):
+async def send_telegram(text: str):
     if not (TG_BOT_TOKEN and TG_CHAT_ID): return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": text}
@@ -265,5 +307,66 @@ TP: {sig['tp']}
 SL: {sig['sl']}
 UTC: {sig['time_utc']}"""
 
+# ----------------- OVERRIDE WATCH (short version) -----------------
+ACTIVE_TRADES: List[Dict] = []
+
+async def multi_override_watch(active_signals: List[Dict]) -> List[str]:
+    alerts = []
+    if not active_signals: return alerts
+    btc_df = await fetch_ohlcv("BTCUSDT", "1m", 12)
+    btc_move = 0.0
+    if not btc_df.empty and len(btc_df) >= 10:
+        btc_move = (btc_df["close"].iloc[-1] - btc_df["close"].iloc[-10]) / btc_df["close"].iloc[-10] * 100
+
+    for sig in active_signals:
+        if not sig.get("ok"): continue
+        symbol = sig["symbol"]
+        side   = sig.get("side", "BUY")
+        entry  = float(sig["entry"])
+        sl     = float(sig["sl"])
+        tp     = float(sig["tp"])
+        time_utc = sig["time_utc"]
+
+        df = await fetch_ohlcv(symbol, "1m", 20)
+        if df.empty or len(df) < 6: continue
+        price = float(df["close"].iloc[-1])
+        age_min = (datetime.utcnow() - datetime.strptime(time_utc, "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+
+        move_pct = (price - entry) / entry * 100 if side == "BUY" else (entry - price) / entry * 100
+        dist_sl  = abs(price - sl) / price * 100
+        in_loss  = (side == "BUY" and price < entry) or (side == "SELL" and price > entry)
+
+        reasons = []
+        strong = 0
+
+        if dist_sl < 0.3 and in_loss:
+            strong +=1; reasons.append(f"SL very close (~{dist_sl:.2f}%)")
+        if age_min <= 5 and move_pct <= -0.7:
+            strong +=1; reasons.append(f"Fast loss (~{move_pct:.2f}%)")
+        if move_pct <= -1.0:
+            strong +=1; reasons.append(f"Big loss (~{move_pct:.2f}%)")
+        if btc_move < -0.7 and in_loss:
+            strong +=1; reasons.append(f"BTC pressure (~{btc_move:.2f}%)")
+        if age_min >= 30 and abs(move_pct) < 0.2:
+            reasons.append(f"Time trap (~{age_min:.1f} min)")
+
+        level = ("EMERGENCY" if strong >=2 else "HIGH" if strong ==1 else "CAUTION") if strong else None
+        if not level: continue
+
+        emoji = {"EMERGENCY": "🔴", "HIGH": "🟠", "CAUTION": "🟡"}.get(level, "⚠️")
+        alerts.append(f"{emoji} {level} ALERT\nPair: {symbol}\nReasons:\n- " + "\n- ".join(reasons) +
+                      f"\nEntry: {entry}\nTP: {tp}\nSL: {sl}\nNow: {price:.4f} ({move_pct:+.2f}%)")
+    return alerts
+
+# ----------------- COIN LIST -----------------
+COIN_LIST: List[str] = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT",
+    "DOTUSDT", "LTCUSDT", "BCHUSDT", "AVAXUSDT", "UNIUSDT", "LINKUSDT", "ATOMUSDT", "ETCUSDT",
+    "FILUSDT", "ICPUSDT", "NEARUSDT", "APTUSDT", "SANDUSDT", "AXSUSDT", "THETAUSDT", "FTMUSDT",
+    "RUNEUSDT", "ALGOUSDT", "EGLDUSDT", "IMXUSDT", "INJUSDT", "OPUSDT", "ARBUSDT", "SUIUSDT",
+    "TIAUSDT", "PEPEUSDT", "TRBUSDT", "SEIUSDT", "JTOUSDT", "PYTHUSDT", "RAYUSDT", "GMTUSDT",
+    "MINAUSDT", "WLDUSDT", "ZKUSDT", "STRKUSDT", "DYDXUSDT", "VETUSDT", "GALAUSDT", "KAVAUSDT",
+]
+
 # ----------------- EXPORT -----------------
-__all__ = ["run_all_modes", "multi_override_watch", "format_signal", "send_tg_async", "log_signal"]
+__all__ = ["run_all_modes", "multi_override_watch", "format_signal", "send_telegram", "log_signal"]
