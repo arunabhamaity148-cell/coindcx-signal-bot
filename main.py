@@ -1,5 +1,5 @@
 # main.py – Sniper-grade signal engine runner for Railway
-# Compatible with helpers.py v2 (ICT, ADR, bias, news, ATR TP/SL)
+# Console + file log, emoji TG, health-check
 
 import asyncio
 import logging
@@ -22,47 +22,46 @@ from helpers import (
     log_signal,
 )
 
-# -------------------------------------------------------------
-# FASTAPI APP (Railway health check)
-# -------------------------------------------------------------
+# -------------------- FASTAPI (health-check) --------------------
 app = FastAPI()
 
 @app.get("/")
 def root() -> Dict[str, str]:
     return {"status": "running", "ts": datetime.utcnow().isoformat()}
 
-# -------------------------------------------------------------
-# ENV + LOGGING
-# -------------------------------------------------------------
+# -------------------- ENV + LOGGING (console + file) --------------------
 load_dotenv()
 
-PING_URL = os.getenv("PING_URL", "").strip()
-
+# Console + file dual log
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler("logs/signals.log"),
+        logging.StreamHandler()          # Railway console-এ দেখাবে
+    ]
 )
 logger = logging.getLogger("sniper-engine")
 
-# -------------------------------------------------------------
-# KEEPALIVE PING
-# -------------------------------------------------------------
-async def ping_forever() -> None:
-    if not PING_URL:
-        logger.info("PING_URL not set – ping disabled")
-        return
+PING_URL = os.getenv("PING_URL", "").strip()
+
+# -------------------- TELEGRAM TEST PING --------------------
+async def test_telegram():
+    await send_telegram("🟢 <b>Sniper bot online</b>\n<code>Ready to scan → score ≥ {}</code>".format(os.getenv("SCORE_MIN",90)))
+
+# -------------------- KEEPALIVE PING (Railway) --------------------
+async def ping_forever():
+    if not PING_URL: return
     while True:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(PING_URL, timeout=10) as resp:
-                    logger.debug("Ping: %s", resp.status)
+            async with aiohttp.ClientSession() as s:
+                async with s.get(PING_URL, timeout=10) as r:
+                    logger.debug("Ping: %s", r.status)
         except Exception as e:
             logger.warning("Ping error: %s", e)
         await asyncio.sleep(60)
 
-# -------------------------------------------------------------
-# SIGNAL DEDUPLICATION
-# -------------------------------------------------------------
+# -------------------- SIGNAL DEDUP --------------------
 SENT_KEYS: set = set()
 SIGNAL_COUNT: int = 0
 
@@ -79,9 +78,7 @@ def flatten_modes(all_modes: Dict[str, List[Dict]]) -> List[Dict]:
             logger.warning("Mode %s not list: %s", mode, type(part))
     return signals
 
-# -------------------------------------------------------------
-# ENGINE CYCLE
-# -------------------------------------------------------------
+# -------------------- ENGINE CYCLE --------------------
 async def engine_cycle() -> None:
     global SIGNAL_COUNT
     try:
@@ -90,13 +87,12 @@ async def engine_cycle() -> None:
         logger.error("run_all_modes error: %s", e)
         return
 
-    # summary
     summary = {k: len(v) if isinstance(v, list) else 0 for k, v in all_modes.items()}
     logger.info("Cycle summary: %s", summary)
 
     signals = flatten_modes(all_modes)
 
-    # new signals
+    # New signals
     for sig in signals:
         if not sig.get("ok"):
             continue
@@ -110,7 +106,7 @@ async def engine_cycle() -> None:
         await send_telegram(msg)
         log_signal(sig)
 
-    # override alerts
+    # Override alerts
     if signals:
         try:
             alerts = await multi_override_watch(signals)
@@ -120,11 +116,10 @@ async def engine_cycle() -> None:
         except Exception as e:
             logger.error("override error: %s", e)
 
-# -------------------------------------------------------------
-# ENGINE LOOP
-# -------------------------------------------------------------
+# -------------------- ENGINE LOOP --------------------
 async def engine_loop() -> None:
     logger.info("🚀 Sniper engine loop started")
+    await test_telegram()
     while True:
         try:
             await engine_cycle()
@@ -133,9 +128,7 @@ async def engine_loop() -> None:
             traceback.print_exc()
         await asyncio.sleep(20)
 
-# -------------------------------------------------------------
-# SAFE RUNNER
-# -------------------------------------------------------------
+# -------------------- SAFE RUNNER --------------------
 async def safe_runner() -> None:
     while True:
         try:
@@ -149,16 +142,12 @@ async def safe_runner() -> None:
         logger.info("Restarting in 5s...")
         await asyncio.sleep(5)
 
-# -------------------------------------------------------------
-# WEB SERVER (Railway)
-# -------------------------------------------------------------
+# -------------------- WEB SERVER (Railway) --------------------
 def start_web():
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
 
-# -------------------------------------------------------------
-# MAIN
-# -------------------------------------------------------------
+# -------------------- MAIN --------------------
 if __name__ == "__main__":
     threading.Thread(target=start_web, daemon=True).start()
     try:
