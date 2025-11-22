@@ -1,5 +1,5 @@
 # main.py – Sniper-grade signal engine runner for Railway
-# Console + file log, emoji TG, health-check
+# Boot ping, console log, emoji TG, health-check
 
 import asyncio
 import logging
@@ -32,7 +32,6 @@ def root() -> Dict[str, str]:
 # -------------------- ENV + LOGGING (console + file) --------------------
 load_dotenv()
 
-# Console + file dual log
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -47,7 +46,9 @@ PING_URL = os.getenv("PING_URL", "").strip()
 
 # -------------------- TELEGRAM TEST PING --------------------
 async def test_telegram():
-    await send_telegram("🟢 <b>Sniper bot online</b>\n<code>Ready to scan → score ≥ {}</code>".format(os.getenv("SCORE_MIN",90)))
+    txt = "🟢 <b>Sniper bot online</b>\n<code>Score ≥ {}</code>".format(os.getenv("SCORE_MIN", 90))
+    await send_telegram(txt)
+    logger.info("Telegram: %s", txt.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
 
 # -------------------- KEEPALIVE PING (Railway) --------------------
 async def ping_forever():
@@ -118,7 +119,7 @@ async def engine_cycle() -> None:
 
 # -------------------- ENGINE LOOP --------------------
 async def engine_loop() -> None:
-    logger.info("🚀 Sniper engine loop started")
+    logger.info("===== BOT BOOTING =====")
     await test_telegram()
     while True:
         try:
