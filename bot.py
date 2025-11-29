@@ -58,11 +58,15 @@ def layer2_micro(k):
     wick = (h[-1] - max(c[-1], c[-2])) / (h[-1] - l[-1]) > 0.6
     # 6. Delta_Divergence_1m (price down, volume up)
     div = (c[-1] < c[-2]) and (v[-1] > v[-2])
-    # 7. Spread_Safety (live check)
-    book = requests.get("https://api.binance.com/api/v3/ticker/bookTicker",
-                        params={"symbol":k[0][0][:k[0][0].index("USDT")+4]}, timeout=5).json()
-    spr = (float(book["askPrice"]) - float(book["bidPrice"])) / float(book["bidPrice"])
-    tight = spr < 0.0005
+    # 7. Spread_Safety (live) – FIXED symbol parse
+    symbol = k[0][0][:k[0][0].rfind("USDT") + 4]   # safe slice
+    try:
+        book = requests.get("https://api.binance.com/api/v3/ticker/bookTicker",
+                            params={"symbol": symbol}, timeout=5).json()
+        spr = (float(book["askPrice"]) - float(book["bidPrice"])) / float(book["bidPrice"])
+        tight = spr < 0.0005
+    except:
+        tight = False
     return int(pb) + int(wick) + int(div) + int(tight)
 
 # ---------- Layer-3 Risk Guard (0-15 pts) ----------
