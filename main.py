@@ -1,257 +1,210 @@
-# main.py — FINAL 10/10 VERSION
-import os, time, json, asyncio, random, sqlite3, hashlib
-import aiohttp
+import os, time, json, asyncio, random, hashlib, aiohttp
 from dotenv import load_dotenv
-
-import ccxt.async_support as ccxt
 from openai import OpenAI
 
-from helpers import (
-    now_ts, human_time, esc, CACHE, calc_tp_sl,
-    build_ai_prompt, rsi, atr, ema
-)
-
+# -----------------------
+# Load ENV
+# -----------------------
 load_dotenv()
 
-# ---------- ENV ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN","")
-CHAT_ID   = os.getenv("CHAT_ID","")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY","")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL","gpt-4o-mini")
-OPENAI_MAX_PER_MIN = int(os.getenv("OPENAI_MAX_PER_MIN","40"))
-OPENAI_TTL = int(os.getenv("OPENAI_TTL_SECONDS","60"))
+CYCLE_TIME = int(os.getenv("CYCLE_TIME", "20"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))
+SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "78"))
 
-CYCLE_TIME = int(os.getenv("CYCLE_TIME","20"))
-SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD","78"))
-COOLDOWN = int(os.getenv("COOLDOWN_SECONDS","1800"))
+SYMBOLS = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT",
+    "DOTUSDT","MATICUSDT","LTCUSDT","LINKUSDT","FILUSDT","ATOMUSDT","ETCUSDT","OPUSDT",
+    "ICPUSDT","APTUSDT","NEARUSDT","INJUSDT","ARBUSDT","SUIUSDT","AAVEUSDT","EOSUSDT",
+    "CRVUSDT","RUNEUSDT","XMRUSDT","FTMUSDT","SNXUSDT","DYDXUSDT","GMTUSDT","HBARUSDT",
+    "THETAUSDT","AXSUSDT","FLOWUSDT","KAVAUSDT","ZILUSDT","GALAUSDT","MTLUSDT",
+    "CHZUSDT","RNDRUSDT","SANDUSDT","MANAUSDT","1INCHUSDT","COMPUSDT","KLAYUSDT",
+    "TOMOUSDT","VETUSDT","BLURUSDT","STRKUSDT"
+]
 
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS","").split(",") if s.strip()]
-
-USE_TESTNET = os.getenv("USE_TESTNET","true").lower() in ("true","1","yes")
-BIN_KEY = os.getenv("BINANCE_API_KEY","")
-BIN_SEC = os.getenv("BINANCE_API_SECRET","")
-
+# -----------------------
+# OpenAI Client
+# -----------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
-_openai_calls=[]
 
-def openai_can():
-    now=time.time()
-    while _openai_calls and _openai_calls[0]<=now-60:
-        _openai_calls.pop(0)
-    return len(_openai_calls)<OPENAI_MAX_PER_MIN
+# -----------------------
+# Cooldown
+# -----------------------
+cooldown = {}
 
-def openai_note():
-    _openai_calls.append(time.time())
+# -----------------------
+# Metric mock
+# (No CCXT → AI-only scoring)
+# -----------------------
+def fetch_price(symbol):
+    return random.uniform(50, 70000)
 
-# ---------- DB ----------
-conn=sqlite3.connect(os.getenv("SIGNAL_DB","signals.db"),check_same_thread=False)
-cur=conn.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS signals(
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- ts INTEGER,
- symbol TEXT,
- price REAL,
- score INTEGER,
- mode TEXT,
- reason TEXT,
- tp REAL,
- sl REAL
-)
-""")
-conn.commit()
+# -----------------------
+# Build AI Prompt (58 LOGICS)
+# -----------------------
+LOGIC_LIST = """
+HTF_EMA_1h_15m, HTF_EMA_1h_4h, HTF_EMA_1h_8h, HTF_Structure_Break, HTF_Structure_Reject,
+Imbalance_FVG, Trend_Continuation, Trend_Exhaustion, Micro_Pullback, Wick_Strength,
+Sweep_Reversal, Vol_Sweep_1m, Vol_Sweep_5m, Delta_Divergence_1m, Delta_Divergence_HTF,
+Iceberg_1m, Iceberg_v2, Orderbook_Wall_Shift, Liquidity_Wall, Liquidity_Bend,
+ADR_DayRange, ATR_Expansion, Phase_Shift, Price_Compression, Speed_Imbalance,
+Taker_Pressure, HTF_Volume_Imprint, Tiny_Cluster_Imprint, Absorption, Recent_Weakness,
+Spread_Snap_0_5s, Spread_Snap_0_25s, Tight_Spread_Filter, Spread_Safety,
+BE_SL_AutoLock, Liquidation_Distance, Kill_Zone_5m, Kill_Zone_HTF,
+Kill_Switch_Fast, Kill_Switch_Primary, News_Guard, 30s_Recheck_Loop,
+Partial_Exit_Logic, BTC_Risk_Filter_L1, BTC_Risk_Filter_L2,
+BTC_Funding_OI_Combo, Funding_Extreme, Funding_Delta_Speed,
+Funding_Arbitrage, OI_Spike_5pct, OI_Spike_Sustained,
+ETH_BTC_Beta_Divergence, Options_Gamma_Flip, Heatmap_Sweep,
+Micro_Slip, Order_Block, Score_Normalization, Final_Signal_Score
+"""
 
-def log_signal(ts,sym,p,sc,m,r,tp,sl):
-    cur.execute("INSERT INTO signals(ts,symbol,price,score,mode,reason,tp,sl) VALUES(?,?,?,?,?,?,?,?)",
-                (ts,sym,p,sc,m,r,tp,sl))
-    conn.commit()
+def build_prompt(symbol, price):
+    return f"""
+You are an expert quant trading signal engine.
+Evaluate FUTURES entry based on 58 logics:
 
-# ---------- TELEGRAM ----------
-async def send_telegram(msg):
+{LOGIC_LIST}
+
+Return STRICT JSON ONLY:
+{{
+ "score": 0-100,
+ "mode": "quick" | "mid" | "trend",
+ "reason": "short reason"
+}}
+
+Symbol: {symbol}
+Price: {price}
+
+Rules:
+- If BTC not calm → score = 0.
+- Trend alignment boosts score.
+- Spread/funding/liquidity issues reduce score.
+- Mode rules:
+  quick = scalp, mid = momentum, trend = HTF alignment.
+- Output JSON only.
+"""
+
+# -----------------------
+# AI Call
+# -----------------------
+async def ai_score(symbol, price):
+    prompt = build_prompt(symbol, price)
+
+    def call_api():
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Only JSON response allowed."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=150
+        )
+        return resp.choices[0].message.content
+
+    raw = await asyncio.to_thread(call_api)
+
+    try:
+        return json.loads(raw)
+    except:
+        # Try to extract JSON
+        import re
+        m = re.search(r"\{.*\}", raw)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except:
+                return None
+        return None
+
+# -----------------------
+# TP/SL Calculation
+# -----------------------
+def calc_tp_sl(price, mode):
+    if mode == "quick":
+        tp = price * 1.016
+        sl = price * 0.99
+    elif mode == "mid":
+        tp = price * 1.02
+        sl = price * 0.99
+    else:
+        tp = price * 1.04
+        sl = price * 0.985
+    return round(tp, 2), round(sl, 2)
+
+# -----------------------
+# TEXT message ( NO HTML )
+# -----------------------
+def build_msg(symbol, price, score, mode, reason, tp, sl):
+    return f"""
+🔥 AI SIGNAL ({mode.upper()})  
+Symbol: {symbol}  
+Price: {price}  
+
+Score: {score}  
+Reason: {reason}  
+
+🎯 TP: {tp}  
+🛡️ SL: {sl}  
+
+Time: {time.strftime('%H:%M:%S')}  
+"""
+
+# -----------------------
+# Telegram Sender
+# -----------------------
+async def send(msg):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram not configured")
         return
-    url=f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"}
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg}
+
     async with aiohttp.ClientSession() as s:
-        try:
-            async with s.post(url,data=data,timeout=15) as r:
-                return await r.text()
-        except:
-            return None
+        await s.post(url, data=payload)
 
-def format_msg(sym,p,sc,mode,reason,tp,sl):
-    return (
-f"🔥⚡ <b>AI SIGNAL — {mode.upper()} MODE</b> ⚡🔥\n"
-f"<b>{sym}</b> • Price: <code>{p:.8f}</code>\n\n"
-f"🎯 <b>Score:</b> <b>{sc}</b>\n"
-f"📌 <b>Reason:</b> {esc(reason)}\n\n"
-f"🎯 <b>TP:</b> <code>{tp}</code>\n"
-f"🛡️ <b>SL:</b> <code>{sl}</code>\n\n"
-f"🕒 {human_time()}  ⏳ Cooldown: {COOLDOWN//60}m\n"
-f"🤖 AI-Only • Hybrid Indicators"
-)
+# -----------------------
+# MAIN LOOP
+# -----------------------
+async def run():
+    print("AI Bot Running...")
 
-# ---------- EXCHANGE ----------
-async def init_ex():
-    opt={"enableRateLimit":True,"options":{"defaultType":"future"}}
-    if USE_TESTNET:
-        opt["urls"]={
-            "api":{
-                "public":"https://testnet.binancefuture.com/fapi/v1",
-                "private":"https://testnet.binancefuture.com/fapi/v1"
-            }
-        }
-    ex=ccxt.binance(opt)
-    if BIN_KEY and BIN_SEC:
-        ex.apiKey=BIN_KEY
-        ex.secret=BIN_SEC
-    return ex
+    while True:
+        for sym in SYMBOLS:
 
-# ---------- SNAPSHOT ----------
-async def snapshot(ex, sym):
-    key=CACHE.make_key("snap",sym)
-    c=CACHE.get(key)
-    if c: return c
+            # Cooldown check
+            if cooldown.get(sym, 0) > time.time():
+                continue
 
-    # price
-    try:
-        tk=await ex.fetch_ticker(sym)
-        p=float(tk.get("last") or tk.get("close") or 0)
-        vol=float(tk.get("baseVolume") or 0)
-    except:
-        p=random.uniform(10,50000); vol=0
+            price = fetch_price(sym)
+            res = await ai_score(sym, price)
 
-    # orderbook for spread
-    try:
-        ob=await ex.fetch_order_book(sym,5)
-        b=ob["bids"][0][0] if ob["bids"] else None
-        a=ob["asks"][0][0] if ob["asks"] else None
-        sp=abs(a-b)/((a+b)/2)*100 if a and b else 0
-    except:
-        sp=0
+            if not res:
+                continue
 
-    # 1m closes
-    try:
-        o1=await ex.fetch_ohlcv(sym,"1m",limit=120)
-        cl1=[x[4] for x in o1]
-    except:
-        cl1=[]
+            score = res.get("score", 0)
+            mode = res.get("mode", "quick")
+            reason = res.get("reason", "")
 
-    m={
-        "closes_1m": cl1[-60:],
-        "vol_1m": vol,
-        "spread_pct": round(sp,4),
-        "rsi_1m": round(rsi(cl1),2) if cl1 else 50,
-    }
+            if score >= SCORE_THRESHOLD:
+                tp, sl = calc_tp_sl(price, mode)
+                msg = build_msg(sym, price, score, mode, reason, tp, sl)
 
-    snap={"price":p,"metrics":m}
-    CACHE.set(key,snap,3)
-    return snap
+                await send(msg)
 
-# ---------- AI SCORING ----------
-def score_key(sym,p,m):
-    base={
-        "p":round(p,6),
-        "r":m.get("rsi_1m"),
-        "s":m.get("spread_pct"),
-    }
-    raw=f"{sym}|{json.dumps(base,sort_keys=True)}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+                cooldown[sym] = time.time() + COOLDOWN_SECONDS
+                print("SENT:", sym, score, mode)
 
-async def ai_score(sym,p,m,prefs):
-    k=CACHE.make_key("ai",score_key(sym,p,m))
-    c=CACHE.get(k)
-    if c: return c
+        await asyncio.sleep(CYCLE_TIME)
 
-    # rate limit
-    wait=0
-    while not openai_can():
-        await asyncio.sleep(1)
-        wait+=1
-        if wait>10:
-            return None
-
-    prompt=build_ai_prompt(sym,p,m,prefs)
-
-    def call():
-        r=client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role":"system","content":"Strict JSON only."},
-                {"role":"user","content":prompt}
-            ],
-            temperature=0.0,
-            max_tokens=200
-        )
-        return r.choices[0].message.content
-
-    openai_note()
-    raw=await asyncio.to_thread(call)
-
-    try:
-        j=json.loads(raw.strip())
-    except:
-        import re
-        f=re.search(r"\{.*\}",raw,re.DOTALL)
-        if f:
-            try: j=json.loads(f.group(0))
-            except: j=None
-        else: j=None
-
-    if j:
-        CACHE.set(k,j,OPENAI_TTL)
-    return j
-
-# ---------- MAIN LOOP ----------
-async def worker():
-    ex=await init_ex()
-    cd={}
-    prefs={"BTC_CALM_REQUIRED":True}
-
-    print(f"BOT READY • {len(SYMBOLS)} symbols • AI model={OPENAI_MODEL}")
-
-    try:
-        while True:
-            for sym in SYMBOLS:
-                try:
-                    if cd.get(sym,0)>time.time():
-                        continue
-
-                    snap=await snapshot(ex,sym)
-                    p=snap["price"]; m=snap["metrics"]
-
-                    sc=await ai_score(sym,p,m,prefs)
-                    if not sc: 
-                        await asyncio.sleep(0.05)
-                        continue
-
-                    score=int(sc.get("score",0))
-                    mode=sc.get("mode","quick")
-                    reason=sc.get("reason","")
-
-                    if score>=SCORE_THRESHOLD:
-                        tp,sl=calc_tp_sl(p,mode)
-                        msg=format_msg(sym,p,score,mode,reason,tp,sl)
-                        await send_telegram(msg)
-                        log_signal(now_ts(),sym,p,score,mode,reason,tp,sl)
-                        cd[sym]=time.time()+COOLDOWN
-
-                    await asyncio.sleep(0.07)
-
-                except Exception as e:
-                    print("ERR symbol:",sym,e)
-                    await asyncio.sleep(0.1)
-
-            await asyncio.sleep(CYCLE_TIME)
-
-    finally:
-        try: await ex.close()
-        except: pass
-
-if __name__=="__main__":
-    if not OPENAI_API_KEY:
-        print("ERROR: Missing OPENAI_API_KEY")
-    else:
-        asyncio.run(worker())
+# -----------------------
+# Start
+# -----------------------
+if __name__ == "__main__":
+    asyncio.run(run())
