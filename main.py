@@ -1,25 +1,28 @@
-# main.py — Updated: hybrid indicators + caching + rate-limit + sqlite history
-import os, time, json, asyncio, hashlib, sqlite3, math
+# main.py — FINAL (Hybrid AI scoring + caching + sqlite + ccxt + Telegram)
+import os, time, json, asyncio, random, hashlib, sqlite3
 from dotenv import load_dotenv
-import aiohttp, random
+import aiohttp
+
 load_dotenv()
 
-# OpenAI & ccxt async
 from openai import OpenAI
 import ccxt.async_support as ccxt
 
 from helpers import (
-    now_ts, human_time, esc, calc_tp_sl, build_ai_prompt, SimpleCache, CACHE, sma,
+    now_ts, human_time, esc, calc_tp_sl, build_ai_prompt, CACHE, SimpleCache,
     compute_ema_from_closes, atr, rsi_from_closes
 )
 
 # -------------------------
-# ENV
+# ENV / config
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID   = os.getenv("CHAT_ID","").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY","").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL","gpt-4o-mini")
+OPENAI_MAX_PER_MIN = int(os.getenv("OPENAI_MAX_PER_MIN","40"))
+OPENAI_TTL_SECONDS = int(os.getenv("OPENAI_TTL_SECONDS","60"))
+
 CYCLE_TIME = int(os.getenv("CYCLE_TIME","20"))
 SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD","78"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS","1800"))
@@ -29,17 +32,16 @@ USE_TESTNET = os.getenv("USE_TESTNET","true").lower() in ("1","true","yes")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY","").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET","").strip()
 
+# -------------------------
 # OpenAI client
+# -------------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Rate-limit config (OpenAI calls per minute)
-OPENAI_MAX_PER_MIN = int(os.getenv("OPENAI_MAX_PER_MIN","40"))
+# simple sliding-window call tracker
 _openai_calls = []
 def openai_can_call():
-    # sliding window
     now = time.time()
     window = 60.0
-    # remove old
     while _openai_calls and _openai_calls[0] <= now - window:
         _openai_calls.pop(0)
     return len(_openai_calls) < OPENAI_MAX_PER_MIN
@@ -48,12 +50,12 @@ def openai_note_call():
     _openai_calls.append(time.time())
 
 # -------------------------
-# SQLite history
+# SQLite logging
 # -------------------------
-DB_PATH = os.getenv("SIGNAL_DB", "signals.db")
+DB_PATH = os.getenv("SIGNAL_DB","signals.db")
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-c = conn.cursor()
-c.execute("""
+cur = conn.cursor()
+cur.execute("""
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER,
@@ -69,12 +71,12 @@ CREATE TABLE IF NOT EXISTS signals (
 conn.commit()
 
 def log_signal_db(ts, symbol, price, score, mode, reason, tp, sl):
-    c.execute("INSERT INTO signals (ts,symbol,price,score,mode,reason,tp,sl) VALUES (?,?,?,?,?,?,?,?)",
-              (ts,symbol,price,score,mode,reason,tp,sl))
+    cur.execute("INSERT INTO signals (ts,symbol,price,score,mode,reason,tp,sl) VALUES (?,?,?,?,?,?,?,?)",
+                (ts, symbol, price, score, mode, reason, tp, sl))
     conn.commit()
 
 # -------------------------
-# Exchange create
+# create exchange
 # -------------------------
 async def create_exchange():
     opts = {"enableRateLimit": True, "options": {"defaultType": "future"}}
@@ -92,26 +94,26 @@ async def create_exchange():
     return exchange
 
 # -------------------------
-# Snapshot fetch (hlines + orderbook best)
+# fetch snapshot (with small caching)
 # -------------------------
 async def fetch_snapshot(exchange, symbol):
-    # try cached snapshot key for heavy ops (1s cache)
     key = CACHE.make_key("snap", symbol)
-    snap = CACHE.get(key)
-    if snap:
-        return snap
+    cached = CACHE.get(key)
+    if cached:
+        return cached
 
     price = None
-    spread_pct = None
-    closes_1m = closes_5m = closes_15m = closes_1h = []
+    spread_pct = 0.0
     # fetch ticker
     try:
         tk = await exchange.fetch_ticker(symbol)
         price = float(tk.get("last") or tk.get("close") or 0)
+        base_vol = float(tk.get("baseVolume") or 0)
     except Exception:
-        price = random.uniform(1,50000)
+        price = random.uniform(1, 50000)
+        base_vol = random.uniform(100, 50000)
 
-    # attempt to fetch orderbook top to compute spread
+    # orderbook top for spread
     try:
         ob = await exchange.fetch_order_book(symbol, 5)
         bid = ob["bids"][0][0] if ob["bids"] else None
@@ -120,36 +122,37 @@ async def fetch_snapshot(exchange, symbol):
             mid = (bid + ask) / 2.0
             spread_pct = abs(ask - bid) / mid * 100.0
     except Exception:
-        spread_pct = None
+        spread_pct = 0.0
 
-    # fetch ohlcv for multiple tf (best-effort, reduce size)
+    # fetch ohlcv for small indicators
+    closes_1m = closes_5m = closes_15m = closes_1h = []
     try:
-        ohlcv_1m = await exchange.fetch_ohlcv(symbol, timeframe='1m', limit=120)
-        closes_1m = [row[4] for row in ohlcv_1m]
+        o1 = await exchange.fetch_ohlcv(symbol, '1m', limit=120)
+        closes_1m = [r[4] for r in o1]
     except Exception:
         closes_1m = []
 
     try:
-        ohlcv_5m = await exchange.fetch_ohlcv(symbol, timeframe='5m', limit=120)
-        closes_5m = [row[4] for row in ohlcv_5m]
+        o5 = await exchange.fetch_ohlcv(symbol, '5m', limit=120)
+        closes_5m = [r[4] for r in o5]
     except Exception:
         closes_5m = []
 
     try:
-        ohlcv_15m = await exchange.fetch_ohlcv(symbol, timeframe='15m', limit=120)
-        closes_15m = [row[4] for row in ohlcv_15m]
+        o15 = await exchange.fetch_ohlcv(symbol, '15m', limit=120)
+        closes_15m = [r[4] for r in o15]
     except Exception:
         closes_15m = []
 
     try:
-        ohlcv_1h = await exchange.fetch_ohlcv(symbol, timeframe='1h', limit=120)
-        closes_1h = [row[4] for row in ohlcv_1h]
+        o1h = await exchange.fetch_ohlcv(symbol, '1h', limit=120)
+        closes_1h = [r[4] for r in o1h]
     except Exception:
         closes_1h = []
 
-    # compute indicators
-    atr_14 = atr(ohlcv_1m if 'ohlcv_1m' in locals() else []) if 'ohlcv_1m' in locals() else 0.0
-    rsi_14 = rsi_from_closes(closes_1m, period=14) if closes_1m else 50.0
+    # compute a few indicators locally
+    atr_1m = atr(o1) if 'o1' in locals() else 0.0
+    rsi_1m = rsi_from_closes(closes_1m) if closes_1m else 50.0
     ema_1h_50 = compute_ema_from_closes(closes_1h, 50) if closes_1h else 0.0
     ema_15m_50 = compute_ema_from_closes(closes_15m, 50) if closes_15m else 0.0
 
@@ -158,25 +161,37 @@ async def fetch_snapshot(exchange, symbol):
         "closes_5m": closes_5m,
         "closes_15m": closes_15m,
         "closes_1h": closes_1h,
-        "vol_1m": sum(closes_1m[-10:]) if closes_1m else 0,
-        "vol_5m": sum(closes_5m[-10:]) if closes_5m else 0,
-        "atr_1m": atr_14,
-        "rsi_1m": rsi_14,
-        "ema_1h_50": ema_1h_50,
-        "ema_15m_50": ema_15m_50,
-        "spread_pct": round(spread_pct or 0.0, 4),
+        "vol_1m": base_vol,
+        "vol_5m": base_vol * 3,
+        "atr_1m": round(atr_1m, 6),
+        "rsi_1m": round(rsi_1m, 2),
+        "ema_1h_50": round(ema_1h_50, 6),
+        "ema_15m_50": round(ema_15m_50, 6),
+        "spread_pct": round(spread_pct, 4),
         "funding_rate": 0.0
     }
 
     snap = {"price": price, "metrics": metrics}
-    CACHE.set(key, snap, ttl_seconds=3)  # small cache for snapshot freshness
+    CACHE.set(key, snap, ttl_seconds=3)
     return snap
 
 # -------------------------
-# AI scorer wrapper with caching + rate-limit
+# AI scoring with cache & rate-limit
 # -------------------------
-def extract_cache_key_for_scoring(symbol, price, metrics):
-    # create stable small fingerprint of metrics
+def parse_json_from_text(text: str):
+    try:
+        return json.loads(text.strip())
+    except Exception:
+        import re
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+        return None
+
+def extract_score_cache_key(symbol, price, metrics):
     important = {
         "price": round(price, 6),
         "rsi_1m": round(metrics.get("rsi_1m",50.0),2),
@@ -188,35 +203,31 @@ def extract_cache_key_for_scoring(symbol, price, metrics):
     raw = f"{symbol}|{json.dumps(important, sort_keys=True)}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
-async def ai_score_with_cache(symbol, price, metrics, prefs, ttl=60):
-    cache_key = CACHE.make_key("ai", extract_cache_key_for_scoring(symbol, price, metrics))
+async def ai_score_with_cache(symbol, price, metrics, prefs, ttl=OPENAI_TTL_SECONDS):
+    cache_key = CACHE.make_key("ai", extract_score_cache_key(symbol, price, metrics))
     cached = CACHE.get(cache_key)
     if cached:
         return cached
 
-    # rate-limit check
-    wait_count = 0
+    # rate-limit loop
+    wait = 0
     while not openai_can_call():
-        # sleep small until allowed (but avoid indefinite block)
         await asyncio.sleep(1)
-        wait_count += 1
-        if wait_count > 10:
-            # avoid too long waiting, bail out
+        wait += 1
+        if wait > 10:
             return None
 
-    # build prompt
     prompt = build_ai_prompt(symbol, price, metrics, prefs)
 
     def call_ai():
-        # synchronous call to OpenAI client (wrapped)
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role":"system","content":"You are an expert crypto futures signal scorer. Return STRICT JSON only."},
+                {"role":"system","content":"You are an expert crypto futures signal scorer. Return strict JSON only."},
                 {"role":"user","content": prompt}
             ],
             temperature=0.0,
-            max_tokens=250
+            max_tokens=300
         )
         try:
             return resp.choices[0].message.content
@@ -228,20 +239,7 @@ async def ai_score_with_cache(symbol, price, metrics, prefs, ttl=60):
 
     openai_note_call()
     raw = await asyncio.to_thread(call_ai)
-    # parse JSON
-    try:
-        parsed = json.loads(raw.strip())
-    except Exception:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-            except Exception:
-                parsed = None
-        else:
-            parsed = None
-
+    parsed = parse_json_from_text(raw)
     if parsed:
         CACHE.set(cache_key, parsed, ttl_seconds=ttl)
     return parsed
@@ -251,7 +249,7 @@ async def ai_score_with_cache(symbol, price, metrics, prefs, ttl=60):
 # -------------------------
 async def send_telegram(msg: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram credentials missing; skipping send.")
+        print("Telegram not configured.")
         return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -269,7 +267,7 @@ async def send_telegram(msg: str):
             return None
 
 # -------------------------
-# Message builder (premium)
+# build message
 # -------------------------
 def build_message(symbol, price, score, mode, reason, tp, sl):
     parts = []
@@ -282,54 +280,55 @@ def build_message(symbol, price, score, mode, reason, tp, sl):
     return "\n".join(parts)
 
 # -------------------------
-# Main worker
+# main worker
 # -------------------------
 async def worker():
     exchange = await create_exchange()
-    cd = {}  # simple per-symbol cooldown timestamps
+    cd = {}  # symbol -> ts
     prefs = {
         "BTC_CALM_REQUIRED": True,
         "TP_SL": {
-            "quick": {"tp_pct":1.6, "sl_pct":1.0},
-            "mid": {"tp_pct":2.0, "sl_pct":1.0},
-            "trend": {"tp_pct":4.0, "sl_pct":1.5}
+            "quick": {"tp_pct":1.6,"sl_pct":1.0},
+            "mid": {"tp_pct":2.0,"sl_pct":1.0},
+            "trend": {"tp_pct":4.0,"sl_pct":1.5}
         }
     }
 
-    print(f"Hybrid AI bot started. Symbols: {len(SYMBOLS)}. OpenAI rate limit: {OPENAI_MAX_PER_MIN}/min")
+    print(f"Hybrid AI bot started. Symbols: {len(SYMBOLS)} • OpenAI limit: {OPENAI_MAX_PER_MIN}/min")
 
     try:
         while True:
             for sym in SYMBOLS:
-                # simple cooldown
-                if cd.get(sym,0) > time.time():
-                    continue
+                try:
+                    if cd.get(sym,0) > time.time():
+                        continue
 
-                snap = await fetch_snapshot(exchange, sym)
-                price = snap["price"]
-                metrics = snap["metrics"]
+                    snap = await fetch_snapshot(exchange, sym)
+                    price = snap["price"]
+                    metrics = snap["metrics"]
 
-                # Call AI with caching and rate-limit
-                parsed = await ai_score_with_cache(sym, price, metrics, prefs, ttl=60)
-                if not parsed:
-                    await asyncio.sleep(0.05)
-                    continue
+                    parsed = await ai_score_with_cache(sym, price, metrics, prefs, ttl=OPENAI_TTL_SECONDS)
+                    if not parsed:
+                        await asyncio.sleep(0.02)
+                        continue
 
-                score = int(parsed.get("score",0))
-                mode = parsed.get("mode","quick")
-                reason = parsed.get("reason","")
+                    score = int(parsed.get("score",0))
+                    mode = parsed.get("mode","quick")
+                    reason = parsed.get("reason","")
 
-                if score >= SCORE_THRESHOLD:
-                    tp, sl = calc_tp_sl(price, mode)
-                    msg = build_message(sym, price, score, mode, reason, tp, sl)
-                    resp = await send_telegram(msg)
-                    print("[SENT]", sym, score, mode, reason, "resp:", resp)
-                    # log to sqlite
-                    log_signal_db(now_ts(), sym, price, score, mode, reason, tp, sl)
-                    # set cooldown
-                    cd[sym] = time.time() + COOLDOWN_SECONDS
+                    if score >= SCORE_THRESHOLD:
+                        tp, sl = calc_tp_sl(price, mode)
+                        msg = build_message(sym, price, score, mode, reason, tp, sl)
+                        resp = await send_telegram(msg)
+                        print("[SENT]", sym, score, mode, reason, "resp:", resp)
+                        log_signal_db(now_ts(), sym, price, score, mode, reason, tp, sl)
+                        cd[sym] = time.time() + COOLDOWN_SECONDS
 
-                await asyncio.sleep(0.08)  # small pacing
+                    await asyncio.sleep(0.08)
+
+                except Exception as e:
+                    print("symbol loop error:", e)
+                    await asyncio.sleep(0.1)
 
             await asyncio.sleep(CYCLE_TIME)
     finally:
