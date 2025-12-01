@@ -229,26 +229,59 @@ async def ai_score_with_cache(symbol, price, metrics, prefs, ttl=OPENAI_TTL_SECO
 
     prompt = build_ai_prompt(symbol, price, metrics, prefs)
 
+    # Synchronous helper that uses the new Responses API
     def call_ai():
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role":"system","content":"You are an expert crypto futures signal scorer. Return strict JSON only."},
-                {"role":"user","content": prompt}
-            ],
-            temperature=0.0,
-            max_tokens=300
-        )
         try:
-            return resp.choices[0].message.content
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                input=prompt,
+                temperature=0.0,
+                max_tokens=300
+            )
+        except Exception as e:
+            # If the SDK raises, return empty string; outer code will handle None
+            print("OpenAI request exception:", e)
+            return ""
+
+        # Try common ways to extract text from response object (be robust)
+        try:
+            # newer SDK exposes output_text shortcut
+            if hasattr(resp, "output_text") and resp.output_text:
+                return resp.output_text
         except Exception:
-            try:
-                return resp.choices[0].text
-            except Exception:
-                return ""
+            pass
+
+        try:
+            # Another common shape: resp.output -> list[ { "content": [ { "type": "...", "text": "..." } ] } ]
+            pieces = []
+            out = getattr(resp, "output", None)
+            if out:
+                for item in out:
+                    content = item.get("content", []) if isinstance(item, dict) else []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text"):
+                            pieces.append(c.get("text"))
+                        elif isinstance(c, dict) and c.get("type") == "message" and isinstance(c.get("content"), list):
+                            # sometimes chat-like messages appear here
+                            for m in c.get("content", []):
+                                if m.get("type") == "output_text" and m.get("text"):
+                                    pieces.append(m.get("text"))
+            if pieces:
+                return "\n".join(pieces)
+        except Exception:
+            pass
+
+        try:
+            # fallback: try to stringify the whole response
+            return json.dumps(resp.to_dict())
+        except Exception:
+            return ""
 
     openai_note_call()
     raw = await asyncio.to_thread(call_ai)
+    if not raw:
+        return None
+
     parsed = parse_json_from_text(raw)
     if parsed:
         CACHE.set(cache_key, parsed, ttl_seconds=ttl)
