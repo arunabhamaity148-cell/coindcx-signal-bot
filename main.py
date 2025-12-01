@@ -236,7 +236,7 @@ async def ai_score_with_cache(symbol, price, metrics, prefs, ttl=OPENAI_TTL_SECO
                 model=OPENAI_MODEL,
                 input=prompt,
                 temperature=0.0,
-                max_tokens=300
+                max_output_tokens=300
             )
         except Exception as e:
             # If the SDK raises, return empty string; outer code will handle None
@@ -252,20 +252,34 @@ async def ai_score_with_cache(symbol, price, metrics, prefs, ttl=OPENAI_TTL_SECO
             pass
 
         try:
-            # Another common shape: resp.output -> list[ { "content": [ { "type": "...", "text": "..." } ] } ]
+            # Another common shape: resp.output -> list-like / dict structure
             pieces = []
             out = getattr(resp, "output", None)
             if out:
-                for item in out:
-                    content = item.get("content", []) if isinstance(item, dict) else []
-                    for c in content:
-                        if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text"):
-                            pieces.append(c.get("text"))
-                        elif isinstance(c, dict) and c.get("type") == "message" and isinstance(c.get("content"), list):
-                            # sometimes chat-like messages appear here
-                            for m in c.get("content", []):
-                                if m.get("type") == "output_text" and m.get("text"):
-                                    pieces.append(m.get("text"))
+                # out might be list or dict depending on SDK version/shape
+                if isinstance(out, list):
+                    iterable = out
+                elif isinstance(out, dict):
+                    iterable = [out]
+                else:
+                    iterable = list(out)
+
+                for item in iterable:
+                    if isinstance(item, dict):
+                        content = item.get("content", [])
+                        for c in content:
+                            if isinstance(c, dict):
+                                # content items can have type / text fields
+                                if c.get("type") == "output_text" and c.get("text"):
+                                    pieces.append(c.get("text"))
+                                elif c.get("type") == "message" and isinstance(c.get("content"), list):
+                                    for m in c.get("content", []):
+                                        if m.get("type") == "output_text" and m.get("text"):
+                                            pieces.append(m.get("text"))
+                            elif isinstance(c, str):
+                                pieces.append(c)
+                    elif isinstance(item, str):
+                        pieces.append(item)
             if pieces:
                 return "\n".join(pieces)
         except Exception:
@@ -273,10 +287,14 @@ async def ai_score_with_cache(symbol, price, metrics, prefs, ttl=OPENAI_TTL_SECO
 
         try:
             # fallback: try to stringify the whole response
-            return json.dumps(resp.to_dict())
+            if hasattr(resp, "to_dict"):
+                return json.dumps(resp.to_dict())
+            else:
+                return str(resp)
         except Exception:
             return ""
 
+    # record call for rate-tracking
     openai_note_call()
     raw = await asyncio.to_thread(call_ai)
     if not raw:
