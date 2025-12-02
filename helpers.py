@@ -1,524 +1,151 @@
-# helpers.py — FINAL (Integrated: 58-logic + OpenAI verifier + decision layer)
-import os
+# helpers.py — 30-Logic + Buy/Sell + BE-SL + Liq-Dist + Mode System
+
 import time
 import math
-import json
-import asyncio
-import aiohttp
-from datetime import datetime
 
-# ----------------------------
-# CONFIG (env overrides possible)
-# ----------------------------
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
-BTC_STABILITY_THRESHOLD = float(os.getenv("BTC_STABILITY_THRESHOLD", "1.2"))  # percent
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
-MAX_SCORE = 100
+# ================================
+# COOLDOWN (30 minutes)
+# ================================
+COOLDOWN = 1800
+last_signal = {}
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "10"))
+def cooldown_ok(symbol):
+    t = last_signal.get(symbol, 0)
+    return (time.time() - t) > COOLDOWN
 
-# ----------------------------
-# MODE & RULES
-# ----------------------------
-MODES = ["quick", "mid", "trend"]
+def update_cd(symbol):
+    last_signal[symbol] = time.time()
 
-MODE_THRESHOLDS = {
+
+# ================================
+# MODE THRESHOLDS
+# ================================
+MODE_THRESH = {
     "quick": 55,
     "mid": 62,
-    "trend": 70,
+    "trend": 70
 }
 
-TP_RULES = {
-    "quick": (1.2, 1.6),
-    "mid": (1.8, 2.4),
-    "trend": (2.5, 3.5),
+TP_SL = {
+    "quick": (1.2, 0.7),     # TP%, SL%
+    "mid":   (1.8, 1.0),
+    "trend": (2.5, 1.2)
 }
 
-SL_RULES = {
-    "quick": (0.5, 0.8),
-    "mid": (0.9, 1.2),
-    "trend": (1.2, 1.8),
-}
-
-# cooldown store
-last_signal_time = {}
-
-def is_cooldown(symbol):
-    t = last_signal_time.get(symbol)
-    if not t:
-        return False
-    return (time.time() - t) < (COOLDOWN_MINUTES * 60)
-
-def update_cooldown(symbol):
-    last_signal_time[symbol] = time.time()
-
-# ----------------------------
-# BTC calm check — robust & fail-safe
-# ----------------------------
-async def btc_calm_check(session):
-    """
-    Returns True if BTC considered 'calm' (safe).
-    Fail-safe: API errors/timeouts/missing fields -> return True (do not block scanning).
-    If API returns percent, compare with BTC_STABILITY_THRESHOLD.
-    """
-    url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
-    try:
-        async with session.get(url, timeout=5) as r:
-            if r.status != 200:
-                # API error -> allow scanning (fail-safe)
-                return True
-            data = await r.json()
-            if not data or "priceChangePercent" not in data:
-                return True
-            try:
-                change = abs(float(data.get("priceChangePercent", 0.0)))
-            except:
-                return True
-            # return True if change < threshold
-            return change < BTC_STABILITY_THRESHOLD
-    except Exception:
-        # network/timeouts -> don't block scan
-        return True
-
-# ----------------------------
-# OpenAI verifier (built-in) — fail-open behavior
-# ----------------------------
-async def call_openai_decision(symbol, mode, price, score, live_summary):
-    """
-    Sends a small prompt to OpenAI to verify/adjust decision.
-    Expects JSON in response: {"approve": bool, "tp": num|null, "sl": num|null, "note": str}
-    Fail-open: if no key / error / parse fail -> return approve=True
-    """
-    if not OPENAI_KEY:
-        return {"approve": True, "tp": None, "sl": None, "note": "no_openai_key_fail_open"}
-
-    prompt = f"""
-You are a conservative crypto signal verifier. Respond ONLY with a single JSON object, nothing else.
-Input:
-symbol: {symbol}
-mode: {mode}
-price: {price}
-score: {score}
-live_summary: {json.dumps(live_summary)}
-Return JSON with keys:
-- approve (boolean)
-- tp (number|null)
-- sl (number|null)
-- note (string, short)
-Example:
-{{"approve": true, "tp": null, "sl": null, "note": "ok"}}
-"""
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a concise signal risk manager."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.0,
-        "max_tokens": 200,
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=body, timeout=OPENAI_TIMEOUT) as resp:
-                if resp.status != 200:
-                    return {"approve": True, "tp": None, "sl": None, "note": f"openai_status_{resp.status}"}
-                data = await resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                try:
-                    j = json.loads(content)
-                    return {
-                        "approve": bool(j.get("approve", False)),
-                        "tp": float(j["tp"]) if j.get("tp") not in (None, "", False) else None,
-                        "sl": float(j["sl"]) if j.get("sl") not in (None, "", False) else None,
-                        "note": str(j.get("note", ""))[:200]
-                    }
-                except Exception:
-                    return {"approve": True, "tp": None, "sl": None, "note": "openai_parse_fail"}
-    except Exception:
-        return {"approve": True, "tp": None, "sl": None, "note": "openai_error"}
-
-# ----------------------------
-# Basic helpers (EMA etc)
-# ----------------------------
-def ema(values, length):
-    if not values or len(values) < length:
-        return None
-    k = 2 / (length + 1)
-    ema_val = float(values[0])
-    for v in values[1:]:
-        ema_val = (float(v) * k) + (ema_val * (1 - k))
-    return ema_val
-
-# ----------------------------
-# 58 Logic functions (each returns int)
-# ----------------------------
-# For brevity each function is defensive; uses .get() from data dict
-def HTF_EMA_1h_15m(data):
-    try:
-        return 2 if data.get("ema_15m", 0) > data.get("ema_1h", 0) else 0
-    except:
-        return 0
-
-def HTF_EMA_1h_4h(data):
-    try:
-        return 2 if data.get("ema_1h", 0) > data.get("ema_4h", 0) else 0
-    except:
-        return 0
-
-def HTF_EMA_1h_8h(data):
-    try:
-        return 2 if data.get("ema_4h", 0) > data.get("ema_8h", 0) else 0
-    except:
-        return 0
-
-def HTF_Structure_Break(data):
-    return 3 if data.get("trend") == "bull_break" else 0
-
-def HTF_Structure_Reject(data):
-    return 3 if data.get("trend") == "reject" else 0
-
-def Imbalance_FVG(data):
-    return 2 if data.get("fvg") else 0
-
-def Trend_Continuation(data):
-    return 3 if data.get("trend_strength", 0) > 0.7 else 0
-
-def Trend_Exhaustion(data):
-    return 1 if data.get("exhaustion") else 0
-
-def Micro_Pullback(data):
-    return 2 if data.get("micro_pb") else 0
-
-def Wick_Strength(data):
-    try:
-        return 2 if float(data.get("wick_ratio", 0)) > 1.5 else 0
-    except:
-        return 0
-
-def Sweep_Reversal(data):
-    return 3 if data.get("liquidation_sweep") else 0
-
-def Vol_Sweep_1m(data):
-    try:
-        return 2 if float(data.get("vol_1m", 0)) > float(data.get("vol_5m", 0)) else 0
-    except:
-        return 0
-
-def Vol_Sweep_5m(data):
-    try:
-        return 2 if float(data.get("vol_5m", 0)) > float(data.get("vol_1m", 0)) else 0
-    except:
-        return 0
-
-def Delta_Divergence_1m(data):
-    return 2 if data.get("delta_1m") else 0
-
-def Delta_Divergence_HTF(data):
-    return 2 if data.get("delta_htf") else 0
-
-def Iceberg_1m(data):
-    return 3 if data.get("iceberg_1m") else 0
-
-def Iceberg_v2(data):
-    return 3 if data.get("iceberg_v2") else 0
-
-def Orderbook_Wall_Shift(data):
-    return 2 if data.get("wall_shift") else 0
-
-def Liquidity_Wall(data):
-    return 2 if data.get("liq_wall") else 0
-
-def Liquidity_Bend(data):
-    return 2 if data.get("liq_bend") else 0
-
-def ADR_DayRange(data):
-    return 1 if data.get("adr_ok") else 0
-
-def ATR_Expansion(data):
-    return 1 if data.get("atr_expanding") else 0
-
-def Phase_Shift(data):
-    return 2 if data.get("phase_shift") else 0
-
-def Price_Compression(data):
-    return 1 if data.get("compression") else 0
-
-def Speed_Imbalance(data):
-    return 2 if data.get("speed_imbalance") else 0
-
-def Taker_Pressure(data):
-    return 2 if data.get("taker_pressure") else 0
-
-def HTF_Volume_Imprint(data):
-    return 2 if data.get("vol_imprint") else 0
-
-def Tiny_Cluster_Imprint(data):
-    return 1 if data.get("cluster_tiny") else 0
-
-def Absorption(data):
-    return 2 if data.get("absorption") else 0
-
-def Recent_Weakness(data):
-    return 1 if data.get("weakness") else 0
-
-def Spread_Snap_0_5s(data):
-    return 2 if data.get("spread_snap_05") else 0
-
-def Spread_Snap_0_25s(data):
-    return 2 if data.get("spread_snap_025") else 0
-
-def Tight_Spread_Filter(data):
-    try:
-        return 1 if float(data.get("spread", 999)) < 0.03 else 0
-    except:
-        return 0
-
-def Spread_Safety(data):
-    try:
-        return 1 if float(data.get("spread", 999)) < 0.05 else 0
-    except:
-        return 0
-
-def BE_SL_AutoLock(data):
-    return 1 if data.get("be_lock") else 0
-
-def Liquidation_Distance(data):
-    try:
-        return 2 if float(data.get("liq_dist", 999)) < 0.5 else 0
-    except:
-        return 0
-
-def Kill_Zone_5m(data):
-    return 1 if data.get("kill_5m") else 0
-
-def Kill_Zone_HTF(data):
-    return 1 if data.get("kill_htf") else 0
-
-def Kill_Switch_Fast(data):
-    return -10 if data.get("kill_fast") else 0
-
-def Kill_Switch_Primary(data):
-    return -25 if data.get("kill_primary") else 0
-
-def News_Guard(data):
-    return -5 if data.get("news_risk") else 0
-
-def Recheck_30s(data):
-    return 1 if data.get("recheck_ok") else 0
-
-def Partial_Exit_Logic(data):
-    return 1
-
-def BTC_Risk_Filter_L1(data):
-    return -8 if not data.get("btc_calm", True) else 2
-
-def BTC_Risk_Filter_L2(data):
-    return -15 if data.get("btc_trending_fast") else 2
-
-def BTC_Funding_OI_Combo(data):
-    return 2 if data.get("funding_oi_combo") else 0
-
-def Funding_Extreme(data):
-    return -2 if data.get("funding_extreme") else 0
-
-def Funding_Delta_Speed(data):
-    return 1 if data.get("funding_delta") else 0
-
-def Funding_Arbitrage(data):
-    return 2 if data.get("arb_opportunity") else 0
-
-def OI_Spike_5pct(data):
-    return 2 if data.get("oi_spike") else 0
-
-def OI_Spike_Sustained(data):
-    return 2 if data.get("oi_sustained") else 0
-
-def ETH_BTC_Beta_Divergence(data):
-    return 1 if data.get("beta_div") else 0
-
-def Options_Gamma_Flip(data):
-    return 3 if data.get("gamma_flip") else 0
-
-def Heatmap_Sweep(data):
-    return 2 if data.get("heat_sweep") else 0
-
-def Micro_Slip(data):
-    return -1 if data.get("slippage") else 0
-
-def Order_Block(data):
-    return 2 if data.get("orderblock") else 0
-
-def Score_Normalization(score):
-    if score < 0:
-        return 0
-    return max(0, min(int(score), MAX_SCORE))
-
-def Final_Signal_Score(data):
-    total = sum([
-        HTF_EMA_1h_15m(data),
-        HTF_EMA_1h_4h(data),
-        HTF_EMA_1h_8h(data),
-        HTF_Structure_Break(data),
-        HTF_Structure_Reject(data),
-        Imbalance_FVG(data),
-        Trend_Continuation(data),
-        Trend_Exhaustion(data),
-        Micro_Pullback(data),
-        Wick_Strength(data),
-        Sweep_Reversal(data),
-        Vol_Sweep_1m(data),
-        Vol_Sweep_5m(data),
-        Delta_Divergence_1m(data),
-        Delta_Divergence_HTF(data),
-        Iceberg_1m(data),
-        Iceberg_v2(data),
-        Orderbook_Wall_Shift(data),
-        Liquidity_Wall(data),
-        Liquidity_Bend(data),
-        ADR_DayRange(data),
-        ATR_Expansion(data),
-        Phase_Shift(data),
-        Price_Compression(data),
-        Speed_Imbalance(data),
-        Taker_Pressure(data),
-        HTF_Volume_Imprint(data),
-        Tiny_Cluster_Imprint(data),
-        Absorption(data),
-        Recent_Weakness(data),
-        Spread_Snap_0_5s(data),
-        Spread_Snap_0_25s(data),
-        Tight_Spread_Filter(data),
-        Spread_Safety(data),
-        BE_SL_AutoLock(data),
-        Liquidation_Distance(data),
-        Kill_Zone_5m(data),
-        Kill_Zone_HTF(data),
-        Kill_Switch_Fast(data),
-        Kill_Switch_Primary(data),
-        News_Guard(data),
-        Recheck_30s(data),
-        Partial_Exit_Logic(data),
-        BTC_Risk_Filter_L1(data),
-        BTC_Risk_Filter_L2(data),
-        BTC_Funding_OI_Combo(data),
-        Funding_Extreme(data),
-        Funding_Delta_Speed(data),
-        Funding_Arbitrage(data),
-        OI_Spike_5pct(data),
-        OI_Spike_Sustained(data),
-        ETH_BTC_Beta_Divergence(data),
-        Options_Gamma_Flip(data),
-        Heatmap_Sweep(data),
-        Micro_Slip(data),
-        Order_Block(data),
+# ================================
+# 30 LOGIC (18 + 12)
+# ================================
+
+# ---- HTF Trend ----
+def HTF_EMA_1h_15m(d):  return 2 if d['ema_15m'] > d['ema_1h'] else 0
+def HTF_EMA_1h_4h(d):   return 2 if d['ema_1h'] > d['ema_4h'] else 0
+def HTF_EMA_1h_8h(d):   return 2 if d['ema_4h'] > d['ema_8h'] else 0
+
+def HTF_Structure_Break(d):   return 3 if d['trend'] == "bull_break" else 0
+def HTF_Structure_Reject(d):  return 3 if d['trend'] == "reject" else 0
+def Trend_Continuation(d):    return 3 if d['trend_strength'] > 0.7 else 0
+
+# ---- PA / Volume ----
+def Micro_Pullback(d):        return 2 if d['micro_pb'] else 0
+def Trend_Exhaustion(d):      return 1 if d['exhaustion'] else 0
+def Imbalance_FVG(d):         return 2 if d['fvg'] else 0
+def Order_Block(d):           return 2 if d['orderblock'] else 0
+
+def Vol_Sweep_1m(d):          return 2 if d['vol_1m'] > d['vol_5m'] else 0
+def Vol_Sweep_5m(d):          return 2 if d['vol_5m'] > d['vol_1m'] else 0
+
+def ADR_DayRange(d):          return 1 if d['adr_ok'] else 0
+def ATR_Expansion(d):         return 1 if d['atr_expanding'] else 0
+
+# ---- Spread/Risk ----
+def Tight_Spread_Filter(d):   return 1 if d['spread'] < 0.03 else 0
+def Spread_Safety(d):         return 1 if d['spread'] < 0.05 else 0
+def BTC_Risk_Filter_L1(d):    return -8 if not d['btc_calm'] else 2
+def Kill_Switch_Primary(d):   return -25 if d['kill_primary'] else 0
+
+# ---- PRO 12 (Orderflow) ----
+def Wick_Strength(d):         return 2 if d['wick_ratio'] > 1.5 else 0
+def Liquidity_Wall(d):        return 2 if d['liq_wall'] else 0
+def Liquidity_Bend(d):        return 2 if d['liq_bend'] else 0
+def Orderbook_Wall_Shift(d):  return 2 if d['wall_shift'] else 0
+def Speed_Imbalance(d):       return 2 if d['speed_imbalance'] else 0
+def Absorption(d):            return 2 if d['absorption'] else 0
+
+def Sweep_Reversal(d):        return 2 if d['liquidation_sweep'] else 0
+def Micro_Slip(d):            return -1 if d['slippage'] else 0
+def Liquidation_Distance(d):  return 2 if d['liq_dist'] < 0.5 else 0
+
+def Spread_Snap_025(d):       return 1 if d['spread'] < 0.0025 else 0
+def Spread_Snap_05(d):        return 1 if d['spread'] < 0.005 else 0
+def Taker_Pressure(d):        return 2 if d['taker_pressure'] else 0
+
+
+# ================================
+# FINAL SCORE
+# ================================
+def final_score(d):
+    score = sum([
+        HTF_EMA_1h_15m(d), HTF_EMA_1h_4h(d), HTF_EMA_1h_8h(d),
+        HTF_Structure_Break(d), HTF_Structure_Reject(d),
+        Trend_Continuation(d), Micro_Pullback(d), Trend_Exhaustion(d),
+        Imbalance_FVG(d), Order_Block(d),
+        Vol_Sweep_1m(d), Vol_Sweep_5m(d),
+        ADR_DayRange(d), ATR_Expansion(d),
+        Tight_Spread_Filter(d), Spread_Safety(d),
+        BTC_Risk_Filter_L1(d), Kill_Switch_Primary(d),
+        Wick_Strength(d), Liquidity_Wall(d), Liquidity_Bend(d),
+        Orderbook_Wall_Shift(d), Speed_Imbalance(d), Absorption(d),
+        Sweep_Reversal(d), Micro_Slip(d), Liquidation_Distance(d),
+        Spread_Snap_025(d), Spread_Snap_05(d), Taker_Pressure(d)
     ])
-    return Score_Normalization(total)
+    return max(0, min(score, 100))
 
-# ----------------------------
-# TP/SL calc & decision
-# ----------------------------
+
+# ================================
+# BUY / SELL DIRECTION
+# ================================
+def trade_side(price, prev, ema1h):
+    if price > prev and price > ema1h:
+        return "BUY"
+    elif price < prev and price < ema1h:
+        return "SELL"
+    return None
+
+
+# ================================
+# TP / SL PER MODE + BE-SL
+# ================================
 def calc_tp_sl(price, mode):
-    tp_min, _ = TP_RULES.get(mode, TP_RULES["mid"])
-    sl_min, _ = SL_RULES.get(mode, SL_RULES["mid"])
-    tp = price * (1 + tp_min/100)
-    sl = price * (1 - sl_min/100)
+    tp_pct, sl_pct = TP_SL[mode]
+    tp = price * (1 + tp_pct/100)
+    sl = price * (1 - sl_pct/100)
     return round(tp, 6), round(sl, 6)
 
-def decide_signal(symbol, mode, price, score):
-    if mode not in MODE_THRESHOLDS:
-        return None
-    if score < MODE_THRESHOLDS[mode]:
-        return None
-    if is_cooldown(symbol):
-        return None
-    tp, sl = calc_tp_sl(price, mode)
-    update_cooldown(symbol)
-    return {
-        "symbol": symbol,
-        "mode": mode,
-        "price": price,
-        "score": score,
-        "tp": tp,
-        "sl": sl,
-        "leverage": 50,
-        "cooldown_min": COOLDOWN_MINUTES
-    }
 
-def format_signal(sig):
+def apply_be_sl(entry_price):
+    return round(entry_price, 6)
+
+
+# ================================
+# PREMIUM TELEGRAM STYLE
+# ================================
+def format_signal(symbol, side, mode, price, score, tp, sl, liq):
     return f"""
-🔥 <b>{sig['mode'].upper()} SIGNAL</b>
+🔥 <b>{mode.upper()} {side} SIGNAL</b>
 
-<b>Pair:</b> {sig['symbol']}
-<b>Price:</b> {sig['price']}
-<b>Score:</b> {sig['score']} / {MAX_SCORE}
+<b>Pair:</b> {symbol}
+<b>Entry:</b> <code>{price}</code>
+<b>Score:</b> <b>{score}</b> / 100
 
-🎯 <b>TP:</b>
-<code>{sig['tp']}</code>
+🎯 <b>TP:</b> <code>{tp}</code>
+🛑 <b>SL:</b> <code>{sl}</code>
 
-🛑 <b>SL:</b>
-<code>{sig['sl']}</code>
+🟩 <b>BE-SL:</b> Enabled  
+📉 <b>LiQ Distance:</b> {liq}
 
-⚡ Leverage: {sig.get('leverage', 50)}x
-⏱️ Cooldown: {sig.get('cooldown_min', COOLDOWN_MINUTES)} minutes
-📊 Mode: {sig['mode'].upper()}
+⚡ Leverage: 50x  
+⏱ Cooldown: 30m  
+📊 Mode: <b>{mode}</b>
 
-#HybridAI #ArunSystem
+#ArunSystem #HybridAI
 """
-
-# ----------------------------
-# Async processing pipeline (local -> openai verifier)
-# ----------------------------
-async def process_data_with_ai(symbol, mode, live_data):
-    """
-    1. Compute local score
-    2. Local decision (thresholds + cooldown)
-    3. Call OpenAI verifier (fail-open)
-    4. Return final decision dict or None
-    """
-    if "btc_calm" not in live_data:
-        # ensure key exists for logic functions
-        live_data["btc_calm"] = True
-
-    score = Final_Signal_Score(live_data)
-    local_decision = decide_signal(symbol, mode, live_data.get("price", 0.0), score)
-    if not local_decision:
-        return None
-
-    # Compact summary for OpenAI
-    live_summary = {
-        "trend": live_data.get("trend"),
-        "vol_1m": live_data.get("vol_1m"),
-        "vol_5m": live_data.get("vol_5m"),
-        "oi_spike": live_data.get("oi_spike"),
-        "funding_extreme": live_data.get("funding_extreme"),
-        "btc_calm": live_data.get("btc_calm", True),
-        "score": score
-    }
-
-    # Call OpenAI verifier
-    ai_resp = await call_openai_decision(symbol, mode, local_decision["price"], score, live_summary)
-
-    # If OpenAI explicitly blocks, do not send
-    if not ai_resp.get("approve", True):
-        return None
-
-    # override TP/SL if provided by OpenAI
-    if ai_resp.get("tp") is not None:
-        local_decision["tp"] = round(float(ai_resp["tp"]), 6)
-    if ai_resp.get("sl") is not None:
-        local_decision["sl"] = round(float(ai_resp["sl"]), 6)
-
-    local_decision["ai_note"] = ai_resp.get("note", "")
-    return local_decision
-
-# Legacy sync wrapper (if needed)
-def process_data(symbol, mode, live_data):
-    return asyncio.get_event_loop().run_until_complete(process_data_with_ai(symbol, mode, live_data))
