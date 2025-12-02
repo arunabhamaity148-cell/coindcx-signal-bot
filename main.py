@@ -6,6 +6,8 @@ from aiohttp import web
 import aiohttp
 import pytz
 import ccxt.async_support as ccxt
+import logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
 
 load_dotenv()
 
