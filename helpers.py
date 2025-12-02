@@ -1,4 +1,4 @@
-# helpers.py — REAL BINANCE + AI DECISION ENGINE (FINAL, safe trades parser)
+# helpers.py — REAL BINANCE + AI DECISION ENGINE (FIXED ema signature + safe parsers)
 import aiohttp
 import asyncio
 import os
@@ -11,7 +11,7 @@ import json
 # ENV / CONFIG
 # -------------------------
 BIN_KEY = os.getenv("BINANCE_API_KEY")
-BIN_SECRET = os.getenv("BINANCE_SECRET_KEY", "").encode()
+BIN_SECRET = os.getenv("BINANCE_SECRET_KEY", "").encode() if os.getenv("BINANCE_SECRET_KEY") else b""
 FUTURES = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -46,7 +46,6 @@ def cache_get(key, ttl=5):
         return None
     t = _cache_time.get(key, 0)
     if time.time() - t > ttl:
-        # expired
         _cache.pop(key, None)
         _cache_time.pop(key, None)
         return None
@@ -135,18 +134,18 @@ async def safe_last_trade(session: aiohttp.ClientSession, symbol: str):
         if not ts or not isinstance(ts, list) or len(ts) == 0:
             return {"price": None, "qty": None}
 
-        # try different possible structures: Binance aggTrades returns list of objects
         last = ts[-1]
-        # common fields: p (price), q (qty) - but be defensive
-        p = last.get("p") if isinstance(last, dict) else None
-        q = last.get("q") if isinstance(last, dict) else None
+        p = None
+        q = None
 
-        # fallback: if elements are lists/tuples
-        if p is None and q is None:
+        if isinstance(last, dict):
+            p = last.get("p") or last.get("price") or last.get("P")
+            q = last.get("q") or last.get("quantity") or last.get("Q")
+        else:
+            # fallback if list-like
             try:
-                # sometimes aggTrades returned as list-of-lists in some wrappers
-                p = float(last[4])
-                q = float(last[5])
+                p = last[4]
+                q = last[5]
             except Exception:
                 p = None
                 q = None
@@ -168,22 +167,44 @@ async def safe_last_trade(session: aiohttp.ClientSession, symbol: str):
         return {"price": None, "qty": None}
 
 # -------------------------
-# EMA
+# EMA (fixed signature: length optional)
 # -------------------------
-def ema(values, length):
-    if not values:
+def ema(values, length=None):
+    """
+    Robust EMA:
+    - values: iterable of numbers (will convert to list)
+    - length: optional int. if None -> use len(values)
+    Returns float (0.0 on empty)
+    """
+    if values is None:
         return 0.0
+    vals = list(values)
+    if not vals:
+        return 0.0
+
+    if length is None:
+        length = len(vals)
+    try:
+        length = int(length)
+        if length <= 0:
+            length = len(vals)
+    except Exception:
+        length = len(vals)
+
+    # if not enough values, use what we have
+    if len(vals) < 1:
+        return float(vals[-1]) if vals else 0.0
+    # initialize with first value
     k = 2.0 / (length + 1.0)
-    e = float(values[0])
-    for v in values[1:]:
+    e = float(vals[0])
+    for v in vals[1:]:
         e = e * (1 - k) + float(v) * k
-    return e
+    return float(e)
 
 # -------------------------
 # HTF FETCHER (15m / 1h / 4h)
 # -------------------------
 async def get_htf(session: aiohttp.ClientSession, symbol: str):
-    # caching small result per symbol to reduce load
     cache_key = f"htf:{symbol}"
     cached = cache_get(cache_key, ttl=6)
     if cached:
@@ -205,13 +226,12 @@ async def get_htf(session: aiohttp.ClientSession, symbol: str):
     except Exception:
         return None
 
-    # compute EMAs safely
-    ema_15 = ema(c15[-15:]) if len(c15) >= 1 else c15[-1]
-    ema_50 = ema(c15[-50:]) if len(c15) >= 50 else ema_15
-    ema_200 = ema(c15[-200:]) if len(c15) >= 200 else ema_50
+    ema_15 = ema(c15[-15:], 15)
+    ema_50 = ema(c15[-50:], 50) if len(c15) >= 50 else ema_15
+    ema_200 = ema(c15[-200:], 200) if len(c15) >= 200 else ema_50
 
-    ema_1h_50 = ema(c1h[-50:]) if len(c1h) >= 50 else c1h[-1]
-    ema_4h_50 = ema(c4h[-50:]) if len(c4h) >= 50 else c4h[-1]
+    ema_1h_50 = ema(c1h[-50:], 50) if len(c1h) >= 50 else c1h[-1]
+    ema_4h_50 = ema(c4h[-50:], 50) if len(c4h) >= 50 else c4h[-1]
 
     out = {
         "close_15": c15[-1],
@@ -328,17 +348,14 @@ async def final_process(session: aiohttp.ClientSession, symbol: str, mode: str):
     Build HTF, get direction, score, compute TP/SL, verify with AI (fail-open).
     Returns signal dict or None.
     """
-    # get HTF
     htf = await get_htf(session, symbol)
     if not htf:
         return None
 
-    # direction
     direction = get_direction(htf)
     if not direction:
         return None
 
-    # score
     score = score_v3(htf, mode)
     if score < MODE_THRESH.get(mode, 60):
         return None
@@ -349,25 +366,22 @@ async def final_process(session: aiohttp.ClientSession, symbol: str, mode: str):
     sl = price * (1 - sl_pct/100.0)
 
     signal = {
-        "symbol": symbol,
-        "direction": direction,
-        "mode": mode,
-        "price": round(price, 6),
-        "tp": round(tp, 6),
-        "sl": round(sl, 6),
-        "score": int(score),
+        "symbol":symbol,
+        "direction":direction,
+        "mode":mode,
+        "price":round(price, 6),
+        "tp":round(tp, 6),
+        "sl":round(sl, 6),
+        "score":int(score),
     }
 
-    # optionally include last trade info (safe)
     last_trade = await safe_last_trade(session, symbol)
     if last_trade.get("price") is not None:
         signal["last_trade_price"] = last_trade["price"]
         signal["last_trade_qty"] = last_trade["qty"]
 
-    # AI verification (fail-open)
     ai = await ai_verify(signal)
     if not ai.get("approve", True):
-        # assistant rejected
         return None
 
     if ai.get("tp") is not None:
