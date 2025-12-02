@@ -1,4 +1,4 @@
-# main.py — FINAL (Ultra-fast health, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
+# main.py — FINAL (200 OK guaranteed, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -160,8 +160,9 @@ def build_message_plain(sym, price, score, mode, reason, tp, sl):
         f"{human_time()}  Cooldown: {COOLDOWN_SECONDS//60}m"
     )
 
-# ------------------------- Health (SYNC + 0.0.0.0) -------------------------
+# ------------------------- Health (SYNC + 0.0.0.0 + instant log) -------------------------
 def health_handler(request):
+    logging.info("Health OK — 200 returned")
     return web.Response(text="ok")
 
 async def start_health_app():
