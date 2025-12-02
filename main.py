@@ -1,20 +1,17 @@
-# main.py — FINAL PRODUCTION VERSION
+# main.py — FINAL PATCHED CLEAN VERSION
 import asyncio
 import aiohttp
 import time
-import json
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
 
-from openai import OpenAI
-from helpers import process_data, btc_calm_check
+from helpers import process_data, btc_calm_check, format_signal
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 50+ coin list (Arun Preferred)
 WATCHLIST = [
     "BTCUSDT","ETHUSDT","SOLUSDT","AVAXUSDT","BNBUSDT","ADAUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
     "DOTUSDT","LTCUSDT","LINKUSDT","MATICUSDT","OPUSDT","ARBUSDT","FILUSDT","AAVEUSDT","SANDUSDT",
@@ -25,37 +22,33 @@ WATCHLIST = [
 
 MODES = ["quick", "mid", "trend"]
 
-# --------------------------------------------------------
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
+
+# -----------------------------------------
 # Telegram Sender
-# --------------------------------------------------------
+# -----------------------------------------
 async def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
     async with aiohttp.ClientSession() as session:
         try:
             await session.post(url, json=payload, timeout=5)
         except:
             pass
 
-# --------------------------------------------------------
-# Binance Data Fetcher
-# --------------------------------------------------------
+# -----------------------------------------
+# Binance Data
+# -----------------------------------------
 async def get_live_data(session, symbol):
-    # Price
     try:
         async with session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5) as r:
-            p = await r.json()
-            price = float(p["price"])
+            d = await r.json()
+            price = float(d["price"])
     except:
         return None
 
-    # Dummy structure for now (to integrate with 58 logic)
-    # Later upgrade: fetch ob/oi/funding/heatmap etc.
-    live = {
+    # Dummy data required for 58 logic system
+    return {
         "price": price,
         "ema_15m": price,
         "ema_1h": price,
@@ -113,21 +106,21 @@ async def get_live_data(session, symbol):
         "orderblock": True
     }
 
-    return live
-
-# --------------------------------------------------------
+# -----------------------------------------
 # MAIN LOOP
-# --------------------------------------------------------
+# -----------------------------------------
 async def scanner():
     print("🚀 Hybrid AI Scanner Started...")
 
     async with aiohttp.ClientSession() as session:
         while True:
-            # BTC Calm Check
+
+            # BTC Calm check
             btc_ok = await btc_calm_check(session)
+
             if not btc_ok:
-                print("⛔ BTC not calm — skipping round")
-                await asyncio.sleep(30)
+                print("⚠️ BTC not calm → AI risk filter blocking signals")
+                await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
             for symbol in WATCHLIST:
@@ -138,16 +131,13 @@ async def scanner():
                 for mode in MODES:
                     decision = process_data(symbol, mode, live)
                     if decision:
-                        from helpers import format_signal
                         msg = format_signal(decision)
                         await send_telegram(msg)
-                        print("📤 SIGNAL SENT:", symbol, mode)
+                        print(f"📤 SIGNAL SENT → {symbol} | {mode}")
 
-            await asyncio.sleep(30)
+            await asyncio.sleep(SCAN_INTERVAL)
 
-# --------------------------------------------------------
-# ENTRY POINT
-# --------------------------------------------------------
+# -----------------------------------------
 if __name__ == "__main__":
     try:
         asyncio.run(scanner())
