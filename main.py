@@ -1,11 +1,10 @@
 # ============================
-# main.py — FINAL RAILWAY-READY
+# main.py — FINAL RAILWAY-READY (no thread, no crash)
 # ============================
 
-import os, time, json, asyncio, random, hashlib, sqlite3, logging, threading
+import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from dotenv import load_dotenv
-import aiohttp
-from aiohttp import web          # <-- NEW (lightweight health server)
+from aiohttp import web          # lightweight health server
 
 load_dotenv()
 
@@ -20,18 +19,16 @@ from helpers import (
 # -------------------------
 # ENV
 # -------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
-CHAT_ID   = os.getenv("CHAT_ID","").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY","").strip()
-OPENAI_MODEL = "gpt-4o-mini"
-
-CYCLE_TIME = 20
-SCORE_THRESHOLD = 78
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID          = os.getenv("CHAT_ID", "").strip()
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL     = "gpt-4o-mini"
+CYCLE_TIME       = 20
+SCORE_THRESHOLD  = 78
 COOLDOWN_SECONDS = 1800
-
-USE_TESTNET = True
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY","").strip()
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET","").strip()
+USE_TESTNET      = True
+BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
 SYMBOLS = [
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
@@ -65,22 +62,19 @@ conn.commit()
 
 def log_signal(ts, sym, price, score, mode, reason, tp, sl):
     cur.execute("INSERT INTO signals (ts,symbol,price,score,mode,reason,tp,sl) VALUES (?,?,?,?,?,?,?,?)",
-                (ts,sym,price,score,mode,reason,tp,sl))
+                (ts, sym, price, score, mode, reason, tp, sl))
     conn.commit()
 
 # -------------------------
-# Binance Exchange
+# Exchange
 # -------------------------
 async def create_exchange():
-    opts = {
-        "enableRateLimit": True,
-        "options":{"defaultType":"future"}
-    }
+    opts = {"enableRateLimit": True, "options": {"defaultType": "future"}}
     if USE_TESTNET:
         opts["urls"] = {
-            "api":{
-                "public":"https://testnet.binancefuture.com/fapi/v1",
-                "private":"https://testnet.binancefuture.com/fapi/v1"
+            "api": {
+                "public": "https://testnet.binancefuture.com/fapi/v1",
+                "private": "https://testnet.binancefuture.com/fapi/v1"
             }
         }
     ex = ccxt.binance(opts)
@@ -89,44 +83,38 @@ async def create_exchange():
     return ex
 
 # -------------------------
-# SNAPSHOT (FIXED VERSION)
+# Snapshot
 # -------------------------
 async def fetch_snapshot(exchange, symbol):
-    key = CACHE.make_key("snap",symbol)
-    c = CACHE.get(key)
-    if c: return c
+    key = CACHE.make_key("snap", symbol)
+    if (c := CACHE.get(key)) is not None:
+        return c
 
-    price = 0
-    base_vol = 0
-
+    price, base_vol = 0, 0
     try:
         tk = await exchange.fetch_ticker(symbol)
-        if tk:
-            price = float(tk.get("last") or tk.get("close") or 0)
-            base_vol = float(tk.get("baseVolume") or 0)
+        price  = float(tk.get("last") or tk.get("close") or 0)
+        base_vol = float(tk.get("baseVolume") or 0)
     except:
-        price = random.uniform(1,1000)
-
+        price = random.uniform(1, 1000)
     if price == 0:
-        price = random.uniform(1,500)
+        price = random.uniform(1, 500)
 
     spread_pct = 0.0
     try:
-        ob = await exchange.fetch_order_book(symbol,5)
+        ob = await exchange.fetch_order_book(symbol, 5)
         if ob["bids"] and ob["asks"]:
-            bid = ob["bids"][0][0]
-            ask = ob["asks"][0][0]
-            mid = (bid+ask)/2
-            spread_pct = abs(ask-bid)/mid * 100
+            bid, ask = ob["bids"][0][0], ob["asks"][0][0]
+            spread_pct = abs(ask - bid) / ((bid + ask) / 2) * 100
     except:
         pass
 
     closes_1m = closes_15m = closes_1h = []
-    try: closes_1m = [r[4] for r in await exchange.fetch_ohlcv(symbol,"1m",limit=100)]
+    try: closes_1m   = [r[4] for r in await exchange.fetch_ohlcv(symbol, "1m",   limit=100)]
     except: pass
-    try: closes_15m = [r[4] for r in await exchange.fetch_ohlcv(symbol,"15m",limit=100)]
+    try: closes_15m  = [r[4] for r in await exchange.fetch_ohlcv(symbol, "15m",  limit=100)]
     except: pass
-    try: closes_1h = [r[4] for r in await exchange.fetch_ohlcv(symbol,"1h",limit=100)]
+    try: closes_1h   = [r[4] for r in await exchange.fetch_ohlcv(symbol, "1h",   limit=100)]
     except: pass
 
     metrics = {
@@ -134,30 +122,23 @@ async def fetch_snapshot(exchange, symbol):
         "closes_15m": closes_15m,
         "closes_1h": closes_1h,
         "rsi_1m": rsi_from_closes(closes_1m) if closes_1m else 50,
-        "ema_1h_50": compute_ema_from_closes(closes_1h,50),
-        "ema_15m_50": compute_ema_from_closes(closes_15m,50),
-        "spread_pct": round(spread_pct,3),
+        "ema_1h_50": compute_ema_from_closes(closes_1h, 50),
+        "ema_15m_50": compute_ema_from_closes(closes_15m, 50),
+        "spread_pct": round(spread_pct, 3),
         "vol_1m": base_vol
     }
-
-    data = {"price":price,"metrics":metrics}
+    data = {"price": price, "metrics": metrics}
     CACHE.set(key, data, 3)
     return data
 
 # -------------------------
-# AI SCORE
+# AI Score
 # -------------------------
 async def ai_score(symbol, price, metrics, prefs):
     prompt = build_ai_prompt(symbol, price, metrics, prefs)
-
     try:
-        r = client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-            temperature=0
-        )
-        text = r.output_text
-        return json.loads(text)
+        r = client.responses.create(model=OPENAI_MODEL, input=prompt, temperature=0)
+        return json.loads(r.output_text)
     except:
         return None
 
@@ -165,15 +146,16 @@ async def ai_score(symbol, price, metrics, prefs):
 # Telegram
 # -------------------------
 async def send_telegram(msg):
-    if not BOT_TOKEN or not CHAT_ID: return
+    if not BOT_TOKEN or not CHAT_ID:
+        return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     async with aiohttp.ClientSession() as s:
-        await s.post(url,data={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"})
+        await s.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
 
 # -------------------------
-# Signal MSG
+# Signal Message
 # -------------------------
-def build_msg(sym,price,score,mode,reason,tp,sl):
+def build_msg(sym, price, score, mode, reason, tp, sl):
     return (
         f"🔥 <b>{mode.upper()} SIGNAL</b>\n"
         f"{sym} • Price {price}\n"
@@ -183,53 +165,39 @@ def build_msg(sym,price,score,mode,reason,tp,sl):
     )
 
 # -------------------------
-# WORKER (with crash-logs)
+# Worker
 # -------------------------
 async def worker():
     ex = await create_exchange()
     cd = {}
-    prefs = { "BTC_CALM_REQUIRED": True }
-
+    prefs = {"BTC_CALM_REQUIRED": True}
     BATCH = 8
     idx = 0
-
     print(f"Bot Started • symbols={len(SYMBOLS)} • batch={BATCH}")
 
     try:
         while True:
-            batch = SYMBOLS[idx:idx+BATCH]
-            if not batch:
-                idx = 0
-                batch = SYMBOLS[0:BATCH]
-
+            batch = SYMBOLS[idx:idx+BATCH] if idx+BATCH <= len(SYMBOLS) else SYMBOLS[idx:] + SYMBOLS[:idx+BATCH-len(SYMBOLS)]
             for sym in batch:
-                if cd.get(sym,0) > time.time(): 
+                if cd.get(sym, 0) > time.time():
                     continue
-
-                snap = await fetch_snapshot(ex, sym)
+                snap  = await fetch_snapshot(ex, sym)
                 price = snap["price"]
-                metrics = snap["metrics"]
-
-                parsed = await ai_score(sym, price, metrics, prefs)
-                if not parsed: 
+                parsed = await ai_score(sym, price, snap["metrics"], prefs)
+                if not parsed:
                     continue
-
-                score = int(parsed.get("score",0))
-                mode = parsed.get("mode","quick")
-                reason = parsed.get("reason","")
-
+                score  = int(parsed.get("score", 0))
+                mode   = parsed.get("mode", "quick")
+                reason = parsed.get("reason", "")
                 if score >= SCORE_THRESHOLD:
-                    tp, sl = calc_tp_sl(price,mode)
-                    msg = build_msg(sym,price,score,mode,reason,tp,sl)
+                    tp, sl = calc_tp_sl(price, mode)
+                    msg = build_msg(sym, price, score, mode, reason, tp, sl)
                     await send_telegram(msg)
-                    log_signal(now_ts(),sym,price,score,mode,reason,tp,sl)
+                    log_signal(now_ts(), sym, price, score, mode, reason, tp, sl)
                     cd[sym] = time.time() + COOLDOWN_SECONDS
-
                 await asyncio.sleep(0.07)
-
-            idx += BATCH
+            idx = (idx + BATCH) % len(SYMBOLS)
             await asyncio.sleep(CYCLE_TIME)
-
     except Exception as e:
         logging.exception("WORKER CRASHED")
         raise
@@ -238,22 +206,27 @@ async def worker():
         except: pass
 
 # -------------------------------------------------
-# HEALTH SERVER (keeps Railway from killing us)
+# Health Server (same loop, no thread)
 # -------------------------------------------------
-async def health(request):
+async def health_handler(_):
     return web.Response(text="ok")
 
-def run_web():
+async def start_health_app():
     app = web.Application()
-    app.router.add_get("/", health)
-    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 7500)))
-
-# Start health server in a daemon thread
-threading.Thread(target=run_web, daemon=True).start()
+    app.router.add_get("/", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 7500)))
+    await site.start()
+    logging.info("Health server running on port %s", os.getenv("PORT", 7500))
 
 # -------------------------------------------------
-# MAIN ENTRY
+# Main Entry
 # -------------------------------------------------
-if __name__ == "__main__":
+async def main():
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(worker())
+    await start_health_app()   # start health endpoint
+    await worker()             # your bot loop
+
+if __name__ == "__main__":
+    asyncio.run(main())
