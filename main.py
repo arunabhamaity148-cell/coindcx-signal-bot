@@ -1,10 +1,11 @@
-# main.py — FINAL (Ensemble 3-vote, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
+# main.py — TOP (already present check)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
 import aiohttp
 import pytz
+import ccxt.async_support as ccxt  
 
 load_dotenv()
 
