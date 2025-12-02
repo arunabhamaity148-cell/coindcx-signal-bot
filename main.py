@@ -1,4 +1,4 @@
-# main.py — FINAL (SKIP logs, IST 00-07 OFF, 45 coins, 4/30s, 70 score)
+# main.py — FINAL (Ensemble 3-vote, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -8,11 +8,8 @@ import pytz
 
 load_dotenv()
 
-from openai import OpenAI
-import ccxt.async_support as ccxt
-
 from helpers import (
-    now_ts, human_time, esc, calc_tp_sl, build_ai_prompt, CACHE,
+    now_ts, human_time, esc, calc_tp_sl, ensemble_score, CACHE,
     compute_ema_from_closes, atr, rsi_from_closes
 )
 
@@ -21,13 +18,13 @@ BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID          = os.getenv("CHAT_ID", "").strip()
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-CYCLE_TIME       = int(os.getenv("CYCLE_TIME", "30"))
+CYCLE_TIME       = int(os.getenv("CYCLE_TIME", "60"))
 SCORE_THRESHOLD  = int(os.getenv("SCORE_THRESHOLD", "70"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))
 USE_TESTNET      = os.getenv("USE_TESTNET", "true").lower() in ("1", "true", "yes")
 BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "4"))
+BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "3"))
 
 SYMBOLS = [
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
@@ -36,8 +33,6 @@ SYMBOLS = [
     "GALAUSDT","CHZUSDT","RNDRUSDT","SANDUSDT","MANAUSDT","1INCHUSDT","COMPUSDT","TOMOUSDT","VETUSDT","BLURUSDT",
     "STRKUSDT","ZRXUSDT","APTUSDT","NEARUSDT","ICPUSDT"
 ]
-
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------- SQLite -------------------------
 DB_PATH = os.getenv("SIGNAL_DB", "signals.db")
@@ -141,34 +136,6 @@ async def fetch_snapshot(exchange, symbol):
     CACHE.set(key, out, ttl_seconds=3)
     return out
 
-# ------------------------- AI Score -------------------------
-def _call_openai_sync(prompt: str):
-    try:
-        resp = client.responses.create(model=OPENAI_MODEL, input=prompt, temperature=0, max_output_tokens=300)
-        if hasattr(resp, "output_text") and resp.output_text:
-            return resp.output_text.strip()
-        return str(resp)
-    except Exception as e:
-        return ""
-
-async def ai_score_symbol_with_cache(symbol: str, price: float, metrics: dict, prefs: dict, ttl: int = 60):
-    fingerprint = f"{symbol}|{round(price,6)}|{round(metrics.get('rsi_1m',50),2)}|{round(metrics.get('spread_pct',0),4)}"
-    key = CACHE.make_key("ai", fingerprint)
-    cached = CACHE.get(key)
-    if cached:
-        return cached
-
-    prompt = build_ai_prompt(symbol, price, metrics, prefs)
-    try:
-        raw = await asyncio.to_thread(_call_openai_sync, prompt)
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict) and {"score","mode","reason"} <= set(parsed.keys()):
-            CACHE.set(key, parsed, ttl_seconds=ttl)
-            return parsed
-    except Exception:
-        pass
-    return None
-
 # ------------------------- Telegram -------------------------
 async def send_telegram(msg: str):
     if not BOT_TOKEN or not CHAT_ID:
@@ -202,7 +169,7 @@ async def worker():
     prefs = {"BTC_CALM_REQUIRED": True}
     idx = 0
     IST = pytz.timezone("Asia/Kolkata")
-    logging.info("Bot started • IST 00-07 OFF • 45 coins • 4/30s • 70 score")
+    logging.info("Bot started • IST 00-07 OFF • 45 coins • 3/60s • 70 score • Ensemble 3-vote")
 
     try:
         while True:
@@ -220,9 +187,9 @@ async def worker():
                 snap = await fetch_snapshot(exchange, sym)
                 price = snap["price"]
                 metrics = snap["metrics"]
-                parsed = await ai_score_symbol_with_cache(sym, price, metrics, prefs, ttl=60)
+                parsed = await ensemble_score(sym, price, metrics, prefs, n=3)
                 if not parsed:
-                    logging.info("SKIP %s — AI returned None", sym)
+                    logging.info("SKIP %s — ensemble failed", sym)
                     await asyncio.sleep(0.05)
                     continue
                 score = int(parsed.get("score", 0))
