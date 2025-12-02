@@ -14,14 +14,12 @@ from helpers import (
     calc_exhaustion, calc_fvg, calc_ob
 )
 
-# ---------- env ----------
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT    = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SEC = os.getenv("BINANCE_SECRET")
 INTERVAL = 60
 
-# ---------- 48 coin full list ----------
 WATCHLIST = [
 "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","AVAXUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
 "LINKUSDT","DOTUSDT","MATICUSDT","TRXUSDT","LTCUSDT","ATOMUSDT","FILUSDT","INJUSDT",
@@ -31,7 +29,6 @@ WATCHLIST = [
 "CRVUSDT","SKLUSDT","ENSUSDT","XLMUSDT","XTZUSDT","CFXUSDT","KAVAUSDT","PEPEUSDT","SHIBUSDT"
 ]
 
-# ---------- 1-min cache ----------
 cache = {}
 CACHE_TTL = 60
 
@@ -53,10 +50,12 @@ async def retry_get(session, url, params=None, headers=None, max_retry=5):
             await asyncio.sleep(2 ** i)
     return None
 
-# ---------- multi-symbol klines (weight 1) ----------
+# ---------- klines batch ----------
 async def fetch_klines_batch(session, symbols, interval="1m", limit=30):
     url  = "https://api.binance.com/api/v3/klines"
-    symbols = [s.upper() for s in symbols]                       # ➜ upper only
+    symbols = [s.upper() for s in symbols]
+    if not symbols:
+        return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":")), "interval": interval, "limit": limit}
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
@@ -75,10 +74,12 @@ async def fetch_klines_batch(session, symbols, interval="1m", limit=30):
                 print("parse err", sym, e)
     return out
 
-# ---------- batch bookTicker (weight 1) ----------
+# ---------- spread batch ----------
 async def fetch_spread_batch(session, symbols):
     url  = "https://api.binance.com/api/v3/ticker/bookTicker"
-    symbols = [s.upper() for s in symbols]                       # ➜ upper only
+    symbols = [s.upper() for s in symbols]
+    if not symbols:
+        return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":"))}
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
@@ -94,10 +95,12 @@ async def fetch_spread_batch(session, symbols):
                 pass
     return out
 
-# ---------- batch EMA ----------
+# ---------- ema batch ----------
 async def fetch_ema_batch(session, symbols, interval, length=20):
     url  = "https://api.binance.com/api/v3/klines"
-    symbols = [s.upper() for s in symbols]                       # ➜ upper only
+    symbols = [s.upper() for s in symbols]
+    if not symbols:
+        return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":")), "interval": interval, "limit": length}
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
@@ -118,7 +121,7 @@ async def send(msg):
     async with aiohttp.ClientSession() as s:
         await s.post(url, json={"chat_id": CHAT, "text": msg, "parse_mode": "HTML"})
 
-# ---------- single symbol handler ----------
+# ---------- symbol handler ----------
 MODE_THRESH = {"quick": 55, "mid": 62, "trend": 70}
 
 async def handle_symbol(session, symbol, kdata, spreads, emas15, emas1h, emas4h, emas8h):
@@ -161,10 +164,10 @@ async def handle_symbol(session, symbol, kdata, spreads, emas15, emas1h, emas4h,
             await send(format_signal(symbol, side, mode, price, score, tp, sl, 0.4, lev))
             print("Signal", symbol, side, mode, score, lev)
 
-# ---------- main scanner ----------
+# ---------- scanner ----------
 async def scanner():
     print("🚀 BATCH-48 COIN BOT RUNNING")
-    sem = asyncio.Semaphore(10)  # concurrency limit
+    sem = asyncio.Semaphore(10)
     async with aiohttp.ClientSession() as session:
         while True:
             tasks = []
