@@ -1,234 +1,310 @@
-# helpers.py — FINAL HYBRID MIND (Part 1/2)
+# helpers.py — PATCHED FINAL (Integrated Part 1 + Part 2)
+# Hybrid Mind: 58-logic scoring engine + decision layer + BTC calm fail-safe
 
-import asyncio, math, time, statistics
+import asyncio
+import math
+import time
+import statistics
 from datetime import datetime
-import aiohttp
 
 # -----------------------------------------
 # GLOBAL SETTINGS
 # -----------------------------------------
 MODES = ["quick", "mid", "trend"]
-
 COOLDOWN_MINUTES = 30
-BTC_STABILITY_THRESHOLD = 0.35   # % change allowed
+BTC_STABILITY_THRESHOLD = 1.0   # percent (increased to avoid constant blocking)
 RECHECK_DELAY = 30               # seconds
 MAX_SCORE = 100
 
 # -----------------------------------------
-# FETCH DATA (Binance)
+# MODE SCORE THRESHOLDS (Arun's system)
 # -----------------------------------------
-async def fetch_binance(session, url):
-    try:
-        async with session.get(url, timeout=5) as r:
-            return await r.json()
-    except Exception:
-        return None
+MODE_THRESHOLDS = {
+    "quick": 55,
+    "mid": 62,
+    "trend": 70,
+}
 
-async def get_price(session, symbol):
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-    data = await fetch_binance(session, url)
-    try:
-        return float(data["price"])
-    except:
-        return None
+# TP/SL rules (Arun preference)
+TP_RULES = {
+    "quick": (1.2, 1.6),   # %
+    "mid": (1.8, 2.4),
+    "trend": (2.5, 3.5),
+}
 
-async def get_klines(session, symbol, interval, limit=100):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = await fetch_binance(session, url)
-    return data or []
+SL_RULES = {
+    "quick": (0.5, 0.8),
+    "mid": (0.9, 1.2),
+    "trend": (1.2, 1.8),
+}
 
 # -----------------------------------------
-# BASE INDICATORS
+# COOLDOWN SYSTEM
+# -----------------------------------------
+last_signal_time = {}
+
+def is_cooldown(symbol):
+    if symbol not in last_signal_time:
+        return False
+    diff = time.time() - last_signal_time[symbol]
+    return diff < (COOLDOWN_MINUTES * 60)
+
+def update_cooldown(symbol):
+    last_signal_time[symbol] = time.time()
+
+# -----------------------------------------
+# SIMPLE INDICATORS / HELPERS
 # -----------------------------------------
 def ema(values, length):
-    if len(values) < length:
+    if not values or len(values) < length:
         return None
     k = 2 / (length + 1)
-    ema_val = values[0]
+    ema_val = float(values[0])
     for v in values[1:]:
-        ema_val = (v * k) + (ema_val * (1 - k))
+        ema_val = (float(v) * k) + (ema_val * (1 - k))
     return ema_val
 
 def get_closes(klines):
     return [float(k[4]) for k in klines]
 
 # -----------------------------------------
+# BTC CALM CHECK (FAIL-SAFE & robust)
+# -----------------------------------------
+async def btc_calm_check(session):
+    """
+    Returns True if BTC is 'calm' enough to allow signals.
+    Fail-safe behavior: if API fails or unexpected response, return True (don't block).
+    Threshold default is 1.0% (adjustable).
+    """
+    url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
+    try:
+        async with session.get(url, timeout=5) as r:
+            if r.status != 200:
+                # rate limit or cloudflare or error -> fail-safe allow
+                return True
+            d = await r.json()
+            # defensive checks
+            if not d or "priceChangePercent" not in d:
+                return True
+            try:
+                change = abs(float(d.get("priceChangePercent", 0.0)))
+            except:
+                return True
+            return change < BTC_STABILITY_THRESHOLD
+    except Exception:
+        # network error/timeouts -> do not block scanning
+        return True
+
+# -----------------------------------------
 # LOGIC ENGINE (58 LOGICS)
+# Each logic expects a dict 'data' with relevant keys (see main.py dummy live structure)
+# Each returns an integer (can be negative for dangerous conditions)
 # -----------------------------------------
 
-# Each logic returns 0–3 score.
-
 def HTF_EMA_1h_15m(data):
-    return 2 if data["ema_15m"] > data["ema_1h"] else 0
+    try:
+        return 2 if data.get("ema_15m", 0) > data.get("ema_1h", 0) else 0
+    except:
+        return 0
 
 def HTF_EMA_1h_4h(data):
-    return 2 if data["ema_1h"] > data["ema_4h"] else 0
+    try:
+        return 2 if data.get("ema_1h", 0) > data.get("ema_4h", 0) else 0
+    except:
+        return 0
 
 def HTF_EMA_1h_8h(data):
-    return 2 if data["ema_4h"] > data["ema_8h"] else 0
+    try:
+        return 2 if data.get("ema_4h", 0) > data.get("ema_8h", 0) else 0
+    except:
+        return 0
 
 def HTF_Structure_Break(data):
-    return 3 if data["trend"] == "bull_break" else 0
+    return 3 if data.get("trend") == "bull_break" else 0
 
 def HTF_Structure_Reject(data):
-    return 3 if data["trend"] == "reject" else 0
+    return 3 if data.get("trend") == "reject" else 0
 
 def Imbalance_FVG(data):
-    return 2 if data["fvg"] else 0
+    return 2 if data.get("fvg") else 0
 
 def Trend_Continuation(data):
-    return 3 if data["trend_strength"] > 0.7 else 0
+    return 3 if data.get("trend_strength", 0) > 0.7 else 0
 
 def Trend_Exhaustion(data):
-    return 1 if data["exhaustion"] else 0
+    return 1 if data.get("exhaustion") else 0
 
 def Micro_Pullback(data):
-    return 2 if data["micro_pb"] else 0
+    return 2 if data.get("micro_pb") else 0
 
 def Wick_Strength(data):
-    return 2 if data["wick_ratio"] > 1.5 else 0
+    try:
+        return 2 if float(data.get("wick_ratio", 0)) > 1.5 else 0
+    except:
+        return 0
 
 def Sweep_Reversal(data):
-    return 3 if data["liquidation_sweep"] else 0
+    return 3 if data.get("liquidation_sweep") else 0
 
 def Vol_Sweep_1m(data):
-    return 2 if data["vol_1m"] > data["vol_5m"] else 0
+    try:
+        return 2 if float(data.get("vol_1m", 0)) > float(data.get("vol_5m", 0)) else 0
+    except:
+        return 0
 
 def Vol_Sweep_5m(data):
-    return 2 if data["vol_5m"] > data["vol_1m"] else 0
+    try:
+        return 2 if float(data.get("vol_5m", 0)) > float(data.get("vol_1m", 0)) else 0
+    except:
+        return 0
 
 def Delta_Divergence_1m(data):
-    return 2 if data["delta_1m"] else 0
+    return 2 if data.get("delta_1m") else 0
 
 def Delta_Divergence_HTF(data):
-    return 2 if data["delta_htf"] else 0
+    return 2 if data.get("delta_htf") else 0
 
 def Iceberg_1m(data):
-    return 3 if data["iceberg_1m"] else 0
+    return 3 if data.get("iceberg_1m") else 0
 
 def Iceberg_v2(data):
-    return 3 if data["iceberg_v2"] else 0
+    return 3 if data.get("iceberg_v2") else 0
 
 def Orderbook_Wall_Shift(data):
-    return 2 if data["wall_shift"] else 0
+    return 2 if data.get("wall_shift") else 0
 
 def Liquidity_Wall(data):
-    return 2 if data["liq_wall"] else 0
+    return 2 if data.get("liq_wall") else 0
 
 def Liquidity_Bend(data):
-    return 2 if data["liq_bend"] else 0
+    return 2 if data.get("liq_bend") else 0
 
 def ADR_DayRange(data):
-    return 1 if data["adr_ok"] else 0
+    return 1 if data.get("adr_ok") else 0
 
 def ATR_Expansion(data):
-    return 1 if data["atr_expanding"] else 0
+    return 1 if data.get("atr_expanding") else 0
 
 def Phase_Shift(data):
-    return 2 if data["phase_shift"] else 0
+    return 2 if data.get("phase_shift") else 0
 
 def Price_Compression(data):
-    return 1 if data["compression"] else 0
+    return 1 if data.get("compression") else 0
 
 def Speed_Imbalance(data):
-    return 2 if data["speed_imbalance"] else 0
+    return 2 if data.get("speed_imbalance") else 0
 
 def Taker_Pressure(data):
-    return 2 if data["taker_pressure"] else 0
+    return 2 if data.get("taker_pressure") else 0
 
 def HTF_Volume_Imprint(data):
-    return 2 if data["vol_imprint"] else 0
+    return 2 if data.get("vol_imprint") else 0
 
 def Tiny_Cluster_Imprint(data):
-    return 1 if data["cluster_tiny"] else 0
+    return 1 if data.get("cluster_tiny") else 0
 
 def Absorption(data):
-    return 2 if data["absorption"] else 0
+    return 2 if data.get("absorption") else 0
 
 def Recent_Weakness(data):
-    return 1 if data["weakness"] else 0
+    return 1 if data.get("weakness") else 0
 
 def Spread_Snap_0_5s(data):
-    return 2 if data["spread_snap_05"] else 0
+    return 2 if data.get("spread_snap_05") else 0
 
 def Spread_Snap_0_25s(data):
-    return 2 if data["spread_snap_025"] else 0
+    return 2 if data.get("spread_snap_025") else 0
 
 def Tight_Spread_Filter(data):
-    return 1 if data["spread"] < 0.03 else 0
+    try:
+        return 1 if float(data.get("spread", 999)) < 0.03 else 0
+    except:
+        return 0
 
 def Spread_Safety(data):
-    return 1 if data["spread"] < 0.05 else 0
+    try:
+        return 1 if float(data.get("spread", 999)) < 0.05 else 0
+    except:
+        return 0
 
 def BE_SL_AutoLock(data):
-    return 1 if data["be_lock"] else 0
+    return 1 if data.get("be_lock") else 0
 
 def Liquidation_Distance(data):
-    return 2 if data["liq_dist"] < 0.5 else 0
+    try:
+        return 2 if float(data.get("liq_dist", 999)) < 0.5 else 0
+    except:
+        return 0
 
 def Kill_Zone_5m(data):
-    return 1 if data["kill_5m"] else 0
+    return 1 if data.get("kill_5m") else 0
 
 def Kill_Zone_HTF(data):
-    return 1 if data["kill_htf"] else 0
+    return 1 if data.get("kill_htf") else 0
 
 def Kill_Switch_Fast(data):
-    return -10 if data["kill_fast"] else 0
+    return -10 if data.get("kill_fast") else 0
 
 def Kill_Switch_Primary(data):
-    return -25 if data["kill_primary"] else 0
+    return -25 if data.get("kill_primary") else 0
 
 def News_Guard(data):
-    return -5 if data["news_risk"] else 0
+    return -5 if data.get("news_risk") else 0
 
 def Recheck_30s(data):
-    return 1 if data["recheck_ok"] else 0
+    return 1 if data.get("recheck_ok") else 0
 
 def Partial_Exit_Logic(data):
     return 1
 
 def BTC_Risk_Filter_L1(data):
-    return -8 if not data["btc_calm"] else 2
+    return -8 if not data.get("btc_calm", True) else 2
 
 def BTC_Risk_Filter_L2(data):
-    return -15 if data["btc_trending_fast"] else 2
+    return -15 if data.get("btc_trending_fast") else 2
 
 def BTC_Funding_OI_Combo(data):
-    return 2 if data["funding_oi_combo"] else 0
+    return 2 if data.get("funding_oi_combo") else 0
 
 def Funding_Extreme(data):
-    return -2 if data["funding_extreme"] else 0
+    return -2 if data.get("funding_extreme") else 0
 
 def Funding_Delta_Speed(data):
-    return 1 if data["funding_delta"] else 0
+    return 1 if data.get("funding_delta") else 0
 
 def Funding_Arbitrage(data):
-    return 2 if data["arb_opportunity"] else 0
+    return 2 if data.get("arb_opportunity") else 0
 
 def OI_Spike_5pct(data):
-    return 2 if data["oi_spike"] else 0
+    return 2 if data.get("oi_spike") else 0
 
 def OI_Spike_Sustained(data):
-    return 2 if data["oi_sustained"] else 0
+    return 2 if data.get("oi_sustained") else 0
 
 def ETH_BTC_Beta_Divergence(data):
-    return 1 if data["beta_div"] else 0
+    return 1 if data.get("beta_div") else 0
 
 def Options_Gamma_Flip(data):
-    return 3 if data["gamma_flip"] else 0
+    return 3 if data.get("gamma_flip") else 0
 
 def Heatmap_Sweep(data):
-    return 2 if data["heat_sweep"] else 0
+    return 2 if data.get("heat_sweep") else 0
 
 def Micro_Slip(data):
-    return -1 if data["slippage"] else 0
+    return -1 if data.get("slippage") else 0
 
 def Order_Block(data):
-    return 2 if data["orderblock"] else 0
+    return 2 if data.get("orderblock") else 0
 
 def Score_Normalization(score):
-    return max(0, min(score, MAX_SCORE))
+    # keep in 0..MAX_SCORE but allow negative checks to reject
+    if score < 0:
+        return 0
+    return max(0, min(int(score), MAX_SCORE))
 
+# -----------------------------------------
+# FINAL SIGNAL SCORE (aggregates all 58)
+# -----------------------------------------
 def Final_Signal_Score(data):
     total = sum([
         HTF_EMA_1h_15m(data),
@@ -288,86 +364,38 @@ def Final_Signal_Score(data):
         Micro_Slip(data),
         Order_Block(data),
     ])
-
     return Score_Normalization(total)
-# helpers.py — FINAL HYBRID MIND (Part 2/2)
-
-import time
-from datetime import datetime
-
-# -----------------------------------------
-# MODE SCORE THRESHOLDS (Arun's system)
-# -----------------------------------------
-MODE_THRESHOLDS = {
-    "quick": 55,
-    "mid": 62,
-    "trend": 70,
-}
-
-# TP/SL rules (Arun preference)
-TP_RULES = {
-    "quick": (1.2, 1.6),   # %
-    "mid": (1.8, 2.4),
-    "trend": (2.5, 3.5),
-}
-
-SL_RULES = {
-    "quick": (0.5, 0.8),
-    "mid": (0.9, 1.2),
-    "trend": (1.2, 1.8),
-}
-
-# -----------------------------------------
-# BTC CALM CHECK
-# -----------------------------------------
-async def btc_calm_check(session):
-    url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
-    try:
-        async with session.get(url) as r:
-            d = await r.json()
-            change = abs(float(d["priceChangePercent"]))
-            return change < BTC_STABILITY_THRESHOLD
-    except:
-        return False
-
-# -----------------------------------------
-# COOLDOWN SYSTEM
-# -----------------------------------------
-last_signal_time = {}
-
-def is_cooldown(symbol):
-    if symbol not in last_signal_time:
-        return False
-    diff = time.time() - last_signal_time[symbol]
-    return diff < (COOLDOWN_MINUTES * 60)
-
-def update_cooldown(symbol):
-    last_signal_time[symbol] = time.time()
 
 # -----------------------------------------
 # TP/SL AUTO CALCULATOR
 # -----------------------------------------
 def calc_tp_sl(price, mode):
-    tp_min, tp_max = TP_RULES[mode]
-    sl_min, sl_max = SL_RULES[mode]
+    tp_min, tp_max = TP_RULES.get(mode, TP_RULES["mid"])
+    sl_min, sl_max = SL_RULES.get(mode, SL_RULES["mid"])
 
     tp = price * (1 + tp_min/100)
     sl = price * (1 - sl_min/100)
 
-    return round(tp, 4), round(sl, 4)
+    # rounding - keep reasonable precision
+    return round(tp, 6), round(sl, 6)
 
 # -----------------------------------------
-# FINAL DECISION ENGINE
+# DECISION ENGINE
 # -----------------------------------------
 def decide_signal(symbol, mode, price, score):
+    # validate mode
+    if mode not in MODE_THRESHOLDS:
+        return None
+
+    # reject if score below mode threshold
     if score < MODE_THRESHOLDS[mode]:
         return None
 
+    # cooldown check
     if is_cooldown(symbol):
         return None
 
     tp, sl = calc_tp_sl(price, mode)
-
     update_cooldown(symbol)
 
     return {
@@ -376,7 +404,9 @@ def decide_signal(symbol, mode, price, score):
         "price": price,
         "score": score,
         "tp": tp,
-        "sl": sl
+        "sl": sl,
+        "leverage": 50,
+        "cooldown_min": COOLDOWN_MINUTES
     }
 
 # -----------------------------------------
@@ -388,7 +418,7 @@ def format_signal(sig):
 
 <b>Pair:</b> {sig['symbol']}
 <b>Price:</b> {sig['price']}
-<b>Score:</b> {sig['score']} / 100
+<b>Score:</b> {sig['score']} / {MAX_SCORE}
 
 🎯 <b>TP:</b>
 <code>{sig['tp']}</code>
@@ -396,8 +426,8 @@ def format_signal(sig):
 🛑 <b>SL:</b>
 <code>{sig['sl']}</code>
 
-⚡ Leverage: 50x
-⏱️ Cooldown: 30 minutes
+⚡ Leverage: {sig.get('leverage', 50)}x
+⏱️ Cooldown: {sig.get('cooldown_min', COOLDOWN_MINUTES)} minutes
 📊 Mode: {sig['mode'].upper()}
 
 #HybridAI #ArunSystem
@@ -407,6 +437,16 @@ def format_signal(sig):
 # MASTER PROCESSOR (Used by main.py)
 # -----------------------------------------
 def process_data(symbol, mode, live_data):
+    """
+    live_data must be a dict and must include at least 'price'.
+    This function returns decision dict or None.
+    """
+    # ensure btc calm key present for logic funcs that use it
+    if "btc_calm" not in live_data:
+        # best-effort: assume calm (but main.py checks btc_calm_check separately)
+        live_data["btc_calm"] = True
+
+    # compute score and then decide
     score = Final_Signal_Score(live_data)
-    decision = decide_signal(symbol, mode, live_data["price"], score)
+    decision = decide_signal(symbol, mode, live_data.get("price", 0.0), score)
     return decision
