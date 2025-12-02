@@ -1,4 +1,4 @@
-# main.py — FINAL (Skip reasons logged, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
+# main.py — FINAL (Exact score logged, IST 00-07 OFF, 45 coins, 3/60s, 60 score)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -140,7 +140,7 @@ async def fetch_snapshot(exchange, symbol):
 
 # ------------------------- Telegram -------------------------
 async def send_telegram(msg: str):
-    if not BOT_TOKEN or not CHAT_ID:
+    if not BOT_TOKEN or not Chat_ID:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": msg}
@@ -175,14 +175,14 @@ async def start_health_app():
     await site.start()
     logging.info(f"Health server on port {port}")
 
-# ------------------------- Worker (with SKIP reasons logged) -------------------------
+# ------------------------- Worker (with EXACT score logged) -------------------------
 async def worker():
     exchange = await create_exchange()
     cd = {}
     prefs = {"BTC_CALM_REQUIRED": True}
     idx = 0
     IST = pytz.timezone("Asia/Kolkata")
-    logging.info("Bot started • IST 00-07 OFF • 45 coins • 3/60s • 70 score")
+    logging.info("Bot started • IST 00-07 OFF • 45 coins • 3/60s • 60 score • exact score logged")
 
     try:
         while True:
@@ -212,7 +212,8 @@ async def worker():
                 reason = parsed.get("reason", "")
 
                 if score < SCORE_THRESHOLD:
-                    logging.info("SKIP %s — score %d < threshold %d", sym, score, SCORE_THRESHOLD)
+                    # ➜ EXACT score logged here
+                    logging.info("SKIP %s — exact score %d < threshold %d", sym, score, SCORE_THRESHOLD)
                     continue
 
                 tp, sl = calc_tp_sl(price, mode)
