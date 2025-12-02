@@ -1,5 +1,3 @@
-# main.py — FIXED (NO index error, stable direction)
-
 import os
 import asyncio
 import aiohttp
@@ -30,15 +28,20 @@ async def send_telegram(msg):
     async with aiohttp.ClientSession() as s:
         await s.post(url, json={"chat_id": CHAT, "text": msg, "parse_mode": "HTML"})
 
+async def get_ema(session, symbol, interval, length=20):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={length}"
+    async with session.get(url, timeout=5) as r:
+        kl = await r.json()
+    if not isinstance(kl, list) or len(kl) < length:
+        return None
+    closes = [float(x[4]) for x in kl]
+    return sum(closes[-length:]) / length
 
 async def get_data(session, symbol):
-
     try:
         k_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=30"
         async with session.get(k_url, timeout=5) as r:
             kl = await r.json()
-
-        # যদি klines invalid হয় → skip
         if not isinstance(kl, list) or len(kl) < 3:
             return None
 
@@ -46,19 +49,22 @@ async def get_data(session, symbol):
         prev  = float(kl[-2][4])
         volume_1m = float(kl[-1][5])
 
-        # low volume হলে skip
         if volume_1m < 5:
             return None
 
-        # fake orderbook skip avoid
         spread = abs(float(kl[-1][2]) - float(kl[-1][3])) / price
+
+        ema_15m = await get_ema(session, symbol, "15m", 20) or price
+        ema_1h  = await get_ema(session, symbol, "1h", 20) or price
+        ema_4h  = await get_ema(session, symbol, "4h", 20) or price
+        ema_8h  = await get_ema(session, symbol, "4h", 40) or price  # fallback
 
         live = {
             "price": price,
-            "ema_15m": price,
-            "ema_1h": price,
-            "ema_4h": price,
-            "ema_8h": price,
+            "ema_15m": ema_15m,
+            "ema_1h": ema_1h,
+            "ema_4h": ema_4h,
+            "ema_8h": ema_8h,
 
             "trend": "bull_break" if price >= prev else "reject",
             "trend_strength": abs(price - prev) / price,
@@ -91,14 +97,11 @@ async def get_data(session, symbol):
 
         return live, price, prev
 
-    except Exception:
+    except Exception as e:
+        print("Error in get_data:", e)
         return None
 
-
-
-
 async def handle_symbol(session, symbol):
-
     data = await get_data(session, symbol)
     if not data:
         print("Skipping (no data):", symbol)
@@ -111,14 +114,11 @@ async def handle_symbol(session, symbol):
         print("No direction:", symbol)
         return
 
-    # mode loop
     for mode in ["quick", "mid", "trend"]:
-
         score = final_score(live)
         threshold = {"quick":55, "mid":62, "trend":70}[mode]
 
         if score >= threshold and cooldown_ok(symbol):
-
             tp, sl = calc_tp_sl(price, mode)
             update_cd(symbol)
 
@@ -128,11 +128,8 @@ async def handle_symbol(session, symbol):
             await send_telegram(msg)
 
             print("Signal --->", symbol, side, mode, score)
-
         else:
             print("Skip:", symbol, score)
-
-
 
 async def scanner():
     print("🚀 FIXED BOT RUNNING…")
@@ -140,7 +137,6 @@ async def scanner():
         while True:
             await asyncio.gather(*[handle_symbol(session, s) for s in WATCHLIST])
             await asyncio.sleep(INTERVAL)
-
 
 if __name__ == "__main__":
     asyncio.run(scanner())
