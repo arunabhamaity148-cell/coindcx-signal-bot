@@ -11,7 +11,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SEC = os.getenv("BINANCE_SECRET")
-INTERVAL = 7
+INTERVAL = 60
 MODE_THRESH = {"quick": 55, "mid": 62, "trend": 70}
 
 
