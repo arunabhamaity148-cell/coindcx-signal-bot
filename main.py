@@ -177,11 +177,13 @@ async def scanner():
     async with aiohttp.ClientSession() as session:
         while True:
             tasks = []
-            for i in range(0, len(WATCHLIST), 24):
-                batch = WATCHLIST[i:i+24]
+            # ➜ 20 করে batch করো (min 2 guarantee)
+            for i in range(0, len(WATCHLIST), 20):
+                batch = WATCHLIST[i:i+20]
                 tasks.append(process_batch(session, batch, sem))
             await asyncio.gather(*tasks)
             await asyncio.sleep(INTERVAL)
+
 
 async def process_batch(session, batch, sem):
     async with sem:
