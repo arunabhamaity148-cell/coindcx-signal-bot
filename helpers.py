@@ -1,10 +1,24 @@
-# helpers.py — FINAL (atr added + world-top GPT features)
-import time, html, json, hashlib, logging, os, random
+# helpers.py — STABLE FINAL (indicators, cache, prompt builder, advanced AI wrapper)
+import os
+import time
+import json
+import html
+import hashlib
+import random
+import asyncio
+from typing import Dict, List, Optional
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
 
-# ---------- time ----------
+try:
+    from pydantic import BaseModel, Field
+    from typing import Literal
+    PydanticAvailable = True
+except Exception:
+    PydanticAvailable = False
+
+# -------------------------
+# Time / small utils
+# -------------------------
 def now_ts() -> int:
     return int(time.time())
 
@@ -16,7 +30,9 @@ def human_time(ts: int = None) -> str:
 def esc(x) -> str:
     return html.escape("" if x is None else str(x))
 
-# ---------- TP/SL ----------
+# -------------------------
+# TP/SL rules (mode-based)
+# -------------------------
 TP_SL_RULES = {
     "quick": {"tp_pct": 1.6, "sl_pct": 1.0},
     "mid":   {"tp_pct": 2.0, "sl_pct": 1.0},
@@ -25,33 +41,42 @@ TP_SL_RULES = {
 
 def calc_tp_sl(price: float, mode: str):
     cfg = TP_SL_RULES.get(mode, {"tp_pct": 2.0, "sl_pct": 1.0})
-    tp = price * (1 + cfg["tp_pct"]/100.0)
-    sl = price * (1 - cfg["sl_pct"]/100.0)
+    tp = price * (1 + cfg["tp_pct"] / 100.0)
+    sl = price * (1 - cfg["sl_pct"] / 100.0)
     return round(tp, 8), round(sl, 8)
 
-# ---------- TTL cache ----------
+# -------------------------
+# Simple in-memory TTL cache
+# -------------------------
 class SimpleCache:
     def __init__(self):
-        self.store = {}
+        self.store = {}  # key -> (expiry_ts, value)
+
     def get(self, key):
         rec = self.store.get(key)
         if not rec:
             return None
         exp, val = rec
         if exp < time.time():
-            try: del self.store[key]
-            except: pass
+            try:
+                del self.store[key]
+            except KeyError:
+                pass
             return None
         return val
+
     def set(self, key, value, ttl_seconds: int):
         self.store[key] = (time.time() + ttl_seconds, value)
+
     def make_key(self, *parts) -> str:
         raw = "|".join([str(p) for p in parts])
         return hashlib.sha256(raw.encode()).hexdigest()
 
 CACHE = SimpleCache()
 
-# ---------- indicators ----------
+# -------------------------
+# Basic indicators (lightweight)
+# -------------------------
 def sma(values: List[float], period: int) -> float:
     if not values:
         return 0.0
@@ -71,21 +96,6 @@ def compute_ema_from_closes(closes: List[float], period: int) -> float:
         ema_val = price * k + ema_val * (1 - k)
     return ema_val
 
-def rsi_from_closes(closes: List[float], period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        gains.append(max(ch, 0)); losses.append(abs(min(ch, 0)))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-# ---------- ATR (missing function added) ----------
 def atr(ohlc: List[List[float]], period: int = 14) -> float:
     if len(ohlc) < 2:
         return 0.0
@@ -105,7 +115,23 @@ def atr(ohlc: List[List[float]], period: int = 14) -> float:
         atr_val = tr * k + atr_val * (1 - k)
     return atr_val
 
-# ---------- 58 logic desc ----------
+def rsi_from_closes(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        ch = closes[i] - closes[i-1]
+        gains.append(max(ch, 0)); losses.append(abs(min(ch, 0)))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+# -------------------------
+# 58 logic short descriptions (for prompt)
+# -------------------------
 LOGIC_DESC = {
     "HTF_EMA_1h_15m": "1h vs 15m EMA alignment and slope",
     "HTF_EMA_1h_4h": "1h vs 4h EMA confluence",
@@ -170,7 +196,9 @@ LOGIC_DESC = {
 def logic_descriptions_text() -> str:
     return "\n".join([f"{k}: {v}" for k, v in LOGIC_DESC.items()])
 
-# ---------- strict filters ----------
+# -------------------------
+# Strict filters & helpers
+# -------------------------
 def btc_calm_filter() -> bool:
     snap = CACHE.get("btc_snapshot")
     if not snap:
@@ -190,16 +218,17 @@ def volume_spike_ok(metrics: Dict) -> bool:
 def htf_alignment_score(metrics: Dict) -> int:
     ema1h = metrics.get("ema_1h_50", 0)
     ema15 = metrics.get("ema_15m_50", 0)
-    price = metrics["price"]
-    if price > ema15 > ema1h:
-        return 20
-    if price < ema15 < ema1h:
-        return 20
+    price = metrics.get("price", 0)
+    if price and ema15 and ema1h:
+        if price > ema15 > ema1h:
+            return 20
+        if price < ema15 < ema1h:
+            return 20
     return 0
 
 def funding_oi_filter(symbol: str) -> bool:
-    funding = CACHE.get(f"funding_{symbol}")
-    oi = CACHE.get(f"oi_change_{symbol}")
+    funding = CACHE.get(f"funding_"+symbol)
+    oi = CACHE.get("oi_change_"+symbol)
     if funding and abs(funding) > 0.05:
         return False
     if oi and oi > 10:
@@ -212,7 +241,9 @@ def kill_switch() -> bool:
         return True
     return False
 
-# ---------- memory ----------
+# -------------------------
+# memory utilities
+# -------------------------
 def get_memory(symbol: str) -> List[dict]:
     return CACHE.get(f"memory_{symbol}") or []
 
@@ -222,53 +253,56 @@ def append_memory(symbol: str, entry: dict, max_items: int = 5):
     mem = mem[-max_items:]
     CACHE.set(f"memory_{symbol}", mem, ttl_seconds=86400)
 
-# ---------- feedback ----------
+# -------------------------
+# lightweight feedback (dummy)
+# -------------------------
 def get_trade_pnl(symbol: str, tp: float, sl: float, mode: str) -> float:
-    # dummy: replace with real PnL fetch
-    return random.uniform(-1, 1)
+    # placeholder: replace with actual PnL calc from exchange/trades
+    return random.uniform(-1.0, 1.0)
 
-# ---------- Pydantic schema ----------
-class Signal(BaseModel):
-    score: int = Field(ge=0, le=100)
-    mode: Literal["quick", "mid", "trend"]
-    reason: str = Field(max_length=64)
+# -------------------------
+# Pydantic schema (optional)
+# -------------------------
+if PydanticAvailable:
+    class Signal(BaseModel):
+        score: int = Field(ge=0, le=100)
+        mode: Literal["quick", "mid", "trend"]
+        reason: str = Field(max_length=64)
+else:
+    Signal = None
 
-# ---------- system + CoT ----------
-SYSTEM_PROMPT = """
-You are a senior quant at Citadel, specialising in crypto futures.
-Use only evidence from the provided metrics.
-Output SINGLE-LINE JSON: {"score":int,"mode":"quick|mid|trend","reason":"max 8 words"}
-Penalty: verbose → score 0.
-"""
+# -------------------------
+# SYSTEM PROMPT (for OpenAI)
+# -------------------------
+SYSTEM_PROMPT = (
+    "You are a senior quant at a top hedge fund specializing in crypto futures. "
+    "Use only evidence from provided metrics and follow instructions exactly. "
+    "RETURN A SINGLE-LINE JSON: {\"score\":int, \"mode\":\"quick|mid|trend\", \"reason\":\"max 8 words\"}."
+)
 
-# ---------- tool-calling ----------
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_funding_rate",
-            "description": "Current funding rate %",
-            "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}}
-        }
-    }
-]
+# -------------------------
+# Low-level OpenAI sync call (used by async wrapper)
+# -------------------------
+def _call_openai_sync(prompt: str, model: Optional[str] = None, max_tokens: int = 300) -> str:
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        model_name = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        resp = client.responses.create(model=model_name, input=prompt, temperature=0, max_output_tokens=max_tokens)
+        if hasattr(resp, "output_text") and resp.output_text:
+            return resp.output_text.strip()
+        # fallback to to_dict textual form
+        try:
+            return json.dumps(resp.to_dict())
+        except Exception:
+            return str(resp)
+    except Exception:
+        return ""
 
-# ---------- ensemble ----------
-async def ensemble_score(symbol: str, price: float, metrics: dict, prefs: dict, n: int = 3) -> dict:
-    scores = []
-    for _ in range(n):
-        sc = await ai_score_symbol_with_memory_and_tools(symbol, price, metrics, prefs)
-        if sc:
-            scores.append(sc)
-    if not scores:
-        return {"score": 0, "mode": "quick", "reason": "ensemble fail"}
-    score_vals = [s["score"] for s in scores]
-    final_score = int(round(sum(score_vals) / len(score_vals)))
-    mode_vals = [s["mode"] for s in scores]
-    final_mode = sorted(mode_vals)[len(mode_vals) // 2]
-    return {"score": final_score, "mode": final_mode, "reason": scores[0]["reason"]}
-
-# ---------- single GPT call (CoT + tools + memory + feedback) ----------
+# -------------------------
+# Single GPT call: memory, tools, CoT, strict filters
+# Returns dict or None
+# -------------------------
 async def ai_score_symbol_with_memory_and_tools(symbol: str, price: float, metrics: dict, prefs: dict, ttl: int = 120) -> Optional[dict]:
     fingerprint = f"{symbol}|{round(price,6)}|{round(metrics.get('rsi_1m',50),2)}|{round(metrics.get('spread_pct',0),4)}"
     key = CACHE.make_key("ai", fingerprint)
@@ -276,13 +310,19 @@ async def ai_score_symbol_with_memory_and_tools(symbol: str, price: float, metri
     if cached:
         return cached
 
-    # strict filters
+    # strict filters (fast exit)
     if not btc_calm_filter():
-        return {"score": 0, "mode": "quick", "reason": "BTC volatile"}
+        out = {"score": 0, "mode": "quick", "reason": "BTC volatile"}
+        CACHE.set(key, out, ttl_seconds=ttl)
+        return out
     if not spread_filter(metrics):
-        return {"score": 0, "mode": "quick", "reason": "Spread wide"}
+        out = {"score": 0, "mode": "quick", "reason": "Spread wide"}
+        CACHE.set(key, out, ttl_seconds=ttl)
+        return out
     if kill_switch():
-        return {"score": 0, "mode": "quick", "reason": "Kill-switch"}
+        out = {"score": 0, "mode": "quick", "reason": "Kill-switch"}
+        CACHE.set(key, out, ttl_seconds=ttl)
+        return out
 
     base = 0
     base += htf_alignment_score(metrics)
@@ -291,9 +331,7 @@ async def ai_score_symbol_with_memory_and_tools(symbol: str, price: float, metri
     if not funding_oi_filter(symbol):
         base = min(base, 50)
 
-    # memory
     memory = get_memory(symbol)
-    # feedback (dummy PnL)
     pnl = get_trade_pnl(symbol, calc_tp_sl(price, "mid")[0], calc_tp_sl(price, "mid")[1], "mid")
 
     small = {k: v[-20:] if isinstance(v, list) else v for k, v in metrics.items()}
@@ -301,48 +339,66 @@ async def ai_score_symbol_with_memory_and_tools(symbol: str, price: float, metri
     prefs_text = json.dumps(prefs, default=str)
     logic_text = logic_descriptions_text()
 
-    prompt = f"""
-{SYSTEM_PROMPT}
+    prompt = (
+        SYSTEM_PROMPT + "\n\n"
+        f"Step 1: List 3 pros and 3 cons briefly about this symbol based only on metrics.\n"
+        f"Step 2: Use memory: {memory}\n"
+        f"Step 3: Last trade pnl (approx): {pnl:.2f}\n"
+        f"Step 4: Base filter score: {base}\n\n"
+        f"Metrics: {metrics_text}\n\n"
+        f"Logic descriptions: {logic_text}\n\n"
+        "Return EXACT single-line JSON only."
+    )
 
-Step 1: Inside <think> list 3 pros and 3 cons based on metrics.
-Step 2: Use tools if needed (funding, OI).
-Step 3: Consider memory: {memory}
-Step 4: Feedback: last trade PnL = {pnl:.2f}
-Step 5: Return strict JSON only.
-
-Base filter score: {base}
-Metrics: {metrics_text}
-Preferences: {prefs_text}
-Logic descriptions: {logic_text}
-"""
+    # call OpenAI synchronously in thread to avoid blocking event loop
     try:
-        raw = await asyncio.to_thread(_call_openai_sync, prompt)
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict) and {"score", "mode", "reason"} <= set(parsed.keys()):
-            # validate pydantic
-            sig = Signal(**parsed)
-            out = sig.dict()
+        raw = await asyncio.to_thread(_call_openai_sync, prompt, os.getenv("OPENAI_MODEL", "gpt-4o-mini"), 300)
+        parsed = None
+        try:
+            parsed = json.loads(raw.strip())
+        except Exception:
+            import re
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except Exception:
+                    parsed = None
+        if parsed and isinstance(parsed, dict) and {"score", "mode", "reason"} <= set(parsed.keys()):
+            # optional pydantic validation
+            if Signal:
+                try:
+                    sig = Signal(**parsed)
+                    out = sig.dict()
+                except Exception:
+                    out = {"score": int(parsed.get("score", 0)), "mode": str(parsed.get("mode", "quick")), "reason": str(parsed.get("reason",""))}
+            else:
+                out = {"score": int(parsed.get("score", 0)), "mode": str(parsed.get("mode", "quick")), "reason": str(parsed.get("reason",""))}
             CACHE.set(key, out, ttl_seconds=ttl)
-            # store memory
             append_memory(symbol, out)
             return out
     except Exception:
         pass
+
     return None
 
-# ---------- sync caller ----------
-def _call_openai_sync(prompt: str) -> str:
-    try:
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        resp = client.responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            input=prompt,
-            temperature=0,
-            max_output_tokens=300,
-            tools=TOOLS  # tool-calling ready
-        )
-        if hasattr(resp, "output_text") and resp.output_text:
-            return resp.output_text.strip()
-        return str(resp)
-    except Exception as e:
-        return ""
+# -------------------------
+# Ensemble helper (call multiple times and average)
+# -------------------------
+async def ensemble_score(symbol: str, price: float, metrics: dict, prefs: dict, n: int = 3) -> dict:
+    scores = []
+    for _ in range(n):
+        sc = await ai_score_symbol_with_memory_and_tools(symbol, price, metrics, prefs)
+        if sc:
+            scores.append(sc)
+    if not scores:
+        return {"score": 0, "mode": "quick", "reason": "ensemble_fail"}
+    score_vals = [s["score"] for s in scores]
+    final_score = int(round(sum(score_vals) / len(score_vals)))
+    mode_vals = [s["mode"] for s in scores]
+    final_mode = sorted(mode_vals)[len(mode_vals) // 2]
+    return {"score": final_score, "mode": final_mode, "reason": scores[0]["reason"]}
+
+# -------------------------
+# End of helpers.py
+# -------------------------
