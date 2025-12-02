@@ -1,23 +1,28 @@
-# helpers.py — PATCHED with OpenAI verifier integration
-# (Includes 58-logic scoring + decision layer)
-import asyncio
-import math
-import time
-import statistics
-from datetime import datetime
+# helpers.py — FINAL (Integrated: 58-logic + OpenAI verifier + decision layer)
 import os
+import time
+import math
+import json
+import asyncio
+import aiohttp
+from datetime import datetime
 
-# import OpenAI verifier
-from helpers_openai import call_openai_decision  # make sure helpers_openai.py is in same dir
-
-# -----------------------------------------
-# GLOBAL SETTINGS
-# -----------------------------------------
-MODES = ["quick", "mid", "trend"]
+# ----------------------------
+# CONFIG (env overrides possible)
+# ----------------------------
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
-BTC_STABILITY_THRESHOLD = float(os.getenv("BTC_STABILITY_THRESHOLD", "1.0"))
-RECHECK_DELAY = 30
+BTC_STABILITY_THRESHOLD = float(os.getenv("BTC_STABILITY_THRESHOLD", "1.2"))  # percent
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 MAX_SCORE = 100
+
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "10"))
+
+# ----------------------------
+# MODE & RULES
+# ----------------------------
+MODES = ["quick", "mid", "trend"]
 
 MODE_THRESHOLDS = {
     "quick": 55,
@@ -37,17 +42,112 @@ SL_RULES = {
     "trend": (1.2, 1.8),
 }
 
+# cooldown store
 last_signal_time = {}
 
 def is_cooldown(symbol):
-    if symbol not in last_signal_time:
+    t = last_signal_time.get(symbol)
+    if not t:
         return False
-    diff = time.time() - last_signal_time[symbol]
-    return diff < (COOLDOWN_MINUTES * 60)
+    return (time.time() - t) < (COOLDOWN_MINUTES * 60)
 
 def update_cooldown(symbol):
     last_signal_time[symbol] = time.time()
 
+# ----------------------------
+# BTC calm check — robust & fail-safe
+# ----------------------------
+async def btc_calm_check(session):
+    """
+    Returns True if BTC considered 'calm' (safe).
+    Fail-safe: API errors/timeouts/missing fields -> return True (do not block scanning).
+    If API returns percent, compare with BTC_STABILITY_THRESHOLD.
+    """
+    url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
+    try:
+        async with session.get(url, timeout=5) as r:
+            if r.status != 200:
+                # API error -> allow scanning (fail-safe)
+                return True
+            data = await r.json()
+            if not data or "priceChangePercent" not in data:
+                return True
+            try:
+                change = abs(float(data.get("priceChangePercent", 0.0)))
+            except:
+                return True
+            # return True if change < threshold
+            return change < BTC_STABILITY_THRESHOLD
+    except Exception:
+        # network/timeouts -> don't block scan
+        return True
+
+# ----------------------------
+# OpenAI verifier (built-in) — fail-open behavior
+# ----------------------------
+async def call_openai_decision(symbol, mode, price, score, live_summary):
+    """
+    Sends a small prompt to OpenAI to verify/adjust decision.
+    Expects JSON in response: {"approve": bool, "tp": num|null, "sl": num|null, "note": str}
+    Fail-open: if no key / error / parse fail -> return approve=True
+    """
+    if not OPENAI_KEY:
+        return {"approve": True, "tp": None, "sl": None, "note": "no_openai_key_fail_open"}
+
+    prompt = f"""
+You are a conservative crypto signal verifier. Respond ONLY with a single JSON object, nothing else.
+Input:
+symbol: {symbol}
+mode: {mode}
+price: {price}
+score: {score}
+live_summary: {json.dumps(live_summary)}
+Return JSON with keys:
+- approve (boolean)
+- tp (number|null)
+- sl (number|null)
+- note (string, short)
+Example:
+{{"approve": true, "tp": null, "sl": null, "note": "ok"}}
+"""
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a concise signal risk manager."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 200,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=body, timeout=OPENAI_TIMEOUT) as resp:
+                if resp.status != 200:
+                    return {"approve": True, "tp": None, "sl": None, "note": f"openai_status_{resp.status}"}
+                data = await resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                try:
+                    j = json.loads(content)
+                    return {
+                        "approve": bool(j.get("approve", False)),
+                        "tp": float(j["tp"]) if j.get("tp") not in (None, "", False) else None,
+                        "sl": float(j["sl"]) if j.get("sl") not in (None, "", False) else None,
+                        "note": str(j.get("note", ""))[:200]
+                    }
+                except Exception:
+                    return {"approve": True, "tp": None, "sl": None, "note": "openai_parse_fail"}
+    except Exception:
+        return {"approve": True, "tp": None, "sl": None, "note": "openai_error"}
+
+# ----------------------------
+# Basic helpers (EMA etc)
+# ----------------------------
 def ema(values, length):
     if not values or len(values) < length:
         return None
@@ -57,34 +157,10 @@ def ema(values, length):
         ema_val = (float(v) * k) + (ema_val * (1 - k))
     return ema_val
 
-def get_closes(klines):
-    return [float(k[4]) for k in klines]
-
-# robust btc_calm_check (keeps fail-safe)
-import aiohttp
-async def btc_calm_check(session):
-    url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
-    try:
-        async with session.get(url, timeout=5) as r:
-            if r.status != 200:
-                return True
-            d = await r.json()
-            if not d or "priceChangePercent" not in d:
-                return True
-            try:
-                change = abs(float(d.get("priceChangePercent", 0.0)))
-            except:
-                return True
-            return change < BTC_STABILITY_THRESHOLD
-    except Exception:
-        return True
-
-# --------------------------
-# (All 58 logic functions)
-# For brevity here: include all previously provided logic functions exactly as before.
-# I'll paste them in full so the file is self-contained.
-# --------------------------
-
+# ----------------------------
+# 58 Logic functions (each returns int)
+# ----------------------------
+# For brevity each function is defensive; uses .get() from data dict
 def HTF_EMA_1h_15m(data):
     try:
         return 2 if data.get("ema_15m", 0) > data.get("ema_1h", 0) else 0
@@ -346,6 +422,9 @@ def Final_Signal_Score(data):
     ])
     return Score_Normalization(total)
 
+# ----------------------------
+# TP/SL calc & decision
+# ----------------------------
 def calc_tp_sl(price, mode):
     tp_min, _ = TP_RULES.get(mode, TP_RULES["mid"])
     sl_min, _ = SL_RULES.get(mode, SL_RULES["mid"])
@@ -394,23 +473,26 @@ def format_signal(sig):
 #HybridAI #ArunSystem
 """
 
-# ---------- NEW: async process_data_with_ai ----------
+# ----------------------------
+# Async processing pipeline (local -> openai verifier)
+# ----------------------------
 async def process_data_with_ai(symbol, mode, live_data):
     """
-    Asynchronous processor: local scoring -> local decision -> OpenAI verifier -> final decision
-    Returns decision dict or None
+    1. Compute local score
+    2. Local decision (thresholds + cooldown)
+    3. Call OpenAI verifier (fail-open)
+    4. Return final decision dict or None
     """
-    # ensure btc_calm present
     if "btc_calm" not in live_data:
+        # ensure key exists for logic functions
         live_data["btc_calm"] = True
 
-    # local score + local decision
     score = Final_Signal_Score(live_data)
     local_decision = decide_signal(symbol, mode, live_data.get("price", 0.0), score)
     if not local_decision:
         return None
 
-    # prepare compact summary for OpenAI (keep payload small)
+    # Compact summary for OpenAI
     live_summary = {
         "trend": live_data.get("trend"),
         "vol_1m": live_data.get("vol_1m"),
@@ -421,15 +503,14 @@ async def process_data_with_ai(symbol, mode, live_data):
         "score": score
     }
 
-    # call OpenAI verifier (async) -> fail-open default
+    # Call OpenAI verifier
     ai_resp = await call_openai_decision(symbol, mode, local_decision["price"], score, live_summary)
 
-    # if OpenAI explicitly blocks -> do not send signal
+    # If OpenAI explicitly blocks, do not send
     if not ai_resp.get("approve", True):
-        # optionally: you can log ai_resp["note"]
         return None
 
-    # override TP/SL if OpenAI supplied custom ones
+    # override TP/SL if provided by OpenAI
     if ai_resp.get("tp") is not None:
         local_decision["tp"] = round(float(ai_resp["tp"]), 6)
     if ai_resp.get("sl") is not None:
@@ -438,6 +519,6 @@ async def process_data_with_ai(symbol, mode, live_data):
     local_decision["ai_note"] = ai_resp.get("note", "")
     return local_decision
 
-# keep old sync function for backwards-compat
+# Legacy sync wrapper (if needed)
 def process_data(symbol, mode, live_data):
     return asyncio.get_event_loop().run_until_complete(process_data_with_ai(symbol, mode, live_data))
