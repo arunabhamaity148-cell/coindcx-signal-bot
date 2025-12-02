@@ -1,10 +1,11 @@
 # ============================
-# main.py — FINAL RAILWAY-READY (no thread, no crash)
+# main.py — FINAL (45 coins, 4/30s, 70 score)
 # ============================
 
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
+from datetime import datetime
 from dotenv import load_dotenv
-from aiohttp import web          # lightweight health server
+from aiohttp import web
 
 load_dotenv()
 
@@ -17,25 +18,30 @@ from helpers import (
 )
 
 # -------------------------
+, rsi_from_closes
+)
+
+# -------------------------
 # ENV
 # -------------------------
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID          = os.getenv("CHAT_ID", "").strip()
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL     = "gpt-4o-mini"
-CYCLE_TIME       = 20
-SCORE_THRESHOLD  = 78
+CYCLE_TIME       = 30          # 30 sec
+SCORE_THRESHOLD  = 70          # relaxed
 COOLDOWN_SECONDS = 1800
 USE_TESTNET      = True
 BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
+# 45 high-volume coins
 SYMBOLS = [
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
-    "LTCUSDT","LINKUSDT","FILUSDT","ATOMUSDT","ETCUSDT","OPUSDT","ICPUSDT","APTUSDT","NEARUSDT","INJUSDT",
-    "SUIUSDT","AAVEUSDT","EOSUSDT","CRVUSDT","RUNEUSDT","XMRUSDT","FTMUSDT","SNXUSDT","DYDXUSDT","GMTUSDT",
-    "HBARUSDT","THETAUSDT","AXSUSDT","FLOWUSDT","KAVAUSDT","ZILUSDT","GALAUSDT","MTLUSDT","CHZUSDT","RNDRUSDT",
-    "SANDUSDT","MANAUSDT","1INCHUSDT","COMPUSDT","KLAYUSDT","TOMOUSDT","VETUSDT","BLURUSDT","STRKUSDT","ZRXUSDT"
+    "LTCUSDT","LINKUSDT","ATOMUSDT","ETCUSDT","OPUSDT","INJUSDT","SUIUSDT","AAVEUSDT","CRVUSDT","RUNEUSDT",
+    "XMRUSDT","FTMUSDT","SNXUSDT","DYDXUSDT","GMTUSDT","HBARUSDT","THETAUSDT","AXSUSDT","FLOWUSDT","KAVAUSDT",
+    "GALAUSDT","CHZUSDT","RNDRUSDT","SANDUSDT","MANAUSDT","1INCHUSDT","COMPUSDT","TOMOUSDT","VETUSDT","BLURUSDT",
+    "STRKUSDT","ZRXUSDT","APTUSDT","NEARUSDT","ICPUSDT"
 ]
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -171,12 +177,18 @@ async def worker():
     ex = await create_exchange()
     cd = {}
     prefs = {"BTC_CALM_REQUIRED": True}
-    BATCH = 8
+    BATCH = 4
     idx = 0
-    print(f"Bot Started • symbols={len(SYMBOLS)} • batch={BATCH}")
+    logging.info("Bot Started • 45 coins • 4/30s • 70 score • sleep 00-07 UTC")
 
     try:
         while True:
+            utc_hour = datetime.utcnow().hour
+            if 0 <= utc_hour < 7:          # night mode
+                logging.info("Night mode – sleeping 30 min")
+                await asyncio.sleep(1800)
+                continue
+
             batch = SYMBOLS[idx:idx+BATCH] if idx+BATCH <= len(SYMBOLS) else SYMBOLS[idx:] + SYMBOLS[:idx+BATCH-len(SYMBOLS)]
             for sym in batch:
                 if cd.get(sym, 0) > time.time():
@@ -195,7 +207,7 @@ async def worker():
                     await send_telegram(msg)
                     log_signal(now_ts(), sym, price, score, mode, reason, tp, sl)
                     cd[sym] = time.time() + COOLDOWN_SECONDS
-                await asyncio.sleep(0.07)
+                await asyncio.sleep(0.2)
             idx = (idx + BATCH) % len(SYMBOLS)
             await asyncio.sleep(CYCLE_TIME)
     except Exception as e:
@@ -206,7 +218,7 @@ async def worker():
         except: pass
 
 # -------------------------------------------------
-# Health Server (same loop, no thread)
+# Health Server
 # -------------------------------------------------
 async def health_handler(_):
     return web.Response(text="ok")
@@ -218,15 +230,15 @@ async def start_health_app():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 7500)))
     await site.start()
-    logging.info("Health server running on port %s", os.getenv("PORT", 7500))
+    logging.info("Health server on port %s", os.getenv("PORT", 7500))
 
 # -------------------------------------------------
 # Main Entry
 # -------------------------------------------------
 async def main():
     logging.basicConfig(level=logging.INFO)
-    await start_health_app()   # start health endpoint
-    await worker()             # your bot loop
+    await start_health_app()
+    await worker()
 
 if __name__ == "__main__":
     asyncio.run(main())
