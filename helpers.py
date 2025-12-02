@@ -1,5 +1,5 @@
-# helpers.py — FINAL (Top-tier GPT: CoT, Tools, Memory, Feedback, Ensemble, Pydantic)
-import time, html, json, hashlib, logging
+# helpers.py — FINAL (atr added + world-top GPT features)
+import time, html, json, hashlib, logging, os, random
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
@@ -84,6 +84,26 @@ def rsi_from_closes(closes: List[float], period: int = 14) -> float:
         return 100.0
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
+
+# ---------- ATR (missing function added) ----------
+def atr(ohlc: List[List[float]], period: int = 14) -> float:
+    if len(ohlc) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(ohlc)):
+        high, low, prev_close = ohlc[i][2], ohlc[i][3], ohlc[i-1][4]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    if not trs:
+        return 0.0
+    if len(trs) < period:
+        return sum(trs) / len(trs)
+    seed = sum(trs[:period]) / period
+    atr_val = seed
+    k = 2 / (period + 1)
+    for tr in trs[period:]:
+        atr_val = tr * k + atr_val * (1 - k)
+    return atr_val
 
 # ---------- 58 logic desc ----------
 LOGIC_DESC = {
@@ -244,14 +264,12 @@ async def ensemble_score(symbol: str, price: float, metrics: dict, prefs: dict, 
         return {"score": 0, "mode": "quick", "reason": "ensemble fail"}
     score_vals = [s["score"] for s in scores]
     final_score = int(round(sum(score_vals) / len(score_vals)))
-    # pick mode by median
     mode_vals = [s["mode"] for s in scores]
     final_mode = sorted(mode_vals)[len(mode_vals) // 2]
     return {"score": final_score, "mode": final_mode, "reason": scores[0]["reason"]}
 
 # ---------- single GPT call (CoT + tools + memory + feedback) ----------
 async def ai_score_symbol_with_memory_and_tools(symbol: str, price: float, metrics: dict, prefs: dict, ttl: int = 120) -> Optional[dict]:
-    # cache
     fingerprint = f"{symbol}|{round(price,6)}|{round(metrics.get('rsi_1m',50),2)}|{round(metrics.get('spread_pct',0),4)}"
     key = CACHE.make_key("ai", fingerprint)
     cached = CACHE.get(key)
