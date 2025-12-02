@@ -1,4 +1,4 @@
-# main.py — FINAL (Sync health, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
+# main.py — FINAL (Stopping-proof, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -35,8 +35,9 @@ SYMBOLS = [
     "STRKUSDT","ZRXUSDT","APTUSDT","NEARUSDT","ICPUSDT"
 ]
 
-# ------------------------- SQLite -------------------------
 DB_PATH = os.getenv("SIGNAL_DB", "signals.db")
+
+# ------------------------- SQLite -------------------------
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 cur.execute("""
@@ -159,7 +160,7 @@ def build_message_plain(sym, price, score, mode, reason, tp, sl):
         f"{human_time()}  Cooldown: {COOLDOWN_SECONDS//60}m"
     )
 
-# ------------------------- Health (SYNC) -------------------------
+# ------------------------- Health (SYNC + 0.0.0.0) -------------------------
 def health_handler(request):
     return web.Response(text="ok")
 
@@ -217,11 +218,11 @@ async def worker():
         try: await exchange.close()
         except: pass
 
-# ------------------------- Main -------------------------
+# ------------------------- Main (health FIRST) -------------------------
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    await start_health_app()
-    await worker()
+    await start_health_app()   # ➜ আগে চালু
+    await worker()             # ➜ পরে চালু
 
 if __name__ == "__main__":
     try:
