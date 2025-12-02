@@ -1,4 +1,4 @@
-import os, asyncio, aiohttp
+import os, asyncio, aiohttp, time, hmac, hashlib
 from dotenv import load_dotenv
 load_dotenv()
 from helpers import (
@@ -8,7 +8,9 @@ from helpers import (
 )
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT  = os.getenv("TELEGRAM_CHAT_ID")
+CHAT = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SEC = os.getenv("BINANCE_SECRET")
 INTERVAL = 7
 
 WATCHLIST = [
@@ -25,69 +27,108 @@ async def send(msg):
     async with aiohttp.ClientSession() as s:
         await s.post(url, json={"chat_id": CHAT, "text": msg, "parse_mode": "HTML"})
 
+def sign(query_string):
+    return hmac.new(API_SEC.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+
+async def retry_get(session, url, params=None, headers=None, max_retry=5):
+    for attempt in range(max_retry):
+        try:
+            async with session.get(url, params=params, headers=headers, timeout=10) as r:
+                data = await r.json()
+                if isinstance(data, dict) and data.get("code"):
+                    print("Binance error", data, "retry", attempt + 1)
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return data
+        except Exception as e:
+            print("Retry ex", e, attempt + 1)
+            await asyncio.sleep(2 ** attempt)
+    return None
+
 async def get_ema(session, symbol, interval, length=20):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={length}"
-    async with session.get(url, timeout=5) as r:
-        k = await r.json()
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": str(length)}
+    headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
+    k = await retry_get(session, url, params, headers)
     if not isinstance(k, list) or len(k) < length:
         return None
-    closes = [float(x[4]) for x in k]
+    try:
+        closes = [float(x[4]) for x in k]
+    except (ValueError, TypeError, IndexError):
+        return None
     return ema(closes, length)
 
 async def get_btc_1h_change(session):
-    url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
-    async with session.get(url, timeout=5) as r:
-        k = await r.json()
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": "BTCUSDT", "interval": "1h", "limit": "2"}
+    headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
+    k = await retry_get(session, url, params, headers)
     if not isinstance(k, list) or len(k) < 2:
         return 0
-    return (float(k[-1][4]) - float(k[-2][4])) / float(k[-2][4]) * 100
+    try:
+        return (float(k[-1][4]) - float(k[-2][4])) / float(k[-2][4]) * 100
+    except Exception:
+        return 0
 
 async def get_spread(session, symbol):
-    url = f"https://api.binance.com/api/v3/ticker/bookTicker?symbol={symbol}"
-    async with session.get(url, timeout=5) as r:
-        d = await r.json()
-    bid = float(d.get("bidPrice", 0))
-    ask = float(d.get("askPrice", 0))
-    return (ask - bid) / ask if ask else 0
+    url = "https://api.binance.com/api/v3/ticker/bookTicker"
+    params = {"symbol": symbol}
+    headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
+    d = await retry_get(session, url, params, headers)
+    if not isinstance(d, dict):
+        return 0
+    try:
+        bid = float(d.get("bidPrice", 0))
+        ask = float(d.get("askPrice", 0))
+        return (ask - bid) / ask if ask else 0
+    except Exception:
+        return 0
 
 async def get_depth_imbalance(session, symbol):
-    url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=20"
-    async with session.get(url, timeout=5) as r:
-        d = await r.json()
-    bids = d.get("bids", [])[:5]
-    asks = d.get("asks", [])[:5]
-    bid_vol = sum(float(q) for _, q in bids)
-    ask_vol = sum(float(q) for _, q in asks)
-    ratio = bid_vol / ask_vol if ask_vol else 1
-    return ratio > 3 or ratio < 0.33
+    url = "https://api.binance.com/api/v3/depth"
+    params = {"symbol": symbol, "limit": "20"}
+    headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
+    d = await retry_get(session, url, params, headers)
+    if not isinstance(d, dict):
+        return False
+    try:
+        bids = d.get("bids", [])[:5]
+        asks = d.get("asks", [])[:5]
+        bid_vol = sum(float(q) for _, q in bids)
+        ask_vol = sum(float(q) for _, q in asks)
+        ratio = bid_vol / ask_vol if ask_vol else 1
+        return ratio > 3 or ratio < 0.33
+    except Exception:
+        return False
 
 async def get_data(session, symbol):
     try:
-        k_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=30"
-        async with session.get(k_url, timeout=5) as r:
-            kl = await r.json()
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": "1m", "limit": "30"}
+        headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
+        kl = await retry_get(session, url, params, headers)
         if not isinstance(kl, list) or len(kl) < 3:
             return None
-        price = float(kl[-1][4])
-        prev  = float(kl[-2][4])
-        vol_1m = float(kl[-1][5])
-        if vol_1m < 5:
+        try:
+            price = float(kl[-1][4])
+            prev = float(kl[-2][4])
+            vol_1m = float(kl[-1][5])
+        except Exception as e:
+            print("Bad kline", symbol, e)
             return None
         ema_15m = await get_ema(session, symbol, "15m", 20) or price
-        ema_1h  = await get_ema(session, symbol, "1h",  20) or price
-        ema_4h  = await get_ema(session, symbol, "4h",  20) or price
-        ema_8h  = await get_ema(session, symbol, "4h",  40) or price
-        spread  = await get_spread(session, symbol)
-        btc_ch  = await get_btc_1h_change(session)
+        ema_1h = await get_ema(session, symbol, "1h", 20) or price
+        ema_4h = await get_ema(session, symbol, "4h", 20) or price
+        ema_8h = await get_ema(session, symbol, "4h", 40) or price
+        spread = await get_spread(session, symbol)
+        btc_ch = await get_btc_1h_change(session)
         liq_wall = await get_depth_imbalance(session, symbol)
 
         live = {
             "price": price, "ema_15m": ema_15m, "ema_1h": ema_1h, "ema_4h": ema_4h, "ema_8h": ema_8h,
             "trend": "bull_break" if price >= prev else "reject", "trend_strength": abs(price - prev) / price,
             "micro_pb": price > prev and price > ema_15m,
-            "exhaustion": calc_exhaustion(kl),
-            "fvg": calc_fvg(kl),
-            "orderblock": calc_ob(kl),
+            "exhaustion": calc_exhaustion(kl[-1]), "fvg": calc_fvg(kl), "orderblock": calc_ob(kl),
             "vol_1m": vol_1m, "vol_5m": sum(float(x[5]) for x in kl),
             "adr_ok": True, "atr_expanding": True,
             "spread": spread, "btc_calm": abs(btc_ch) < 1.5, "kill_primary": False,
@@ -97,7 +138,7 @@ async def get_data(session, symbol):
         }
         return live, price, prev
     except Exception as e:
-        print("get_data err", symbol, e)
+        print("get_data ex", symbol, e)
         return None
 
 async def handle_symbol(session, symbol):
@@ -123,7 +164,7 @@ async def handle_symbol(session, symbol):
             print("Signal", symbol, side, mode, score, lev)
 
 async def scanner():
-    print("🚀 REAL-30-LOGIC BOT RUNNING")
+    print("🚀 REAL-30-LOGIC AUTH-BOT RUNNING")
     async with aiohttp.ClientSession() as s:
         while True:
             await asyncio.gather(*[handle_symbol(s, sym) for sym in WATCHLIST])
