@@ -1,9 +1,8 @@
-# main.py — 50 Coins + Quick/Mid/Trend + Buy/Sell + Binance Scanner
+# main.py — FIXED (NO index error, stable direction)
 
 import os
 import asyncio
 import aiohttp
-import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,7 +25,6 @@ WATCHLIST = [
 "CRVUSDT","SKLUSDT","ENSUSDT","XLMUSDT","XTZUSDT","CFXUSDT","KAVAUSDT","PEPEUSDT","SHIBUSDT"
 ]
 
-
 async def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     async with aiohttp.ClientSession() as s:
@@ -34,95 +32,113 @@ async def send_telegram(msg):
 
 
 async def get_data(session, symbol):
-    # ---- Binance klines ----
-    k_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=30"
-    ob_url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=20"
 
-    async with session.get(k_url) as r:
-        kl = await r.json()
+    try:
+        k_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=30"
+        async with session.get(k_url, timeout=5) as r:
+            kl = await r.json()
 
-    async with session.get(ob_url) as r:
-        ob = await r.json()
+        # যদি klines invalid হয় → skip
+        if not isinstance(kl, list) or len(kl) < 3:
+            return None
 
-    price = float(kl[-1][4])
-    prev  = float(kl[-2][4])
+        price = float(kl[-1][4])
+        prev  = float(kl[-2][4])
+        volume_1m = float(kl[-1][5])
 
-    spread = abs(float(ob["asks"][0][0]) - float(ob["bids"][0][0]))
+        # low volume হলে skip
+        if volume_1m < 5:
+            return None
 
-    live = {
-        "price": price,
-        "ema_15m": price,
-        "ema_1h": price,
-        "ema_4h": price,
-        "ema_8h": price,
+        # fake orderbook skip avoid
+        spread = abs(float(kl[-1][2]) - float(kl[-1][3])) / price
 
-        "trend": "bull_break" if price > prev else "reject",
-        "trend_strength": abs(price - prev) / price,
-        "micro_pb": price > prev,
-        "exhaustion": False,
-        "fvg": False,
-        "orderblock": False,
+        live = {
+            "price": price,
+            "ema_15m": price,
+            "ema_1h": price,
+            "ema_4h": price,
+            "ema_8h": price,
 
-        "vol_1m": sum(float(x[5]) for x in kl[-5:]),
-        "vol_5m": sum(float(x[5]) for x in kl),
+            "trend": "bull_break" if price >= prev else "reject",
+            "trend_strength": abs(price - prev) / price,
+            "micro_pb": price > prev,
+            "exhaustion": False,
+            "fvg": False,
+            "orderblock": False,
 
-        "adr_ok": True,
-        "atr_expanding": True,
+            "vol_1m": volume_1m,
+            "vol_5m": sum(float(x[5]) for x in kl),
 
-        "spread": spread,
-        "btc_calm": True,
-        "kill_primary": False,
+            "adr_ok": True,
+            "atr_expanding": True,
 
-        "wick_ratio": 1.0,
-        "liq_wall": False,
-        "liq_bend": False,
-        "wall_shift": False,
-        "speed_imbalance": False,
-        "absorption": False,
-        "liquidation_sweep": False,
-        "slippage": False,
-        "liq_dist": 0.4,
-        "taker_pressure": False
-    }
+            "spread": spread,
+            "btc_calm": True,
+            "kill_primary": False,
 
-    return live, price, prev
+            "wick_ratio": 1.0,
+            "liq_wall": False,
+            "liq_bend": False,
+            "wall_shift": False,
+            "speed_imbalance": False,
+            "absorption": False,
+            "liquidation_sweep": False,
+            "slippage": False,
+            "liq_dist": 0.4,
+            "taker_pressure": False
+        }
+
+        return live, price, prev
+
+    except Exception:
+        return None
+
+
 
 
 async def handle_symbol(session, symbol):
-    try:
-        live, price, prev = await get_data(session, symbol)
 
-        side = trade_side(price, prev, live['ema_1h'])
-        if not side:
-            print("No direction:", symbol)
-            return
+    data = await get_data(session, symbol)
+    if not data:
+        print("Skipping (no data):", symbol)
+        return
 
-        for mode in ["quick", "mid", "trend"]:
-            score = final_score(live)
+    live, price, prev = data
 
-            thresh = {"quick":55, "mid":62, "trend":70}[mode]
+    side = trade_side(price, prev, live["ema_1h"])
+    if not side:
+        print("No direction:", symbol)
+        return
 
-            if score >= thresh and cooldown_ok(symbol):
-                tp, sl = calc_tp_sl(price, mode)
-                update_cd(symbol)
+    # mode loop
+    for mode in ["quick", "mid", "trend"]:
 
-                msg = format_signal(symbol, side, mode, price, score, tp, sl, live['liq_dist'])
-                await send_telegram(msg)
+        score = final_score(live)
+        threshold = {"quick":55, "mid":62, "trend":70}[mode]
 
-                print("Signal ---->", symbol, side, mode, score)
-            else:
-                print("Skip:", symbol, score)
+        if score >= threshold and cooldown_ok(symbol):
 
-    except Exception as e:
-        print("Error:", symbol, e)
+            tp, sl = calc_tp_sl(price, mode)
+            update_cd(symbol)
+
+            msg = format_signal(
+                symbol, side, mode, price, score, tp, sl, live["liq_dist"]
+            )
+            await send_telegram(msg)
+
+            print("Signal --->", symbol, side, mode, score)
+
+        else:
+            print("Skip:", symbol, score)
+
 
 
 async def scanner():
-    print("🚀 30-Logic | Quick/Mid/Trend | Buy/Sell | Scanner Running...")
+    print("🚀 FIXED BOT RUNNING…")
     async with aiohttp.ClientSession() as session:
         while True:
-            tasks = [handle_symbol(session, s) for s in WATCHLIST]
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*[handle_symbol(session, s) for s in WATCHLIST])
             await asyncio.sleep(INTERVAL)
 
 
