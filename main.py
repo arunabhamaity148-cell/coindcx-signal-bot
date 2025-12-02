@@ -3,7 +3,8 @@ from dotenv import load_dotenv
 load_dotenv()
 from helpers import (
     final_score, calc_tp_sl, cooldown_ok, update_cd,
-    trade_side, format_signal, auto_leverage
+    trade_side, format_signal, auto_leverage, ema,
+    calc_exhaustion, calc_fvg, calc_ob
 )
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -31,7 +32,7 @@ async def get_ema(session, symbol, interval, length=20):
     if not isinstance(k, list) or len(k) < length:
         return None
     closes = [float(x[4]) for x in k]
-    return sum(closes[-length:]) / length     # real EMA approximation (sufficient)
+    return ema(closes, length)
 
 async def get_btc_1h_change(session):
     url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
@@ -48,6 +49,17 @@ async def get_spread(session, symbol):
     bid = float(d.get("bidPrice", 0))
     ask = float(d.get("askPrice", 0))
     return (ask - bid) / ask if ask else 0
+
+async def get_depth_imbalance(session, symbol):
+    url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=20"
+    async with session.get(url, timeout=5) as r:
+        d = await r.json()
+    bids = d.get("bids", [])[:5]
+    asks = d.get("asks", [])[:5]
+    bid_vol = sum(float(q) for _, q in bids)
+    ask_vol = sum(float(q) for _, q in asks)
+    ratio = bid_vol / ask_vol if ask_vol else 1
+    return ratio > 3 or ratio < 0.33
 
 async def get_data(session, symbol):
     try:
@@ -67,17 +79,21 @@ async def get_data(session, symbol):
         ema_8h  = await get_ema(session, symbol, "4h",  40) or price
         spread  = await get_spread(session, symbol)
         btc_ch  = await get_btc_1h_change(session)
+        liq_wall = await get_depth_imbalance(session, symbol)
 
         live = {
             "price": price, "ema_15m": ema_15m, "ema_1h": ema_1h, "ema_4h": ema_4h, "ema_8h": ema_8h,
             "trend": "bull_break" if price >= prev else "reject", "trend_strength": abs(price - prev) / price,
-            "micro_pb": price > prev and price > ema_15m, "exhaustion": False, "fvg": False, "orderblock": False,
+            "micro_pb": price > prev and price > ema_15m,
+            "exhaustion": calc_exhaustion(kl),
+            "fvg": calc_fvg(kl),
+            "orderblock": calc_ob(kl),
             "vol_1m": vol_1m, "vol_5m": sum(float(x[5]) for x in kl),
             "adr_ok": True, "atr_expanding": True,
             "spread": spread, "btc_calm": abs(btc_ch) < 1.5, "kill_primary": False,
-            "wick_ratio": 1.0, "liq_wall": False, "liq_bend": False, "wall_shift": False,
-            "speed_imbalance": False, "absorption": False, "liquidation_sweep": False,
-            "slippage": False, "liq_dist": 0.4, "taker_pressure": False
+            "wick_ratio": 1.0, "liq_wall": liq_wall, "liq_bend": False,
+            "wall_shift": False, "speed_imbalance": False, "absorption": False,
+            "liquidation_sweep": False, "slippage": False, "liq_dist": 0.4, "taker_pressure": False
         }
         return live, price, prev
     except Exception as e:
@@ -107,7 +123,7 @@ async def handle_symbol(session, symbol):
             print("Signal", symbol, side, mode, score, lev)
 
 async def scanner():
-    print("🚀 REAL-BOT RUNNING")
+    print("🚀 REAL-30-LOGIC BOT RUNNING")
     async with aiohttp.ClientSession() as s:
         while True:
             await asyncio.gather(*[handle_symbol(s, sym) for sym in WATCHLIST])
