@@ -4,6 +4,13 @@ load_dotenv()
 
 COOLDOWN = 1800
 last_signal = {}
+
+def cooldown_ok(symbol):
+    return (time.time() - last_signal.get(symbol, 0)) > COOLDOWN
+
+def update_cd(symbol):
+    last_signal[symbol] = time.time()
+
 MODE_THRESH = {"quick": 55, "mid": 62, "trend": 70}
 TP_SL = {"quick": (1.2, 0.7), "mid": (1.8, 1.0), "trend": (2.5, 1.2)}
 
