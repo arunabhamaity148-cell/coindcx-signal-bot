@@ -1,5 +1,11 @@
-# helpers.py — FINAL (atr added + relaxed filters + exact score)
-import os, time, json, html, hashlib, random, asyncio
+# helpers.py — FINAL (robust AI caller + deterministic fallback scorer + indicators + cache)
+import os
+import time
+import json
+import html
+import hashlib
+import random
+import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -28,22 +34,27 @@ def calc_tp_sl(price: float, mode: str):
     sl = price * (1 - cfg["sl_pct"] / 100.0)
     return round(tp, 8), round(sl, 8)
 
-# ---------- cache ----------
+# ---------- simple TTL cache ----------
 class SimpleCache:
     def __init__(self):
-        self.store = {}
+        self.store = {}  # key -> (expiry, value)
+
     def get(self, key):
         rec = self.store.get(key)
         if not rec:
             return None
         exp, val = rec
         if exp < time.time():
-            try: del self.store[key]
-            except: pass
+            try:
+                del self.store[key]
+            except KeyError:
+                pass
             return None
         return val
+
     def set(self, key, value, ttl_seconds: int):
         self.store[key] = (time.time() + ttl_seconds, value)
+
     def make_key(self, *parts) -> str:
         raw = "|".join([str(p) for p in parts])
         return hashlib.sha256(raw.encode()).hexdigest()
@@ -52,13 +63,17 @@ CACHE = SimpleCache()
 
 # ---------- indicators ----------
 def sma(values: list, period: int) -> float:
-    if not values: return 0.0
-    if len(values) < period: return sum(values) / len(values)
+    if not values:
+        return 0.0
+    if len(values) < period:
+        return sum(values) / len(values)
     return sum(values[-period:]) / period
 
 def compute_ema_from_closes(closes: list, period: int) -> float:
-    if not closes: return 0.0
-    if len(closes) < period: return sma(closes, period)
+    if not closes:
+        return 0.0
+    if len(closes) < period:
+        return sma(closes, period)
     seed = sum(closes[:period]) / period
     ema_val = seed
     k = 2 / (period + 1)
@@ -67,27 +82,31 @@ def compute_ema_from_closes(closes: list, period: int) -> float:
     return ema_val
 
 def rsi_from_closes(closes: list, period: int = 14) -> float:
-    if len(closes) < period + 1: return 50.0
+    if len(closes) < period + 1:
+        return 50.0
     gains, losses = [], []
     for i in range(1, len(closes)):
         ch = closes[i] - closes[i-1]
         gains.append(max(ch, 0)); losses.append(abs(min(ch, 0)))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0: return 100.0
+    if avg_loss == 0:
+        return 100.0
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------- ATR added ----------
 def atr(ohlc: list, period: int = 14) -> float:
-    if len(ohlc) < 2: return 0.0
+    if len(ohlc) < 2:
+        return 0.0
     trs = []
     for i in range(1, len(ohlc)):
         high, low, prev_close = ohlc[i][2], ohlc[i][3], ohlc[i-1][4]
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
-    if not trs: return 0.0
-    if len(trs) < period: return sum(trs) / len(trs)
+    if not trs:
+        return 0.0
+    if len(trs) < period:
+        return sum(trs) / len(trs)
     seed = sum(trs[:period]) / period
     atr_val = seed
     k = 2 / (period + 1)
@@ -95,10 +114,11 @@ def atr(ohlc: list, period: int = 14) -> float:
         atr_val = tr * k + atr_val * (1 - k)
     return atr_val
 
-# ---------- 58 logic desc ----------
+# ---------- logic descriptions ----------
 LOGIC_DESC = {
     "HTF_EMA_1h_15m": "1h vs 15m EMA alignment and slope",
     "HTF_EMA_1h_4h": "1h vs 4h EMA confluence",
+    "HTF_EMA_1h_8h": "1h vs 8h EMA confluence",
     "HTF_Structure_Break": "Breakout of HTF support/resistance",
     "Imbalance_FVG": "Fair-value gap / imbalance near price",
     "Trend_Continuation": "Current trend likely to continue",
@@ -137,39 +157,23 @@ LOGIC_DESC = {
     "30s_Recheck_Loop": "30s quick recheck rule",
     "Partial_Exit_Logic": "Partial take-profit logic",
     "BTC_Risk_Filter_L1": "BTC calm / volatility filter L1",
-    "BTC_Risk_FILTER_L2": "Stricter BTC risk filter L2",
     "BTC_Funding_OI_Combo": "BTC funding & OI combination",
     "Funding_Extreme": "Extreme funding rate signal",
-    "Funding_Delta_Speed": "Speed of funding change",
-    "Funding_Arbitrage": "Funding arbitrage signal",
     "OI_Spike_5pct": "OI spike >5% detection",
-    "OI_Spike_Sustained": "Sustained OI increase",
-    "ETH_BTC_Beta_Divergence": "ETH/BTC beta divergence",
-    "Options_Gamma_Flip": "Options gamma flip signal",
-    "Heatmap_Sweep": "Heatmap sweep on orderflow",
-    "Micro_Slip": "Micro execution slippage",
-    "Order_Block": "Order block detection",
-    "Score_Normalization": "Normalization step for scores",
     "Final_Signal_Score": "Final combined AI decision/confidence"
 }
 
 def logic_descriptions_text() -> str:
     return "\n".join([f"{k}: {v}" for k, v in LOGIC_DESC.items()])
 
-# ---------- RELAXED strict filters ----------
-def btc_calm_filter() -> bool:
-    # relaxed: always pass (no BTC volatility gate)
-    return True
-
+# ---------- relaxed filters (you can tune) ----------
 def spread_filter(metrics: dict) -> bool:
-    # relaxed: allow up to 0.12 % spread
-    return metrics.get("spread_pct", 999) < 0.12   # was 0.08
+    return metrics.get("spread_pct", 999) < 0.12
 
 def volume_spike_ok(metrics: dict) -> bool:
-    # relaxed: 1.2 x average volume
     vol = metrics.get("vol_1m", 0)
     base = metrics.get("vol_1m_avg_20", 0) or 1
-    return vol > base * 1.2   # was 1.5
+    return vol > base * 1.2
 
 def htf_alignment_score(metrics: dict) -> int:
     ema1h = metrics.get("ema_1h_50", 0)
@@ -182,14 +186,6 @@ def htf_alignment_score(metrics: dict) -> int:
             return 20
     return 0
 
-def funding_oi_filter(symbol: str) -> bool:
-    # relaxed: always pass (no funding/OI gate)
-    return True
-
-def kill_switch() -> bool:
-    # relaxed: no kill-switch
-    return False
-
 # ---------- memory ----------
 def get_memory(symbol: str) -> list:
     return CACHE.get(f"memory_{symbol}") or []
@@ -200,28 +196,11 @@ def append_memory(symbol: str, entry: dict, max_items: int = 5):
     mem = mem[-max_items:]
     CACHE.set(f"memory_{symbol}", mem, ttl_seconds=86400)
 
-# ---------- feedback ----------
+# ---------- feedback (dummy) ----------
 def get_trade_pnl(symbol: str, tp: float, sl: float, mode: str) -> float:
     return random.uniform(-1.0, 1.0)
 
-# ---------- pydantic ----------
-try:
-    from pydantic import BaseModel, Field
-    from typing import Literal
-    class Signal(BaseModel):
-        score: int = Field(ge=0, le=100)
-        mode: Literal["quick", "mid", "trend"]
-        reason: str = Field(max_length=64)
-except Exception:
-    Signal = None
-
-SYSTEM_PROMPT = (
-    "You are a senior quant at a top hedge fund specializing in crypto futures. "
-    "Use only evidence from provided metrics and follow instructions exactly. "
-    "RETURN A SINGLE-LINE JSON: {\"score\":int, \"mode\":\"quick|mid|trend\", \"reason\":\"max 8 words\"}."
-)
-
-# ---------- OpenAI caller ----------
+# ---------- OpenAI sync caller ----------
 def _call_openai_sync(prompt: str, model: Optional[str] = None, max_tokens: int = 300) -> str:
     try:
         from openai import OpenAI
@@ -230,21 +209,105 @@ def _call_openai_sync(prompt: str, model: Optional[str] = None, max_tokens: int 
         resp = client.responses.create(model=model_name, input=prompt, temperature=0, max_output_tokens=max_tokens)
         if hasattr(resp, "output_text") and resp.output_text:
             return resp.output_text.strip()
-        return json.dumps(resp.to_dict())
+        # try to return dict text
+        try:
+            return json.dumps(resp.to_dict())
+        except Exception:
+            return str(resp)
     except Exception:
         return ""
 
-# ---------- relaxed AI scorer ----------
+# ---------- deterministic fallback scorer (when AI fails or to validate) ----------
+def deterministic_score_from_metrics(metrics: dict, base: int = 0) -> dict:
+    """
+    Fast deterministic scorer used as fallback.
+    Returns {"score":int,"mode":"quick|mid|trend","reason":str}
+    """
+    score = int(base)
+    # EMA alignment
+    score += htf_alignment_score(metrics)
+    # RSI: favour moderate momentum (too extreme is penalized mildly)
+    rsi = metrics.get("rsi_1m", 50)
+    if 55 <= rsi <= 70:
+        score += 8
+    elif 45 <= rsi < 55:
+        score += 4
+    elif rsi > 70 or rsi < 30:
+        score -= 6
+
+    # ATR relative (smaller ATR = safer for quick signals)
+    closes = metrics.get("closes_1m") or []
+    atr_val = 0.0
+    try:
+        # if we have ohlc, user main.py stores closes only — use pct-based proxy
+        if "closes_1h" in metrics and metrics.get("price", 0):
+            # rough proxy: range of 1h / price
+            cl = metrics.get("closes_1h", [])[-20:]
+            if cl:
+                rng = max(cl) - min(cl)
+                atr_pct = (rng / (metrics.get("price") or 1)) * 100
+                if atr_pct < 0.5:
+                    score += 8
+                elif atr_pct < 1.2:
+                    score += 4
+                else:
+                    score -= 6
+    except Exception:
+        pass
+
+    # Spread penalty
+    spread = metrics.get("spread_pct", 0)
+    if spread > 0.08:
+        score -= int(min(25, (spread - 0.08) * 200))  # proportional penalty
+
+    # Volume bonus
+    vol = metrics.get("vol_1m", 0)
+    base_vol = metrics.get("vol_1m_avg_20", 0) or 1
+    if vol > base_vol * 2:
+        score += 12
+    elif vol > base_vol * 1.2:
+        score += 6
+
+    # Bound & choose mode
+    score = max(0, min(100, score))
+    if score > 85:
+        mode = "trend"
+    elif score > 65:
+        mode = "mid"
+    else:
+        mode = "quick"
+
+    reason = []
+    if htf_alignment_score(metrics) >= 20:
+        reason.append("HTF EMA alignment")
+    if vol > base_vol * 1.2:
+        reason.append("Volume spike")
+    if spread > 0.08:
+        reason.append("Wide spread")
+    if not reason:
+        reason = ["No strong edge"]
+    reason_text = ", ".join(reason[:3])
+    return {"score": score, "mode": mode, "reason": reason_text}
+
+# ---------- AI scorer with memory + robust parsing + fallback ----------
+SYSTEM_PROMPT = (
+    "You are a senior quant at a top hedge fund specializing in crypto futures. "
+    "Use only evidence from provided metrics and follow instructions exactly. "
+    "RETURN A SINGLE-LINE JSON: {\"score\":int, \"mode\":\"quick|mid|trend\", \"reason\":\"max 8 words\"}."
+)
+
 async def ai_score_symbol_with_memory_and_tools(symbol: str, price: float, metrics: dict, prefs: dict, ttl: int = 120) -> Optional[dict]:
+    """
+    Try AI ensemble call (single). If AI fails or returns invalid, use deterministic fallback.
+    Uses CACHE to avoid repeated calls.
+    """
     fingerprint = f"{symbol}|{round(price,6)}|{round(metrics.get('rsi_1m',50),2)}|{round(metrics.get('spread_pct',0),4)}"
     key = CACHE.make_key("ai", fingerprint)
     cached = CACHE.get(key)
     if cached:
         return cached
 
-    # relaxed filters (always pass)
     base = htf_alignment_score(metrics)
-
     memory = get_memory(symbol)
     pnl = get_trade_pnl(symbol, calc_tp_sl(price, "mid")[0], calc_tp_sl(price, "mid")[1], "mid")
 
@@ -264,37 +327,50 @@ async def ai_score_symbol_with_memory_and_tools(symbol: str, price: float, metri
         "Return EXACT single-line JSON only."
     )
 
+    # call OpenAI in thread to avoid blocking event loop
+    raw = ""
     try:
         raw = await asyncio.to_thread(_call_openai_sync, prompt, os.getenv("OPENAI_MODEL", "gpt-4o-mini"), 300)
-        parsed = None
+    except Exception:
+        raw = ""
+
+    parsed = None
+    if raw:
+        # try strict json first
         try:
             parsed = json.loads(raw.strip())
         except Exception:
-            import re
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            if m:
-                try:
+            # attempt to extract JSON substring
+            try:
+                import re
+                m = re.search(r"\{(?:[^{}]|(?R))*\}", raw, re.DOTALL)
+                if not m:
+                    # fallback simple match
+                    m = re.search(r"\{.*\}", raw, re.DOTALL)
+                if m:
                     parsed = json.loads(m.group(0))
-                except Exception:
-                    parsed = None
-        if parsed and isinstance(parsed, dict) and {"score", "mode", "reason"} <= set(parsed.keys()):
-            if Signal:
-                try:
-                    sig = Signal(**parsed)
-                    out = sig.dict()
-                except Exception:
-                    out = {"score": int(parsed.get("score", 0)), "mode": str(parsed.get("mode", "quick")), "reason": str(parsed.get("reason",""))}
-            else:
-                out = {"score": int(parsed.get("score", 0)), "mode": str(parsed.get("mode", "quick")), "reason": str(parsed.get("reason",""))}
+            except Exception:
+                parsed = None
+
+    if parsed and isinstance(parsed, dict) and {"score", "mode", "reason"} <= set(parsed.keys()):
+        try:
+            out = {"score": int(parsed.get("score", 0)), "mode": str(parsed.get("mode", "quick")), "reason": str(parsed.get("reason",""))}
+            # sanitize mode
+            if out["mode"] not in ("quick","mid","trend"):
+                out["mode"] = "quick"
             CACHE.set(key, out, ttl_seconds=ttl)
             append_memory(symbol, out)
             return out
-    except Exception:
-        pass
+        except Exception:
+            parsed = None
 
-    return None
+    # If AI failed or returned invalid -> deterministic fallback
+    fallback = deterministic_score_from_metrics(metrics, base=base)
+    CACHE.set(key, fallback, ttl_seconds=ttl)
+    append_memory(symbol, fallback)
+    return fallback
 
-# ---------- ensemble ----------
+# ---------- ensemble (multiple independent calls) ----------
 async def ensemble_score(symbol: str, price: float, metrics: dict, prefs: dict, n: int = 3) -> dict:
     scores = []
     for _ in range(n):
