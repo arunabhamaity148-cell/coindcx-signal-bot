@@ -1,10 +1,8 @@
-# helpers.py — FINAL (indicators, prompt builder, TP/SL, cache)
+# helpers.py — FINAL (indicators, prompt builder, TP/SL, small TTL cache)
 import time, html, json, hashlib
 from typing import Dict, List
 
-# -------------------------
-# Time / small utils
-# -------------------------
+# ---- time utils ----
 def now_ts() -> int:
     return int(time.time())
 
@@ -16,9 +14,7 @@ def human_time(ts: int = None) -> str:
 def esc(x) -> str:
     return html.escape("" if x is None else str(x))
 
-# -------------------------
-# TP/SL (mode-based)
-# -------------------------
+# ---- TP/SL ----
 TP_SL_RULES = {
     "quick": {"tp_pct": 1.6, "sl_pct": 1.0},
     "mid":   {"tp_pct": 2.0, "sl_pct": 1.0},
@@ -31,38 +27,29 @@ def calc_tp_sl(price: float, mode: str):
     sl = price * (1 - cfg["sl_pct"]/100.0)
     return round(tp, 8), round(sl, 8)
 
-# -------------------------
-# Simple in-memory TTL cache
-# -------------------------
+# ---- simple TTL cache (in-memory) ----
 class SimpleCache:
     def __init__(self):
         self.store = {}  # key -> (expiry, value)
-
     def get(self, key):
         rec = self.store.get(key)
         if not rec:
             return None
         exp, val = rec
         if exp < time.time():
-            try:
-                del self.store[key]
-            except KeyError:
-                pass
+            try: del self.store[key]
+            except: pass
             return None
         return val
-
     def set(self, key, value, ttl_seconds: int):
         self.store[key] = (time.time() + ttl_seconds, value)
-
     def make_key(self, *parts) -> str:
         raw = "|".join([str(p) for p in parts])
         return hashlib.sha256(raw.encode()).hexdigest()
 
 CACHE = SimpleCache()
 
-# -------------------------
-# Basic indicators (lightweight)
-# -------------------------
+# ---- indicators (lightweight) ----
 def sma(values: List[float], period: int) -> float:
     if not values:
         return 0.0
@@ -87,16 +74,13 @@ def atr(ohlc: List[List[float]], period: int = 14) -> float:
         return 0.0
     trs = []
     for i in range(1, len(ohlc)):
-        high = ohlc[i][2]
-        low = ohlc[i][3]
-        prev_close = ohlc[i-1][4]
+        high = ohlc[i][2]; low = ohlc[i][3]; prev_close = ohlc[i-1][4]
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
     if not trs:
         return 0.0
     if len(trs) < period:
         return sum(trs) / len(trs)
-    # EMA of TRs
     seed = sum(trs[:period]) / period
     atr_val = seed
     k = 2 / (period + 1)
@@ -107,16 +91,13 @@ def atr(ohlc: List[List[float]], period: int = 14) -> float:
 def rsi_from_closes(closes: List[float], period: int = 14) -> float:
     if len(closes) < period + 1:
         return 50.0
-    gains = []
-    losses = []
+    gains = []; losses = []
     for i in range(1, len(closes)):
         ch = closes[i] - closes[i-1]
         if ch > 0:
-            gains.append(ch)
-            losses.append(0)
+            gains.append(ch); losses.append(0)
         else:
-            gains.append(0)
-            losses.append(abs(ch))
+            gains.append(0); losses.append(abs(ch))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
@@ -124,9 +105,7 @@ def rsi_from_closes(closes: List[float], period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# -------------------------
-# 58 logic short descriptions (for prompt)
-# -------------------------
+# ---- logic descriptions (short) ----
 LOGIC_DETAILS = {
     "HTF_EMA_1h_15m": "1h vs 15m EMA alignment and slope",
     "HTF_EMA_1h_4h": "1h vs 4h EMA confluence",
@@ -194,11 +173,9 @@ def logic_descriptions_text() -> str:
         parts.append(f"{k}: {v}")
     return "\n".join(parts)
 
-# -------------------------
-# Build AI prompt
-# -------------------------
+# ---- prompt builder ----
 def build_ai_prompt(symbol: str, price: float, metrics: Dict, prefs: Dict) -> str:
-    # Keep arrays small in prompt (trim to last 20)
+    # keep arrays short
     small = {}
     for k, v in metrics.items():
         if isinstance(v, list):
