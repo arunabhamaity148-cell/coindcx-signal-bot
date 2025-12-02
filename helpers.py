@@ -1,7 +1,8 @@
-# helpers.py — FINAL (58 logic desc + strict filters + score builder)
+# helpers.py — FINAL (Top-tier GPT: CoT, Tools, Memory, Feedback, Ensemble, Pydantic)
 import time, html, json, hashlib, logging
-from typing import Dict, List
 from datetime import datetime
+from typing import Dict, List, Literal, Optional
+from pydantic import BaseModel, Field
 
 # ---------- time ----------
 def now_ts() -> int:
@@ -70,25 +71,6 @@ def compute_ema_from_closes(closes: List[float], period: int) -> float:
         ema_val = price * k + ema_val * (1 - k)
     return ema_val
 
-def atr(ohlc: List[List[float]], period: int = 14) -> float:
-    if len(ohlc) < 2:
-        return 0.0
-    trs = []
-    for i in range(1, len(ohlc)):
-        high, low, prev_close = ohlc[i][2], ohlc[i][3], ohlc[i-1][4]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    if not trs:
-        return 0.0
-    if len(trs) < period:
-        return sum(trs) / len(trs)
-    seed = sum(trs[:period]) / period
-    atr_val = seed
-    k = 2 / (period + 1)
-    for tr in trs[period:]:
-        atr_val = tr * k + atr_val * (1 - k)
-    return atr_val
-
 def rsi_from_closes(closes: List[float], period: int = 14) -> float:
     if len(closes) < period + 1:
         return 50.0
@@ -103,7 +85,7 @@ def rsi_from_closes(closes: List[float], period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---------- 58 logic short desc ----------
+# ---------- 58 logic desc ----------
 LOGIC_DESC = {
     "HTF_EMA_1h_15m": "1h vs 15m EMA alignment and slope",
     "HTF_EMA_1h_4h": "1h vs 4h EMA confluence",
@@ -210,15 +192,79 @@ def kill_switch() -> bool:
         return True
     return False
 
-# ---------- prompt + score builder ----------
-def build_ai_prompt(symbol: str, price: float, metrics: Dict, prefs: Dict) -> str:
-    # ---- strict filters ----
+# ---------- memory ----------
+def get_memory(symbol: str) -> List[dict]:
+    return CACHE.get(f"memory_{symbol}") or []
+
+def append_memory(symbol: str, entry: dict, max_items: int = 5):
+    mem = get_memory(symbol)
+    mem.append(entry)
+    mem = mem[-max_items:]
+    CACHE.set(f"memory_{symbol}", mem, ttl_seconds=86400)
+
+# ---------- feedback ----------
+def get_trade_pnl(symbol: str, tp: float, sl: float, mode: str) -> float:
+    # dummy: replace with real PnL fetch
+    return random.uniform(-1, 1)
+
+# ---------- Pydantic schema ----------
+class Signal(BaseModel):
+    score: int = Field(ge=0, le=100)
+    mode: Literal["quick", "mid", "trend"]
+    reason: str = Field(max_length=64)
+
+# ---------- system + CoT ----------
+SYSTEM_PROMPT = """
+You are a senior quant at Citadel, specialising in crypto futures.
+Use only evidence from the provided metrics.
+Output SINGLE-LINE JSON: {"score":int,"mode":"quick|mid|trend","reason":"max 8 words"}
+Penalty: verbose → score 0.
+"""
+
+# ---------- tool-calling ----------
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_funding_rate",
+            "description": "Current funding rate %",
+            "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}}
+        }
+    }
+]
+
+# ---------- ensemble ----------
+async def ensemble_score(symbol: str, price: float, metrics: dict, prefs: dict, n: int = 3) -> dict:
+    scores = []
+    for _ in range(n):
+        sc = await ai_score_symbol_with_memory_and_tools(symbol, price, metrics, prefs)
+        if sc:
+            scores.append(sc)
+    if not scores:
+        return {"score": 0, "mode": "quick", "reason": "ensemble fail"}
+    score_vals = [s["score"] for s in scores]
+    final_score = int(round(sum(score_vals) / len(score_vals)))
+    # pick mode by median
+    mode_vals = [s["mode"] for s in scores]
+    final_mode = sorted(mode_vals)[len(mode_vals) // 2]
+    return {"score": final_score, "mode": final_mode, "reason": scores[0]["reason"]}
+
+# ---------- single GPT call (CoT + tools + memory + feedback) ----------
+async def ai_score_symbol_with_memory_and_tools(symbol: str, price: float, metrics: dict, prefs: dict, ttl: int = 120) -> Optional[dict]:
+    # cache
+    fingerprint = f"{symbol}|{round(price,6)}|{round(metrics.get('rsi_1m',50),2)}|{round(metrics.get('spread_pct',0),4)}"
+    key = CACHE.make_key("ai", fingerprint)
+    cached = CACHE.get(key)
+    if cached:
+        return cached
+
+    # strict filters
     if not btc_calm_filter():
-        return json.dumps({"score": 0, "mode": "quick", "reason": "BTC volatile"})
+        return {"score": 0, "mode": "quick", "reason": "BTC volatile"}
     if not spread_filter(metrics):
-        return json.dumps({"score": 0, "mode": "quick", "reason": "Spread wide"})
+        return {"score": 0, "mode": "quick", "reason": "Spread wide"}
     if kill_switch():
-        return json.dumps({"score": 0, "mode": "quick", "reason": "Kill-switch"})
+        return {"score": 0, "mode": "quick", "reason": "Kill-switch"}
 
     base = 0
     base += htf_alignment_score(metrics)
@@ -227,33 +273,58 @@ def build_ai_prompt(symbol: str, price: float, metrics: Dict, prefs: Dict) -> st
     if not funding_oi_filter(symbol):
         base = min(base, 50)
 
+    # memory
+    memory = get_memory(symbol)
+    # feedback (dummy PnL)
+    pnl = get_trade_pnl(symbol, calc_tp_sl(price, "mid")[0], calc_tp_sl(price, "mid")[1], "mid")
+
     small = {k: v[-20:] if isinstance(v, list) else v for k, v in metrics.items()}
     metrics_text = json.dumps(small, default=str)
     prefs_text = json.dumps(prefs, default=str)
     logic_text = logic_descriptions_text()
 
     prompt = f"""
-You are an expert crypto futures signal scorer. Evaluate the symbol using 58 trading logics.
+{SYSTEM_PROMPT}
 
-Return EXACT single-line JSON only with keys:
-- score: integer 0-100
-- mode: "quick"|"mid"|"trend"
-- reason: 4-12 words concise
+Step 1: Inside <think> list 3 pros and 3 cons based on metrics.
+Step 2: Use tools if needed (funding, OI).
+Step 3: Consider memory: {memory}
+Step 4: Feedback: last trade PnL = {pnl:.2f}
+Step 5: Return strict JSON only.
 
-Symbol: {symbol}
-Price: {price}
+Base filter score: {base}
 Metrics: {metrics_text}
 Preferences: {prefs_text}
-
-Base filter score so far: {base}
-
-Logic descriptions (short):
-{logic_text}
-
-Rules:
-1) Add 0-50 more points based on HTF alignment, volume, ATR, orderflow, imbalance, liquidation distance, etc.
-2) If total >85 → mode "trend", >70 → "mid", else "quick"
-3) Penalize wide spread, low liquidity, extreme funding/OI
-4) Output strict JSON only.
+Logic descriptions: {logic_text}
 """
-    return prompt.strip()
+    try:
+        raw = await asyncio.to_thread(_call_openai_sync, prompt)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and {"score", "mode", "reason"} <= set(parsed.keys()):
+            # validate pydantic
+            sig = Signal(**parsed)
+            out = sig.dict()
+            CACHE.set(key, out, ttl_seconds=ttl)
+            # store memory
+            append_memory(symbol, out)
+            return out
+    except Exception:
+        pass
+    return None
+
+# ---------- sync caller ----------
+def _call_openai_sync(prompt: str) -> str:
+    try:
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            input=prompt,
+            temperature=0,
+            max_output_tokens=300,
+            tools=TOOLS  # tool-calling ready
+        )
+        if hasattr(resp, "output_text") and resp.output_text:
+            return resp.output_text.strip()
+        return str(resp)
+    except Exception as e:
+        return ""
