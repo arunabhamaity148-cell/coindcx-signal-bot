@@ -1,11 +1,11 @@
-# main.py — TOP (already present check)
+# main.py — FINAL (IST 00:00–07:00 OFF, Ensemble scoring, health endpoint, minimal logs)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
 import aiohttp
 import pytz
-import ccxt.async_support as ccxt  
+import ccxt.async_support as ccxt
 
 load_dotenv()
 
@@ -14,12 +14,12 @@ from helpers import (
     compute_ema_from_closes, atr, rsi_from_closes
 )
 
-# ------------------------- ENV -------------------------
+# ------------------------- ENV / CONFIG -------------------------
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID          = os.getenv("CHAT_ID", "").strip()
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-CYCLE_TIME       = int(os.getenv("CYCLE_TIME", "60"))
+CYCLE_TIME       = int(os.getenv("CYCLE_TIME", "60"))        # seconds between batches
 SCORE_THRESHOLD  = int(os.getenv("SCORE_THRESHOLD", "70"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))
 USE_TESTNET      = os.getenv("USE_TESTNET", "true").lower() in ("1", "true", "yes")
@@ -27,6 +27,9 @@ BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "3"))
 
+DB_PATH = os.getenv("SIGNAL_DB", "signals.db")
+
+# ------------------------- SYMBOL LIST -------------------------
 SYMBOLS = [
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
     "LTCUSDT","LINKUSDT","ATOMUSDT","ETCUSDT","OPUSDT","INJUSDT","SUIUSDT","AAVEUSDT","CRVUSDT","RUNEUSDT",
@@ -35,8 +38,7 @@ SYMBOLS = [
     "STRKUSDT","ZRXUSDT","APTUSDT","NEARUSDT","ICPUSDT"
 ]
 
-# ------------------------- SQLite -------------------------
-DB_PATH = os.getenv("SIGNAL_DB", "signals.db")
+# ------------------------- DB / Logging -------------------------
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 cur.execute("""
@@ -78,7 +80,7 @@ async def create_exchange():
         ex.secret = BINANCE_API_SECRET
     return ex
 
-# ------------------------- Snapshot -------------------------
+# ------------------------- Snapshot (cached small TTL) -------------------------
 async def fetch_snapshot(exchange, symbol):
     key = CACHE.make_key("snap", symbol)
     cached = CACHE.get(key)
@@ -99,7 +101,7 @@ async def fetch_snapshot(exchange, symbol):
         ob = await exchange.fetch_order_book(symbol, 5)
         if ob.get("bids") and ob.get("asks"):
             bid, ask = ob["bids"][0][0], ob["asks"][0][0]
-            mid = (bid + ask) / 2.0
+            mid = (bid + ask) / 2.0 if (bid + ask) else 1.0
             spread_pct = abs(ask - bid) / mid * 100.0
     except Exception:
         spread_pct = 0.0
@@ -137,7 +139,7 @@ async def fetch_snapshot(exchange, symbol):
     CACHE.set(key, out, ttl_seconds=3)
     return out
 
-# ------------------------- Telegram -------------------------
+# ------------------------- Telegram (plain text) -------------------------
 async def send_telegram(msg: str):
     if not BOT_TOKEN or not CHAT_ID:
         return
@@ -159,73 +161,84 @@ def build_message_plain(sym, price, score, mode, reason, tp, sl):
         f"{human_time()}  Cooldown: {COOLDOWN_SECONDS//60}m"
     )
 
-# ------------------------- Test Endpoint -------------------------
-def handle_test(request):
-    return web.Response(text="Test endpoint works")
-
-# ------------------------- Worker (with SKIP logs) -------------------------
-async def worker():
-    exchange = await create_exchange()
-    cd = {}
-    prefs = {"BTC_CALM_REQUIRED": True}
-    idx = 0
-    IST = pytz.timezone("Asia/Kolkata")
-    logging.info("Bot started • IST 00-07 OFF • 45 coins • 3/60s • 70 score • Ensemble 3-vote")
-
-    try:
-        while True:
-            now_ist = datetime.now(IST)
-            if 0 <= now_ist.hour < 7:          # IST night off
-                logging.info("Night mode (IST 00-07) – sleeping 30 min")
-                await asyncio.sleep(1800)
-                continue
-
-            batch = SYMBOLS[idx:idx+BATCH_SIZE] if idx+BATCH_SIZE <= len(SYMBOLS) else SYMBOLS[idx:] + SYMBOLS[:(idx+BATCH_SIZE)-len(SYMBOLS)]
-            for sym in batch:
-                if cd.get(sym, 0) > time.time():
-                    logging.info("SKIP %s — cooldown active", sym)
-                    continue
-                snap = await fetch_snapshot(exchange, sym)
-                price = snap["price"]
-                metrics = snap["metrics"]
-                parsed = await ensemble_score(sym, price, metrics, prefs, n=3)
-                if not parsed:
-                    logging.info("SKIP %s — ensemble failed", sym)
-                    await asyncio.sleep(0.05)
-                    continue
-                score = int(parsed.get("score", 0))
-                mode = parsed.get("mode", "quick")
-                reason = parsed.get("reason", "")
-                if score < SCORE_THRESHOLD:
-                    logging.info("SKIP %s — score %d < threshold %d", sym, score, SCORE_THRESHOLD)
-                    await asyncio.sleep(0.08)
-                    continue
-                tp, sl = calc_tp_sl(price, mode)
-                msg = build_message_plain(sym, price, score, mode, reason, tp, sl)
-                await send_telegram(msg)
-                log_signal(now_ts(), sym, price, score, mode, reason, tp, sl)
-                cd[sym] = time.time() + COOLDOWN_SECONDS
-                await asyncio.sleep(0.08)
-            idx = (idx + BATCH_SIZE) % len(SYMBOLS)
-            await asyncio.sleep(CYCLE_TIME)
-    finally:
-        try: await exchange.close()
-        except: pass
-
-# ------------------------- Health Server -------------------------
-def health_handler(request):
+# ------------------------- Health & test endpoints -------------------------
+async def health_handler(request):
     return web.Response(text="ok")
+
+async def test_handler(request):
+    return web.Response(text="test ok")
 
 async def start_health_app():
     app = web.Application()
     app.router.add_get("/", health_handler)
-    app.router.add_get("/test", handle_test)
+    app.router.add_get("/test", test_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "7500"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"Health server on port {port}")
+
+# ------------------------- Worker (ensemble scoring, minimal logs) -------------------------
+async def worker():
+    exchange = await create_exchange()
+    cd = {}  # cooldown map
+    prefs = {"BTC_CALM_REQUIRED": True}
+    idx = 0
+    IST = pytz.timezone("Asia/Kolkata")
+    logging.info("Bot started • IST 00-07 OFF • Ensemble scoring")
+
+    try:
+        while True:
+            now_ist = datetime.now(IST)
+            # disable during IST 00:00-07:00
+            if 0 <= now_ist.hour < 7:
+                logging.info("Night mode (IST 00-07) — sleeping 30m")
+                await asyncio.sleep(1800)
+                continue
+
+            # build batch
+            batch = SYMBOLS[idx:idx+BATCH_SIZE] if idx+BATCH_SIZE <= len(SYMBOLS) else SYMBOLS[idx:] + SYMBOLS[:(idx+BATCH_SIZE)-len(SYMBOLS)]
+            for sym in batch:
+                if cd.get(sym, 0) > time.time():
+                    # skip quietly
+                    continue
+
+                snap = await fetch_snapshot(exchange, sym)
+                price = snap["price"]
+                metrics = snap["metrics"]
+
+                # ensemble scoring (helpers.ensemble_score -> uses helpers.ai internals)
+                parsed = await ensemble_score(sym, price, metrics, prefs, n=3)
+                if not parsed:
+                    # skip if ensemble failed
+                    continue
+
+                score = int(parsed.get("score", 0))
+                mode = parsed.get("mode", "quick")
+                reason = parsed.get("reason", "")
+
+                if score < SCORE_THRESHOLD:
+                    # skip low-score quietly
+                    continue
+
+                tp, sl = calc_tp_sl(price, mode)
+                msg = build_message_plain(sym, price, score, mode, reason, tp, sl)
+                await send_telegram(msg)
+                log_signal(now_ts(), sym, price, score, mode, reason, tp, sl)
+                cd[sym] = time.time() + COOLDOWN_SECONDS
+
+                # small pacing to avoid bursts
+                await asyncio.sleep(0.08)
+
+            idx = (idx + BATCH_SIZE) % len(SYMBOLS)
+            await asyncio.sleep(CYCLE_TIME)
+
+    finally:
+        try:
+            await exchange.close()
+        except Exception:
+            pass
 
 # ------------------------- Main -------------------------
 async def main():
@@ -237,4 +250,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
-        logging.exception("Fatal error in main")
+        logging.exception("Fatal error in main") 
