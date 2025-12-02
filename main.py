@@ -1,4 +1,4 @@
-# main.py — FINAL (Stopping-proof, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
+# main.py — FINAL (Ultra-fast health, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
