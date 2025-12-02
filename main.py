@@ -17,8 +17,7 @@ from helpers import (
     compute_ema_from_closes, atr, rsi_from_closes
 )
 
-# -------------------------
-, rsi_from_closes
+# ------------------------- rsi_from_closes
 
 
 # -------------------------
