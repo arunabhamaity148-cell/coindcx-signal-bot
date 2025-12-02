@@ -1,272 +1,412 @@
-# ============================
-# helpers.py — FINAL (58 logic + strict filters + stable scoring)
-# ============================
+# helpers.py — FINAL HYBRID MIND (Part 1/2)
 
-import os, time, json, html, hashlib, random, asyncio
-from typing import Dict, List, Optional
+import asyncio, math, time, statistics
 from datetime import datetime
+import aiohttp
 
-# ---------- utils ----------
-def now_ts() -> int:
-    return int(time.time())
+# -----------------------------------------
+# GLOBAL SETTINGS
+# -----------------------------------------
+MODES = ["quick", "mid", "trend"]
 
-def human_time(ts: int = None) -> str:
-    if ts is None:
-        ts = now_ts()
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+COOLDOWN_MINUTES = 30
+BTC_STABILITY_THRESHOLD = 0.35   # % change allowed
+RECHECK_DELAY = 30               # seconds
+MAX_SCORE = 100
 
-def esc(x) -> str:
-    return html.escape("" if x is None else str(x))
+# -----------------------------------------
+# FETCH DATA (Binance)
+# -----------------------------------------
+async def fetch_binance(session, url):
+    try:
+        async with session.get(url, timeout=5) as r:
+            return await r.json()
+    except Exception:
+        return None
 
-# ---------- TP/SL ----------
-TP_SL_RULES = {
-    "quick": {"tp_pct": 1.6, "sl_pct": 1.0},
-    "mid":   {"tp_pct": 2.2, "sl_pct": 1.0},
-    "trend": {"tp_pct": 4.0, "sl_pct": 1.4},
-}
+async def get_price(session, symbol):
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+    data = await fetch_binance(session, url)
+    try:
+        return float(data["price"])
+    except:
+        return None
 
-def calc_tp_sl(price: float, mode: str):
-    cfg = TP_SL_RULES.get(mode, {"tp_pct": 2.0, "sl_pct": 1.0})
-    tp = price * (1 + cfg["tp_pct"] / 100.0)
-    sl = price * (1 - cfg["sl_pct"] / 100.0)
-    return round(tp, 8), round(sl, 8)
+async def get_klines(session, symbol, interval, limit=100):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = await fetch_binance(session, url)
+    return data or []
 
-# ---------- cache ----------
-class SimpleCache:
-    def __init__(self):
-        self.store = {}
-    def get(self, key):
-        rec = self.store.get(key)
-        if not rec:
-            return None
-        exp, val = rec
-        if exp < time.time():
-            try: del self.store[key]
-            except: pass
-            return None
-        return val
-    def set(self, key, value, ttl_seconds: int):
-        self.store[key] = (time.time() + ttl_seconds, value)
-    def make_key(self, *parts) -> str:
-        raw = "|".join([str(p) for p in parts])
-        return hashlib.sha256(raw.encode()).hexdigest()
-
-CACHE = SimpleCache()
-
-# ---------- indicators ----------
-def sma(values: list, period: int) -> float:
-    if not values: return 0.0
-    if len(values) < period: return sum(values) / len(values)
-    return sum(values[-period:]) / period
-
-def compute_ema_from_closes(closes: list, period: int) -> float:
-    if not closes: return 0.0
-    if len(closes) < period: return sma(closes, period)
-    seed = sum(closes[:period]) / period
-    ema_val = seed
-    k = 2 / (period + 1)
-    for price in closes[period:]:
-        ema_val = price * k + ema_val * (1 - k)
+# -----------------------------------------
+# BASE INDICATORS
+# -----------------------------------------
+def ema(values, length):
+    if len(values) < length:
+        return None
+    k = 2 / (length + 1)
+    ema_val = values[0]
+    for v in values[1:]:
+        ema_val = (v * k) + (ema_val * (1 - k))
     return ema_val
 
-def rsi_from_closes(closes: list, period: int = 14) -> float:
-    if len(closes) < period + 1: return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        gains.append(max(ch, 0)); losses.append(abs(min(ch, 0)))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+def get_closes(klines):
+    return [float(k[4]) for k in klines]
 
-def atr(ohlc: list, period: int = 14) -> float:
-    if len(ohlc) < 2: return 0.0
-    trs = []
-    for i in range(1, len(ohlc)):
-        h, l, pc = ohlc[i][2], ohlc[i][3], ohlc[i-1][4]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    if not trs: return 0.0
-    if len(trs) < period: return sum(trs) / len(trs)
-    seed = sum(trs[:period]) / period
-    val = seed
-    k = 2 / (period + 1)
-    for tr in trs[period:]:
-        val = tr*k + val*(1-k)
-    return val
+# -----------------------------------------
+# LOGIC ENGINE (58 LOGICS)
+# -----------------------------------------
 
-# ---------- 58 logic descriptions ----------
-LOGIC_DESC = {
-    "HTF_EMA_1h_15m": "1h vs 15m EMA alignment",
-    "HTF_EMA_1h_4h": "1h vs 4h EMA confluence",
-    "HTF_EMA_1h_8h": "1h vs 8h EMA confluence",
-    "HTF_Structure_Break": "Breakout of HTF S/R",
-    "HTF_Structure_Reject": "HTF rejection at S/R",
-    "Imbalance_FVG": "Fair-value gap near price",
-    "Trend_Continuation": "Trend continuation possible",
-    "Trend_Exhaustion": "Momentum exhaustion",
-    "Micro_Pullback": "Small pullback to value",
-    "Wick_Strength": "Strong wick rejection",
-    "Sweep_Reversal": "Liquidity sweep + reversal",
-    "Vol_Sweep_1m": "1m volume spike",
-    "Vol_Sweep_5m": "5m volume spike",
-    "Delta_Divergence_1m": "Delta divergence 1m",
-    "Delta_Divergence_HTF": "Delta divergence HTF",
-    "Iceberg_1m": "Hidden orders (iceberg)",
-    "Iceberg_v2": "Advanced iceberg",
-    "Orderbook_Wall_Shift": "Orderbook wall shift",
-    "Liquidity_Wall": "Liquidity wall near price",
-    "Liquidity_Bend": "Liquidity bending",
-    "ADR_DayRange": "ADR comparison",
-    "ATR_Expansion": "ATR expansion",
-    "Phase_Shift": "Market phase shift",
-    "Price_Compression": "Price compression",
-    "Speed_Imbalance": "Speed imbalance",
-    "Taker_Pressure": "Taker pressure strength",
-    "HTF_Volume_Imprint": "HTF volume footprint",
-    "Tiny_Cluster_Imprint": "Micro cluster volume",
-    "Absorption": "Absorption signature",
-    "Recent_Weakness": "Weak push",
-    "Spread_Snap_0_5s": "Spread snapshot 0.5s",
-    "Spread_Snap_0_25s": "Spread snapshot 0.25s",
-    "Tight_Spread_Filter": "Tight spread rule",
-    "Spread_Safety": "Spread safe zone",
-    "BE_SL_AutoLock": "Breakeven/SL auto-lock",
-    "Liquidation_Distance": "Liquidation cluster",
-    "Kill_Zone_5m": "5m kill-zone",
-    "Kill_Zone_HTF": "HTF kill-zone",
-    "Kill_Switch_Fast": "Fast kill-switch",
-    "Kill_Switch_Primary": "Primary kill-switch",
-    "News_Guard": "News safety guard",
-    "30s_Recheck_Loop": "30s recheck",
-    "Partial_Exit_Logic": "Partial profit logic",
-    "BTC_Risk_Filter_L1": "BTC volatility filter 1",
-    "BTC_Risk_FILTER_L2": "BTC volatility filter 2",
-    "BTC_Funding_OI_Combo": "BTC funding + OI",
-    "Funding_Extreme": "Extreme funding",
-    "Funding_Delta_Speed": "Funding change speed",
-    "Funding_Arbitrage": "Funding arbitrage",
-    "OI_Spike_5pct": "OI spike >5%",
-    "OI_Spike_Sustained": "Sustained OI spike",
-    "ETH_BTC_Beta_Divergence": "ETH/BTC beta divergence",
-    "Options_Gamma_Flip": "Gamma flip",
-    "Heatmap_Sweep": "Heatmap sweep",
-    "Micro_Slip": "Micro slippage",
-    "Order_Block": "Order block detection",
-    "Score_Normalization": "Score normalization",
-    "Final_Signal_Score": "Final AI score"
+# Each logic returns 0–3 score.
+
+def HTF_EMA_1h_15m(data):
+    return 2 if data["ema_15m"] > data["ema_1h"] else 0
+
+def HTF_EMA_1h_4h(data):
+    return 2 if data["ema_1h"] > data["ema_4h"] else 0
+
+def HTF_EMA_1h_8h(data):
+    return 2 if data["ema_4h"] > data["ema_8h"] else 0
+
+def HTF_Structure_Break(data):
+    return 3 if data["trend"] == "bull_break" else 0
+
+def HTF_Structure_Reject(data):
+    return 3 if data["trend"] == "reject" else 0
+
+def Imbalance_FVG(data):
+    return 2 if data["fvg"] else 0
+
+def Trend_Continuation(data):
+    return 3 if data["trend_strength"] > 0.7 else 0
+
+def Trend_Exhaustion(data):
+    return 1 if data["exhaustion"] else 0
+
+def Micro_Pullback(data):
+    return 2 if data["micro_pb"] else 0
+
+def Wick_Strength(data):
+    return 2 if data["wick_ratio"] > 1.5 else 0
+
+def Sweep_Reversal(data):
+    return 3 if data["liquidation_sweep"] else 0
+
+def Vol_Sweep_1m(data):
+    return 2 if data["vol_1m"] > data["vol_5m"] else 0
+
+def Vol_Sweep_5m(data):
+    return 2 if data["vol_5m"] > data["vol_1m"] else 0
+
+def Delta_Divergence_1m(data):
+    return 2 if data["delta_1m"] else 0
+
+def Delta_Divergence_HTF(data):
+    return 2 if data["delta_htf"] else 0
+
+def Iceberg_1m(data):
+    return 3 if data["iceberg_1m"] else 0
+
+def Iceberg_v2(data):
+    return 3 if data["iceberg_v2"] else 0
+
+def Orderbook_Wall_Shift(data):
+    return 2 if data["wall_shift"] else 0
+
+def Liquidity_Wall(data):
+    return 2 if data["liq_wall"] else 0
+
+def Liquidity_Bend(data):
+    return 2 if data["liq_bend"] else 0
+
+def ADR_DayRange(data):
+    return 1 if data["adr_ok"] else 0
+
+def ATR_Expansion(data):
+    return 1 if data["atr_expanding"] else 0
+
+def Phase_Shift(data):
+    return 2 if data["phase_shift"] else 0
+
+def Price_Compression(data):
+    return 1 if data["compression"] else 0
+
+def Speed_Imbalance(data):
+    return 2 if data["speed_imbalance"] else 0
+
+def Taker_Pressure(data):
+    return 2 if data["taker_pressure"] else 0
+
+def HTF_Volume_Imprint(data):
+    return 2 if data["vol_imprint"] else 0
+
+def Tiny_Cluster_Imprint(data):
+    return 1 if data["cluster_tiny"] else 0
+
+def Absorption(data):
+    return 2 if data["absorption"] else 0
+
+def Recent_Weakness(data):
+    return 1 if data["weakness"] else 0
+
+def Spread_Snap_0_5s(data):
+    return 2 if data["spread_snap_05"] else 0
+
+def Spread_Snap_0_25s(data):
+    return 2 if data["spread_snap_025"] else 0
+
+def Tight_Spread_Filter(data):
+    return 1 if data["spread"] < 0.03 else 0
+
+def Spread_Safety(data):
+    return 1 if data["spread"] < 0.05 else 0
+
+def BE_SL_AutoLock(data):
+    return 1 if data["be_lock"] else 0
+
+def Liquidation_Distance(data):
+    return 2 if data["liq_dist"] < 0.5 else 0
+
+def Kill_Zone_5m(data):
+    return 1 if data["kill_5m"] else 0
+
+def Kill_Zone_HTF(data):
+    return 1 if data["kill_htf"] else 0
+
+def Kill_Switch_Fast(data):
+    return -10 if data["kill_fast"] else 0
+
+def Kill_Switch_Primary(data):
+    return -25 if data["kill_primary"] else 0
+
+def News_Guard(data):
+    return -5 if data["news_risk"] else 0
+
+def Recheck_30s(data):
+    return 1 if data["recheck_ok"] else 0
+
+def Partial_Exit_Logic(data):
+    return 1
+
+def BTC_Risk_Filter_L1(data):
+    return -8 if not data["btc_calm"] else 2
+
+def BTC_Risk_Filter_L2(data):
+    return -15 if data["btc_trending_fast"] else 2
+
+def BTC_Funding_OI_Combo(data):
+    return 2 if data["funding_oi_combo"] else 0
+
+def Funding_Extreme(data):
+    return -2 if data["funding_extreme"] else 0
+
+def Funding_Delta_Speed(data):
+    return 1 if data["funding_delta"] else 0
+
+def Funding_Arbitrage(data):
+    return 2 if data["arb_opportunity"] else 0
+
+def OI_Spike_5pct(data):
+    return 2 if data["oi_spike"] else 0
+
+def OI_Spike_Sustained(data):
+    return 2 if data["oi_sustained"] else 0
+
+def ETH_BTC_Beta_Divergence(data):
+    return 1 if data["beta_div"] else 0
+
+def Options_Gamma_Flip(data):
+    return 3 if data["gamma_flip"] else 0
+
+def Heatmap_Sweep(data):
+    return 2 if data["heat_sweep"] else 0
+
+def Micro_Slip(data):
+    return -1 if data["slippage"] else 0
+
+def Order_Block(data):
+    return 2 if data["orderblock"] else 0
+
+def Score_Normalization(score):
+    return max(0, min(score, MAX_SCORE))
+
+def Final_Signal_Score(data):
+    total = sum([
+        HTF_EMA_1h_15m(data),
+        HTF_EMA_1h_4h(data),
+        HTF_EMA_1h_8h(data),
+        HTF_Structure_Break(data),
+        HTF_Structure_Reject(data),
+        Imbalance_FVG(data),
+        Trend_Continuation(data),
+        Trend_Exhaustion(data),
+        Micro_Pullback(data),
+        Wick_Strength(data),
+        Sweep_Reversal(data),
+        Vol_Sweep_1m(data),
+        Vol_Sweep_5m(data),
+        Delta_Divergence_1m(data),
+        Delta_Divergence_HTF(data),
+        Iceberg_1m(data),
+        Iceberg_v2(data),
+        Orderbook_Wall_Shift(data),
+        Liquidity_Wall(data),
+        Liquidity_Bend(data),
+        ADR_DayRange(data),
+        ATR_Expansion(data),
+        Phase_Shift(data),
+        Price_Compression(data),
+        Speed_Imbalance(data),
+        Taker_Pressure(data),
+        HTF_Volume_Imprint(data),
+        Tiny_Cluster_Imprint(data),
+        Absorption(data),
+        Recent_Weakness(data),
+        Spread_Snap_0_5s(data),
+        Spread_Snap_0_25s(data),
+        Tight_Spread_Filter(data),
+        Spread_Safety(data),
+        BE_SL_AutoLock(data),
+        Liquidation_Distance(data),
+        Kill_Zone_5m(data),
+        Kill_Zone_HTF(data),
+        Kill_Switch_Fast(data),
+        Kill_Switch_Primary(data),
+        News_Guard(data),
+        Recheck_30s(data),
+        Partial_Exit_Logic(data),
+        BTC_Risk_Filter_L1(data),
+        BTC_Risk_Filter_L2(data),
+        BTC_Funding_OI_Combo(data),
+        Funding_Extreme(data),
+        Funding_Delta_Speed(data),
+        Funding_Arbitrage(data),
+        OI_Spike_5pct(data),
+        OI_Spike_Sustained(data),
+        ETH_BTC_Beta_Divergence(data),
+        Options_Gamma_Flip(data),
+        Heatmap_Sweep(data),
+        Micro_Slip(data),
+        Order_Block(data),
+    ])
+
+    return Score_Normalization(total)
+# helpers.py — FINAL HYBRID MIND (Part 2/2)
+
+import time
+from datetime import datetime
+
+# -----------------------------------------
+# MODE SCORE THRESHOLDS (Arun's system)
+# -----------------------------------------
+MODE_THRESHOLDS = {
+    "quick": 55,
+    "mid": 62,
+    "trend": 70,
 }
 
-def logic_descriptions_text() -> str:
-    return "\n".join([f"{k}: {v}" for k, v in LOGIC_DESC.items()])
+# TP/SL rules (Arun preference)
+TP_RULES = {
+    "quick": (1.2, 1.6),   # %
+    "mid": (1.8, 2.4),
+    "trend": (2.5, 3.5),
+}
 
-# ---------- strict filters ----------
-def btc_calm_filter() -> bool:
-    return True  # relaxed (always pass)
+SL_RULES = {
+    "quick": (0.5, 0.8),
+    "mid": (0.9, 1.2),
+    "trend": (1.2, 1.8),
+}
 
-def spread_filter(metrics: dict) -> bool:
-    return metrics.get("spread_pct", 999) < 0.12
-
-def volume_spike_ok(metrics: dict) -> bool:
-    vol = metrics.get("vol_1m", 0)
-    base = metrics.get("vol_1m_avg_20", 1)
-    return vol > base * 1.2
-
-def htf_alignment_score(metrics: dict) -> int:
-    p = metrics.get("price", 0)
-    e15 = metrics.get("ema_15m_50", 0)
-    e1h = metrics.get("ema_1h_50", 0)
-    if p and e15 and e1h:
-        if p > e15 > e1h: return 20
-        if p < e15 < e1h: return 20
-    return 0
-
-def funding_oi_filter(symbol: str) -> bool:
-    return True
-
-def kill_switch() -> bool:
-    return False
-
-# ---------- memory ----------
-def get_memory(symbol: str) -> list:
-    return CACHE.get(f"memory_{symbol}") or []
-
-def append_memory(symbol: str, entry: dict, max_items: int = 5):
-    mem = get_memory(symbol)
-    mem.append(entry)
-    CACHE.set(f"memory_{symbol}", mem[-max_items:], 86400)
-
-# ---------- feedback ----------
-def get_trade_pnl(symbol: str, tp: float, sl: float, mode: str) -> float:
-    return random.uniform(-1, 1)
-
-# ---------- OpenAI sync ----------
-def _call_openai_sync(prompt: str) -> str:
+# -----------------------------------------
+# BTC CALM CHECK
+# -----------------------------------------
+async def btc_calm_check(session):
+    url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        mdl = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        r = client.responses.create(model=mdl, input=prompt, temperature=0, max_output_tokens=180)
-        return r.output_text.strip()
+        async with session.get(url) as r:
+            d = await r.json()
+            change = abs(float(d["priceChangePercent"]))
+            return change < BTC_STABILITY_THRESHOLD
     except:
-        return ""
+        return False
 
-# ---------- AI scorer ----------
-async def ai_score_symbol(symbol: str, price: float, metrics: dict, prefs: dict, ttl: int = 90):
-    key = CACHE.make_key("ai", symbol, round(price,5))
-    c = CACHE.get(key)
-    if c: return c
+# -----------------------------------------
+# COOLDOWN SYSTEM
+# -----------------------------------------
+last_signal_time = {}
 
-    base = htf_alignment_score(metrics)
-    memory = get_memory(symbol)
-    pnl = get_trade_pnl(symbol, price, price, "mid")
+def is_cooldown(symbol):
+    if symbol not in last_signal_time:
+        return False
+    diff = time.time() - last_signal_time[symbol]
+    return diff < (COOLDOWN_MINUTES * 60)
 
-    mtxt = json.dumps({k:(v[-20:] if isinstance(v,list) else v) for k,v in metrics.items()})
-    ptxt = json.dumps(prefs)
-    logic = logic_descriptions_text()
+def update_cooldown(symbol):
+    last_signal_time[symbol] = time.time()
 
-    prompt = f"""
-You are a senior quant. Output ONLY strict JSON.
+# -----------------------------------------
+# TP/SL AUTO CALCULATOR
+# -----------------------------------------
+def calc_tp_sl(price, mode):
+    tp_min, tp_max = TP_RULES[mode]
+    sl_min, sl_max = SL_RULES[mode]
 
-Metrics: {mtxt}
-BaseScore: {base}
-Memory: {memory}
-PnL: {pnl:.2f}
+    tp = price * (1 + tp_min/100)
+    sl = price * (1 - sl_min/100)
 
-Rules:
-1) score 0-100
-2) mode quick/mid/trend
-3) reason max 8 words
+    return round(tp, 4), round(sl, 4)
 
-Logic:
-{logic}
+# -----------------------------------------
+# FINAL DECISION ENGINE
+# -----------------------------------------
+def decide_signal(symbol, mode, price, score):
+    if score < MODE_THRESHOLDS[mode]:
+        return None
 
-Return ONLY: {{"score":int,"mode":"quick|mid|trend","reason":"text"}}
+    if is_cooldown(symbol):
+        return None
+
+    tp, sl = calc_tp_sl(price, mode)
+
+    update_cooldown(symbol)
+
+    return {
+        "symbol": symbol,
+        "mode": mode,
+        "price": price,
+        "score": score,
+        "tp": tp,
+        "sl": sl
+    }
+
+# -----------------------------------------
+# FORMAT TELEGRAM SIGNAL (Style C Premium)
+# -----------------------------------------
+def format_signal(sig):
+    return f"""
+🔥 <b>{sig['mode'].upper()} SIGNAL</b>
+
+<b>Pair:</b> {sig['symbol']}
+<b>Price:</b> {sig['price']}
+<b>Score:</b> {sig['score']} / 100
+
+🎯 <b>TP:</b>
+<code>{sig['tp']}</code>
+
+🛑 <b>SL:</b>
+<code>{sig['sl']}</code>
+
+⚡ Leverage: 50x
+⏱️ Cooldown: 30 minutes
+📊 Mode: {sig['mode'].upper()}
+
+#HybridAI #ArunSystem
 """
 
-    raw = await asyncio.to_thread(_call_openai_sync, prompt)
-    try:
-        js = json.loads(raw)
-        out = {"score": int(js["score"]), "mode": js["mode"], "reason": js["reason"]}
-        CACHE.set(key, out, ttl)
-        append_memory(symbol, out)
-        return out
-    except:
-        return {"score": 0, "mode": "quick", "reason": "parse_fail"}
-
-# ---------- ensemble ----------
-async def ensemble_score(symbol: str, price: float, metrics: dict, prefs: dict, n: int = 3):
-    out = []
-    for _ in range(n):
-        r = await ai_score_symbol(symbol, price, metrics, prefs)
-        if r: out.append(r)
-    if not out:
-        return {"score":0,"mode":"quick","reason":"fail"}
-
-    sc = round(sum(o["score"] for o in out)/len(out))
-    mode = sorted([o["mode"] for o in out])[1]
-    return {"score":sc,"mode":mode,"reason":out[0]["reason"]}
-
-# END helpers.py
+# -----------------------------------------
+# MASTER PROCESSOR (Used by main.py)
+# -----------------------------------------
+def process_data(symbol, mode, live_data):
+    score = Final_Signal_Score(live_data)
+    decision = decide_signal(symbol, mode, live_data["price"], score)
+    return decision
