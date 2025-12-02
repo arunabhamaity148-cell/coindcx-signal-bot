@@ -1,13 +1,13 @@
-# main.py — FINAL PATCHED CLEAN VERSION
+# main.py — PATCHED to use OpenAI verifier (process_data_with_ai)
 import asyncio
 import aiohttp
 import time
 import os
 from dotenv import load_dotenv
 
-from helpers import process_data, btc_calm_check, format_signal
-
 load_dotenv()
+
+from helpers import format_signal, btc_calm_check, process_data_with_ai
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -16,17 +16,13 @@ WATCHLIST = [
     "BTCUSDT","ETHUSDT","SOLUSDT","AVAXUSDT","BNBUSDT","ADAUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
     "DOTUSDT","LTCUSDT","LINKUSDT","MATICUSDT","OPUSDT","ARBUSDT","FILUSDT","AAVEUSDT","SANDUSDT",
     "ATOMUSDT","NEARUSDT","INJUSDT","FXSUSDT","DYDXUSDT","EGLDUSDT","APTUSDT","RNDRUSDT","TIAUSDT",
-    "SEIUSDT","BONKUSDT","FTMUSDT","RUNEUSDT","PYTHUSDT","WLDUSDT","SKLUSDT","BLURUSDT","MINAUSDT",
+    "SEIUSDT","BONKUSDT","FTMUSDT","RUNEUSDT","PYTHUSDT","WLDUSDT","SKLUSUT","BLURUSDT","MINAUSDT",
     "JTOUSDT","MEWUSDT","1000PEPEUSDT"
 ]
 
 MODES = ["quick", "mid", "trend"]
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
-
-# -----------------------------------------
-# Telegram Sender
-# -----------------------------------------
 async def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
@@ -36,9 +32,6 @@ async def send_telegram(msg):
         except:
             pass
 
-# -----------------------------------------
-# Binance Data
-# -----------------------------------------
 async def get_live_data(session, symbol):
     try:
         async with session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5) as r:
@@ -47,7 +40,7 @@ async def get_live_data(session, symbol):
     except:
         return None
 
-    # Dummy data required for 58 logic system
+    # dummy structure — replace with real OB/OI/funding fetch later
     return {
         "price": price,
         "ema_15m": price,
@@ -106,18 +99,11 @@ async def get_live_data(session, symbol):
         "orderblock": True
     }
 
-# -----------------------------------------
-# MAIN LOOP
-# -----------------------------------------
 async def scanner():
     print("🚀 Hybrid AI Scanner Started...")
-
     async with aiohttp.ClientSession() as session:
         while True:
-
-            # BTC Calm check
             btc_ok = await btc_calm_check(session)
-
             if not btc_ok:
                 print("⚠️ BTC not calm → AI risk filter blocking signals")
                 await asyncio.sleep(SCAN_INTERVAL)
@@ -129,15 +115,19 @@ async def scanner():
                     continue
 
                 for mode in MODES:
-                    decision = process_data(symbol, mode, live)
+                    # use async processor with OpenAI verifier
+                    try:
+                        decision = await process_data_with_ai(symbol, mode, live)
+                    except Exception as e:
+                        # protect scanner loop from processor errors
+                        decision = None
+
                     if decision:
                         msg = format_signal(decision)
                         await send_telegram(msg)
-                        print(f"📤 SIGNAL SENT → {symbol} | {mode}")
-
+                        print(f"📤 SIGNAL SENT → {symbol} | {mode} | score={decision.get('score')}")
             await asyncio.sleep(SCAN_INTERVAL)
 
-# -----------------------------------------
 if __name__ == "__main__":
     try:
         asyncio.run(scanner())
