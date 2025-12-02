@@ -55,8 +55,10 @@ async def fetch_klines_batch(session, symbols, interval="1m", limit=30):
     url  = "https://api.binance.com/api/v3/klines"
     symbols = [s.upper() for s in symbols]
     if not symbols:
+        print("Empty symbols – skipping klines")
         return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":")), "interval": interval, "limit": limit}
+    print("klines params", params)   # ➜ debug
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     if not isinstance(data, list) or len(data) != len(symbols):
@@ -79,8 +81,10 @@ async def fetch_spread_batch(session, symbols):
     url  = "https://api.binance.com/api/v3/ticker/bookTicker"
     symbols = [s.upper() for s in symbols]
     if not symbols:
+        print("Empty symbols – skipping spread")
         return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":"))}
+    print("spread params", params)   # ➜ debug
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     out = {}
@@ -100,8 +104,10 @@ async def fetch_ema_batch(session, symbols, interval, length=20):
     url  = "https://api.binance.com/api/v3/klines"
     symbols = [s.upper() for s in symbols]
     if not symbols:
+        print("Empty symbols – skipping ema")
         return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":")), "interval": interval, "limit": length}
+    print("ema params", params)   # ➜ debug
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     out = {}
@@ -179,6 +185,10 @@ async def scanner():
 
 async def process_batch(session, batch, sem):
     async with sem:
+        if not batch:
+            print("Empty batch – skipping")
+            return
+        print("Processing batch", batch)   # ➜ debug
         now = time.time()
         if cache.get("kl_time", 0) > now - CACHE_TTL:
             kdata   = cache.get("kl", {})
