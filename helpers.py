@@ -1,4 +1,4 @@
-# helpers.py — REAL BINANCE SIGNAL ENGINE (AI disabled, stronger filters + scoring)
+# helpers.py — REAL BINANCE SIGNAL ENGINE (logging & explain + safe parsers)
 import aiohttp
 import asyncio
 import os
@@ -15,7 +15,7 @@ BIN_KEY = os.getenv("BINANCE_API_KEY")
 BIN_SECRET = os.getenv("BINANCE_SECRET_KEY", "").encode() if os.getenv("BINANCE_SECRET_KEY") else b""
 FUTURES = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
 
-# AI disabled by default (you can enable later)
+# AI disabled by default
 AI_VERIFY_ENABLED = False
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -25,7 +25,7 @@ COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "1800"))   # 30 min default
 INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "8"))
 
 MODE_THRESH = {
-    "quick": int(os.getenv("THRESH_QUICK", "65")),   # raised thresholds for quality
+    "quick": int(os.getenv("THRESH_QUICK", "65")),
     "mid": int(os.getenv("THRESH_MID", "72")),
     "trend": int(os.getenv("THRESH_TREND", "78")),
 }
@@ -43,6 +43,9 @@ BTC_STABILITY_THRESHOLD = float(os.getenv("BTC_STABILITY_THRESHOLD", "1.2"))  # 
 MIN_24H_VOL = float(os.getenv("MIN_24H_VOL", "20000"))  # minimum quote volume over 24h (in USDT)
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.06"))  # 0.06% max spread
 MAX_LIQ_DIST = float(os.getenv("MAX_LIQ_DIST", "1.0"))  # percent mark->liq threshold for safety
+
+# Logging verbosity
+VERBOSE_SCORE_MIN = int(os.getenv("VERBOSE_SCORE_MIN", "45"))
 
 # -------------------------
 # STATE + CACHE
@@ -194,30 +197,37 @@ def ema(values, length=None):
     return float(e)
 
 # -------------------------
-# HTF FETCHER
+# HTF FETCHER (15m/1h/4h)
 # -------------------------
 async def get_htf(session: aiohttp.ClientSession, symbol: str):
     cache_key = f"htf:{symbol}"
     cached = cache_get(cache_key, ttl=6)
     if cached:
         return cached
+
     k15_task = kline(session, symbol, "15m", 60)
     k1h_task = kline(session, symbol, "1h", 60)
     k4h_task = kline(session, symbol, "4h", 60)
+
     k15, k1h, k4h = await asyncio.gather(k15_task, k1h_task, k4h_task)
+
     if not k15 or not k1h or not k4h:
         return None
+
     try:
         c15 = [float(x[4]) for x in k15]
         c1h = [float(x[4]) for x in k1h]
         c4h = [float(x[4]) for x in k4h]
     except Exception:
         return None
+
     ema_15 = ema(c15[-15:], 15)
     ema_50 = ema(c15[-50:], 50) if len(c15) >= 50 else ema_15
     ema_200 = ema(c15[-200:], 200) if len(c15) >= 200 else ema_50
+
     ema_1h_50 = ema(c1h[-50:], 50) if len(c1h) >= 50 else c1h[-1]
     ema_4h_50 = ema(c4h[-50:], 50) if len(c4h) >= 50 else c4h[-1]
+
     out = {
         "close_15": c15[-1],
         "prev_15": c15[-2] if len(c15) >= 2 else c15[-1],
@@ -230,6 +240,7 @@ async def get_htf(session: aiohttp.ClientSession, symbol: str):
         "trend_1h": "up" if c1h[-1] > ema_1h_50 else "down",
         "trend_4h": "up" if c4h[-1] > ema_4h_50 else "down",
     }
+
     cache_set(cache_key, out)
     return out
 
@@ -237,7 +248,6 @@ async def get_htf(session: aiohttp.ClientSession, symbol: str):
 # BTC calm check
 # -------------------------
 async def btc_calm_check(session: aiohttp.ClientSession):
-    # use 24h price change percent from ticker
     try:
         r = await public(session, "/fapi/v1/ticker/24hr", "symbol=BTCUSDT")
         if not r or "priceChangePercent" not in r:
@@ -256,10 +266,6 @@ def compute_spread_pct(best_bid: float, best_ask: float) -> float:
     return abs(best_ask - best_bid) / ((best_ask + best_bid) / 2.0) * 100.0
 
 def depth_imbalance(depth_json) -> float:
-    """
-    Return imbalance ratio: (bid_volume / ask_volume) in top N levels
-    >1 => more bid pressure, <1 => ask pressure
-    """
     try:
         bids = depth_json.get("bids", [])[:10]
         asks = depth_json.get("asks", [])[:10]
@@ -271,9 +277,6 @@ def depth_imbalance(depth_json) -> float:
     except Exception:
         return 1.0
 
-# -------------------------
-# Additional quality checks
-# -------------------------
 async def check_liquidity_and_spread(session: aiohttp.ClientSession, symbol: str):
     d = await depth(session, symbol, limit=20)
     t = await ticker_24h(session, symbol)
@@ -285,7 +288,11 @@ async def check_liquidity_and_spread(session: aiohttp.ClientSession, symbol: str
     except Exception:
         return False, "no_depth"
     spread_pct = compute_spread_pct(best_bid, best_ask)
-    vol_quote = float(t.get("quoteVolume", 0)) if t.get("quoteVolume") else float(t.get("volume", 0)) * ((best_bid+best_ask)/2)
+    vol_quote = 0.0
+    try:
+        vol_quote = float(t.get("quoteVolume", 0)) if t.get("quoteVolume") else float(t.get("volume", 0)) * ((best_bid+best_ask)/2)
+    except Exception:
+        vol_quote = 0.0
     if spread_pct > MAX_SPREAD_PCT:
         return False, "wide_spread"
     if vol_quote < MIN_24H_VOL:
@@ -311,14 +318,10 @@ def get_direction(htf: dict):
     return None
 
 # -------------------------
-# SCORE ENGINE (stronger, orderflow focused)
+# SCORE ENGINE (orderflow focused)
 # -------------------------
 def score_engine(htf: dict, order_meta: dict, mode: str):
-    """
-    order_meta: {"spread_pct":float, "imbalance":float, "vol_quote":float, "funding":float, "oi_sustained":bool}
-    """
     s = 0
-    # HTF structure weights
     if mode == "quick":
         s += 15 if htf.get("trend_15") == "up" else 0
         s += 10 if htf.get("ema_15",0) > htf.get("ema_50",0) else 0
@@ -338,78 +341,88 @@ def score_engine(htf: dict, order_meta: dict, mode: str):
         s += 10 if order_meta.get("oi_sustained", False) else 0
         s += 10 if order_meta.get("imbalance",1) > 1.4 else 0
 
-    # penalize high funding or extreme OI
     if abs(order_meta.get("funding",0)) > 0.05:
         s -= 15
     if order_meta.get("liq_risk", False):
         s -= 25
 
-    # normalize
     s = max(0, min(100, int(s)))
     return s
 
 # -------------------------
-# final_process without AI (or AI disabled)
+# Logging explain helper
+# -------------------------
+def explain_data_for_log(htf: dict, order_meta: dict):
+    return {
+        "ema_15": round(htf.get("ema_15", 0), 6) if htf.get("ema_15") is not None else None,
+        "ema_50": round(htf.get("ema_50", 0), 6) if htf.get("ema_50") is not None else None,
+        "trend_1h": htf.get("trend_1h"),
+        "imbalance": order_meta.get("imbalance"),
+        "spread_pct": order_meta.get("spread_pct"),
+        "vol_quote": int(order_meta.get("vol_quote")) if order_meta.get("vol_quote") else 0,
+        "funding": round(order_meta.get("funding", 0), 6),
+        "liq_risk": order_meta.get("liq_risk", False),
+    }
+
+# -------------------------
+# final_process with verbose logs
 # -------------------------
 async def final_process(session: aiohttp.ClientSession, symbol: str, mode: str):
-    """
-    1. BTC calm check
-    2. HTF build
-    3. liquidity + spread + depth checks
-    4. funding + OI checks
-    5. score_engine
-    6. threshold check + cooldown + return signal
-    """
     # 1. BTC calm
     btc_ok = await btc_calm_check(session)
     if not btc_ok:
-        # skip scanning if BTC volatile
+        print(f"[SKIP] {symbol} → BTC volatile (BTC calm check failed)")
         return None
 
     # 2. HTF
     htf = await get_htf(session, symbol)
     if not htf:
+        print(f"[SKIP] {symbol} → Binance returned no OHLCV or HTF failed")
         return None
 
     # 3. liquidity & spread
     liq_ok, liq_meta = await check_liquidity_and_spread(session, symbol)
     if not liq_ok:
+        reason = liq_meta if isinstance(liq_meta, str) else "liquidity/spread check failed"
+        print(f"[SKIP] {symbol} → {reason}")
         return None
 
     # 4. funding + OI + liq dist
     funding = await funding_rate(session, symbol)
-    # attempt OI check (best-effort)
     oi = await oi_history(session, symbol, limit=3)
     oi_sustained = False
     try:
-        # if last few openInterest increasing -> sustained
         if oi and isinstance(oi, list) and len(oi) >= 2:
-            vals = [float(x.get("sumOpenInterest", x.get("openInterest", 0))) for x in oi]
-            oi_sustained = vals[-1] > vals[0]
+            vals = []
+            for x in oi:
+                # openInterest or sumOpenInterest
+                v = x.get("sumOpenInterest") or x.get("openInterest") or x.get("value")
+                try:
+                    vals.append(float(v))
+                except Exception:
+                    vals.append(0.0)
+            if len(vals) >= 2:
+                oi_sustained = vals[-1] > vals[0]
     except Exception:
         oi_sustained = False
 
-    # 5. liquidation distance approximation (mark price vs bids/asks)
+    # 5. liquidation distance approx
     d = await depth(session, symbol, limit=20)
     mark = await mark_price(session, symbol)
     liq_risk = False
     try:
-        if d and mark and isinstance(mark, list):
-            # mark might be list of dicts; handle defensive
-            mp = float(mark[0].get("markPrice", mark[0].get("lastPrice", 0)))
-            best_bid = float(d["bids"][0][0])
-            best_ask = float(d["asks"][0][0])
-            # distance to nearest side in percent
-            dist_pct = min(abs(mp - best_bid), abs(best_ask - mp)) / mp * 100.0
-            if dist_pct < MAX_LIQ_DIST:
-                liq_risk = True
-        elif d and mark and isinstance(mark, dict):
-            mp = float(mark.get("markPrice", 0))
-            best_bid = float(d["bids"][0][0])
-            best_ask = float(d["asks"][0][0])
-            dist_pct = min(abs(mp - best_bid), abs(best_ask - mp)) / mp * 100.0
-            if dist_pct < MAX_LIQ_DIST:
-                liq_risk = True
+        if d and mark:
+            mp = None
+            if isinstance(mark, list) and len(mark) > 0:
+                mp = float(mark[0].get("markPrice", mark[0].get("lastPrice", 0)))
+            elif isinstance(mark, dict):
+                mp = float(mark.get("markPrice", 0))
+            if mp and d.get("bids") and d.get("asks"):
+                best_bid = float(d["bids"][0][0])
+                best_ask = float(d["asks"][0][0])
+                dist_pct = min(abs(mp - best_bid), abs(best_ask - mp)) / mp * 100.0
+                if dist_pct < MAX_LIQ_DIST:
+                    liq_risk = True
     except Exception:
         liq_risk = False
 
@@ -425,22 +438,36 @@ async def final_process(session: aiohttp.ClientSession, symbol: str, mode: str):
     # 6. direction
     direction = get_direction(htf)
     if not direction:
+        print(f"[SKIP] {symbol} → No direction (data incomplete)")
         return None
 
     # 7. score
     score = score_engine(htf, order_meta, mode)
-    if score < MODE_THRESH.get(mode, 100):
+
+    # Verbose score print if above threshold for logging convenience
+    if score >= VERBOSE_SCORE_MIN:
+        print(f"[SCORE] {symbol} → {score} | RAW: {explain_data_for_log(htf, order_meta)}")
+
+    # 8. threshold check
+    mode_thresh = MODE_THRESH.get(mode, 100)
+    if score < mode_thresh:
+        print(f"[SKIP] {symbol} ({mode}) → score {score} < threshold {mode_thresh}")
         return None
 
-    # 8. cooldown check
+    # 9. cooldown
     if not cooldown_ok(symbol):
+        print(f"[SKIP] {symbol} ({mode}) → cooldown active")
         return None
 
-    # 9. compute tp/sl
+    # 10. compute tp/sl (direction-aware)
     price = float(htf["close_15"])
     tp_pct, sl_pct = TP_SL.get(mode, (1.8, 1.0))
-    tp = price * (1 + tp_pct/100.0) if direction == "BUY" else price * (1 - tp_pct/100.0)
-    sl = price * (1 - sl_pct/100.0) if direction == "BUY" else price * (1 + sl_pct/100.0)
+    if direction == "BUY":
+        tp = price * (1 + tp_pct/100.0)
+        sl = price * (1 - sl_pct/100.0)
+    else:  # SELL
+        tp = price * (1 - tp_pct/100.0)
+        sl = price * (1 + sl_pct/100.0)
 
     signal = {
         "symbol": symbol,
@@ -453,14 +480,14 @@ async def final_process(session: aiohttp.ClientSession, symbol: str, mode: str):
         "meta": order_meta
     }
 
-    # include last trade safely
     last_trade = await safe_last_trade(session, symbol)
     if last_trade.get("price") is not None:
         signal["last_trade_price"] = last_trade["price"]
         signal["last_trade_qty"] = last_trade["qty"]
 
-    # done → update cooldown and return
+    # update cooldown and return
     update_cd(symbol)
+    print(f"[SEND] {symbol} ({mode}) → direction={direction} score={score} tp={signal['tp']} sl={signal['sl']}")
     return signal
 
 # -------------------------
