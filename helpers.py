@@ -1,5 +1,3 @@
-# helpers.py — 30-Logic + Buy/Sell + BE-SL + Liq-Dist + Mode System
-
 import time
 import math
 
@@ -16,7 +14,6 @@ def cooldown_ok(symbol):
 def update_cd(symbol):
     last_signal[symbol] = time.time()
 
-
 # ================================
 # MODE THRESHOLDS
 # ================================
@@ -27,7 +24,7 @@ MODE_THRESH = {
 }
 
 TP_SL = {
-    "quick": (1.2, 0.7),     # TP%, SL%
+    "quick": (1.2, 0.7),
     "mid":   (1.8, 1.0),
     "trend": (2.5, 1.2)
 }
@@ -79,7 +76,6 @@ def Spread_Snap_025(d):       return 1 if d['spread'] < 0.0025 else 0
 def Spread_Snap_05(d):        return 1 if d['spread'] < 0.005 else 0
 def Taker_Pressure(d):        return 2 if d['taker_pressure'] else 0
 
-
 # ================================
 # FINAL SCORE
 # ================================
@@ -100,7 +96,6 @@ def final_score(d):
     ])
     return max(0, min(score, 100))
 
-
 # ================================
 # BUY / SELL DIRECTION
 # ================================
@@ -111,7 +106,6 @@ def trade_side(price, prev, ema1h):
         return "SELL"
     return None
 
-
 # ================================
 # TP / SL PER MODE + BE-SL
 # ================================
@@ -121,10 +115,8 @@ def calc_tp_sl(price, mode):
     sl = price * (1 - sl_pct/100)
     return round(tp, 6), round(sl, 6)
 
-
 def apply_be_sl(entry_price):
     return round(entry_price, 6)
-
 
 # ================================
 # PREMIUM TELEGRAM STYLE
@@ -148,4 +140,3 @@ def format_signal(symbol, side, mode, price, score, tp, sl, liq):
 📊 Mode: <b>{mode}</b>
 
 #ArunSystem #HybridAI
-"""
