@@ -1,9 +1,9 @@
-# helpers.py — RELAXED (alert ↑, quality intact)
+# helpers.py — FINAL (atr added + relaxed filters + exact score)
 import os, time, json, html, hashlib, random, asyncio
 from typing import Dict, List, Optional
 from datetime import datetime
 
-# ------------------------- utils / cache / indicators / TP-SL (same) ----------
+# ---------- utils ----------
 def now_ts() -> int:
     return int(time.time())
 
@@ -78,6 +78,23 @@ def rsi_from_closes(closes: list, period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+# ---------- ATR added ----------
+def atr(ohlc: list, period: int = 14) -> float:
+    if len(ohlc) < 2: return 0.0
+    trs = []
+    for i in range(1, len(ohlc)):
+        high, low, prev_close = ohlc[i][2], ohlc[i][3], ohlc[i-1][4]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    if not trs: return 0.0
+    if len(trs) < period: return sum(trs) / len(trs)
+    seed = sum(trs[:period]) / period
+    atr_val = seed
+    k = 2 / (period + 1)
+    for tr in trs[period:]:
+        atr_val = tr * k + atr_val * (1 - k)
+    return atr_val
+
 # ---------- 58 logic desc ----------
 LOGIC_DESC = {
     "HTF_EMA_1h_15m": "1h vs 15m EMA alignment and slope",
@@ -95,6 +112,7 @@ LOGIC_DESC = {
     "Iceberg_1m": "Hidden large order signatures",
     "Orderbook_Wall_Shift": "Large wall shift in orderbook",
     "Liquidity_Wall": "Liquidity wall near price",
+    "Liquidity_Bend": "Liquidity bending/rotation",
     "ADR_DayRange": "Price vs daily range (ADR)",
     "ATR_Expansion": "ATR expansion confirms breakout",
     "Phase_Shift": "Market shifting phase (comp->exp)",
