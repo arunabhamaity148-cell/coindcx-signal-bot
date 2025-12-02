@@ -1,8 +1,9 @@
-# main.py — FINAL (Health FIRST, 0.0.0.0, sync, minimal boot)
+# main.py — FINAL (Skip reasons logged, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
+import aiohttp
 import pytz
 import ccxt.async_support as ccxt
 
@@ -174,7 +175,7 @@ async def start_health_app():
     await site.start()
     logging.info(f"Health server on port {port}")
 
-# ------------------------- Worker (minimal logs) -------------------------
+# ------------------------- Worker (with SKIP reasons logged) -------------------------
 async def worker():
     exchange = await create_exchange()
     cd = {}
@@ -194,26 +195,36 @@ async def worker():
             batch = SYMBOLS[idx:idx+BATCH_SIZE] if idx+BATCH_SIZE <= len(SYMBOLS) else SYMBOLS[idx:] + SYMBOLS[:(idx+BATCH_SIZE)-len(SYMBOLS)]
             for sym in batch:
                 if cd.get(sym, 0) > time.time():
+                    logging.info("SKIP %s — cooldown active", sym)
                     continue
+
                 snap = await fetch_snapshot(exchange, sym)
                 price = snap["price"]
                 metrics = snap["metrics"]
+
                 parsed = await ensemble_score(sym, price, metrics, prefs, n=3)
                 if not parsed:
+                    logging.info("SKIP %s — ensemble failed", sym)
                     continue
+
                 score = int(parsed.get("score", 0))
                 mode = parsed.get("mode", "quick")
                 reason = parsed.get("reason", "")
+
                 if score < SCORE_THRESHOLD:
+                    logging.info("SKIP %s — score %d < threshold %d", sym, score, SCORE_THRESHOLD)
                     continue
+
                 tp, sl = calc_tp_sl(price, mode)
                 msg = build_message_plain(sym, price, score, mode, reason, tp, sl)
                 await send_telegram(msg)
                 log_signal(now_ts(), sym, price, score, mode, reason, tp, sl)
                 cd[sym] = time.time() + COOLDOWN_SECONDS
                 await asyncio.sleep(0.08)
+
             idx = (idx + BATCH_SIZE) % len(SYMBOLS)
             await asyncio.sleep(CYCLE_TIME)
+
     finally:
         try: await exchange.close()
         except: pass
