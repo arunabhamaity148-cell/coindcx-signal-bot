@@ -1,11 +1,10 @@
-# main.py — FINAL (200 OK guaranteed, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
+# main.py — FINAL (Ensemble 3-vote, IST 00-07 OFF, 45 coins, 3/60s, 70 score)
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
 from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
 import aiohttp
 import pytz
-import ccxt.async_support as ccxt
 
 load_dotenv()
 
@@ -35,9 +34,8 @@ SYMBOLS = [
     "STRKUSDT","ZRXUSDT","APTUSDT","NEARUSDT","ICPUSDT"
 ]
 
-DB_PATH = os.getenv("SIGNAL_DB", "signals.db")
-
 # ------------------------- SQLite -------------------------
+DB_PATH = os.getenv("SIGNAL_DB", "signals.db")
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 cur.execute("""
@@ -100,7 +98,7 @@ async def fetch_snapshot(exchange, symbol):
         ob = await exchange.fetch_order_book(symbol, 5)
         if ob.get("bids") and ob.get("asks"):
             bid, ask = ob["bids"][0][0], ob["asks"][0][0]
-            mid = (bid + ask) / 2.0 if (bid + ask) else 1.0
+            mid = (bid + ask) / 2.0
             spread_pct = abs(ask - bid) / mid * 100.0
     except Exception:
         spread_pct = 0.0
@@ -160,29 +158,18 @@ def build_message_plain(sym, price, score, mode, reason, tp, sl):
         f"{human_time()}  Cooldown: {COOLDOWN_SECONDS//60}m"
     )
 
-# ------------------------- Health (SYNC + 0.0.0.0 + instant log) -------------------------
-def health_handler(request):
-    logging.info("Health OK — 200 returned")
-    return web.Response(text="ok")
+# ------------------------- Test Endpoint -------------------------
+def handle_test(request):
+    return web.Response(text="Test endpoint works")
 
-async def start_health_app():
-    app = web.Application()
-    app.router.add_get("/", health_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "7500"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info(f"Health server on port {port}")
-
-# ------------------------- Worker (minimal logs) -------------------------
+# ------------------------- Worker (with SKIP logs) -------------------------
 async def worker():
     exchange = await create_exchange()
     cd = {}
     prefs = {"BTC_CALM_REQUIRED": True}
     idx = 0
     IST = pytz.timezone("Asia/Kolkata")
-    logging.info("Bot started • IST 00-07 OFF • 45 coins • 3/60s • 70 score")
+    logging.info("Bot started • IST 00-07 OFF • 45 coins • 3/60s • 70 score • Ensemble 3-vote")
 
     try:
         while True:
@@ -195,17 +182,22 @@ async def worker():
             batch = SYMBOLS[idx:idx+BATCH_SIZE] if idx+BATCH_SIZE <= len(SYMBOLS) else SYMBOLS[idx:] + SYMBOLS[:(idx+BATCH_SIZE)-len(SYMBOLS)]
             for sym in batch:
                 if cd.get(sym, 0) > time.time():
+                    logging.info("SKIP %s — cooldown active", sym)
                     continue
                 snap = await fetch_snapshot(exchange, sym)
                 price = snap["price"]
                 metrics = snap["metrics"]
                 parsed = await ensemble_score(sym, price, metrics, prefs, n=3)
                 if not parsed:
+                    logging.info("SKIP %s — ensemble failed", sym)
+                    await asyncio.sleep(0.05)
                     continue
                 score = int(parsed.get("score", 0))
                 mode = parsed.get("mode", "quick")
                 reason = parsed.get("reason", "")
                 if score < SCORE_THRESHOLD:
+                    logging.info("SKIP %s — score %d < threshold %d", sym, score, SCORE_THRESHOLD)
+                    await asyncio.sleep(0.08)
                     continue
                 tp, sl = calc_tp_sl(price, mode)
                 msg = build_message_plain(sym, price, score, mode, reason, tp, sl)
@@ -219,11 +211,26 @@ async def worker():
         try: await exchange.close()
         except: pass
 
-# ------------------------- Main (health FIRST) -------------------------
+# ------------------------- Health Server -------------------------
+def health_handler(request):
+    return web.Response(text="ok")
+
+async def start_health_app():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/test", handle_test)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "7500"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Health server on port {port}")
+
+# ------------------------- Main -------------------------
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    await start_health_app()   # ➜ আগে চালু
-    await worker()             # ➜ পরে চালু
+    await start_health_app()
+    await worker()
 
 if __name__ == "__main__":
     try:
