@@ -1,8 +1,9 @@
-# helpers.py — FINAL (indicators, prompt builder, TP/SL, small TTL cache)
-import time, html, json, hashlib
+# helpers.py — FINAL (58 logic desc + strict filters + score builder)
+import time, html, json, hashlib, logging
 from typing import Dict, List
+from datetime import datetime
 
-# ---- time utils ----
+# ---------- time ----------
 def now_ts() -> int:
     return int(time.time())
 
@@ -14,7 +15,7 @@ def human_time(ts: int = None) -> str:
 def esc(x) -> str:
     return html.escape("" if x is None else str(x))
 
-# ---- TP/SL ----
+# ---------- TP/SL ----------
 TP_SL_RULES = {
     "quick": {"tp_pct": 1.6, "sl_pct": 1.0},
     "mid":   {"tp_pct": 2.0, "sl_pct": 1.0},
@@ -27,10 +28,10 @@ def calc_tp_sl(price: float, mode: str):
     sl = price * (1 - cfg["sl_pct"]/100.0)
     return round(tp, 8), round(sl, 8)
 
-# ---- simple TTL cache (in-memory) ----
+# ---------- TTL cache ----------
 class SimpleCache:
     def __init__(self):
-        self.store = {}  # key -> (expiry, value)
+        self.store = {}
     def get(self, key):
         rec = self.store.get(key)
         if not rec:
@@ -49,7 +50,7 @@ class SimpleCache:
 
 CACHE = SimpleCache()
 
-# ---- indicators (lightweight) ----
+# ---------- indicators ----------
 def sma(values: List[float], period: int) -> float:
     if not values:
         return 0.0
@@ -74,7 +75,7 @@ def atr(ohlc: List[List[float]], period: int = 14) -> float:
         return 0.0
     trs = []
     for i in range(1, len(ohlc)):
-        high = ohlc[i][2]; low = ohlc[i][3]; prev_close = ohlc[i-1][4]
+        high, low, prev_close = ohlc[i][2], ohlc[i][3], ohlc[i-1][4]
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
     if not trs:
@@ -91,13 +92,10 @@ def atr(ohlc: List[List[float]], period: int = 14) -> float:
 def rsi_from_closes(closes: List[float], period: int = 14) -> float:
     if len(closes) < period + 1:
         return 50.0
-    gains = []; losses = []
+    gains, losses = [], []
     for i in range(1, len(closes)):
         ch = closes[i] - closes[i-1]
-        if ch > 0:
-            gains.append(ch); losses.append(0)
-        else:
-            gains.append(0); losses.append(abs(ch))
+        gains.append(max(ch, 0)); losses.append(abs(min(ch, 0)))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
@@ -105,14 +103,14 @@ def rsi_from_closes(closes: List[float], period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ---- logic descriptions (short) ----
-LOGIC_DETAILS = {
+# ---------- 58 logic short desc ----------
+LOGIC_DESC = {
     "HTF_EMA_1h_15m": "1h vs 15m EMA alignment and slope",
     "HTF_EMA_1h_4h": "1h vs 4h EMA confluence",
     "HTF_EMA_1h_8h": "1h vs 8h EMA confluence",
     "HTF_Structure_Break": "Breakout of HTF support/resistance",
     "HTF_Structure_Reject": "HTF rejection at structure",
-    "Imbalance_FVG": "Fair-value gap / imbalance presence near price",
+    "Imbalance_FVG": "Fair-value gap / imbalance near price",
     "Trend_Continuation": "Current trend likely to continue",
     "Trend_Exhaustion": "Momentum dying out at push extremes",
     "Micro_Pullback": "Small retracement into value for entry",
@@ -168,20 +166,68 @@ LOGIC_DETAILS = {
 }
 
 def logic_descriptions_text() -> str:
-    parts = []
-    for k, v in LOGIC_DETAILS.items():
-        parts.append(f"{k}: {v}")
-    return "\n".join(parts)
+    return "\n".join([f"{k}: {v}" for k, v in LOGIC_DESC.items()])
 
-# ---- prompt builder ----
+# ---------- strict filters ----------
+def btc_calm_filter() -> bool:
+    snap = CACHE.get("btc_snapshot")
+    if not snap:
+        return False
+    atr_pct = snap["metrics"].get("atr_1h_pct", 999)
+    spr_pct = snap["metrics"].get("spread_5m_pct", 999)
+    return atr_pct < 1.2 and spr_pct < 0.05
+
+def spread_filter(metrics: Dict) -> bool:
+    return metrics.get("spread_pct", 999) < 0.08
+
+def volume_spike_ok(metrics: Dict) -> bool:
+    vol = metrics.get("vol_1m", 0)
+    base = metrics.get("vol_1m_avg_20", 0) or 1
+    return vol > base * 1.5
+
+def htf_alignment_score(metrics: Dict) -> int:
+    ema1h = metrics.get("ema_1h_50", 0)
+    ema15 = metrics.get("ema_15m_50", 0)
+    price = metrics["price"]
+    if price > ema15 > ema1h:
+        return 20
+    if price < ema15 < ema1h:
+        return 20
+    return 0
+
+def funding_oi_filter(symbol: str) -> bool:
+    funding = CACHE.get(f"funding_{symbol}")
+    oi = CACHE.get(f"oi_change_{symbol}")
+    if funding and abs(funding) > 0.05:
+        return False
+    if oi and oi > 10:
+        return False
+    return True
+
+def kill_switch() -> bool:
+    btc_ret = CACHE.get("btc_5m_return")
+    if btc_ret and btc_ret < -2.0:
+        return True
+    return False
+
+# ---------- prompt + score builder ----------
 def build_ai_prompt(symbol: str, price: float, metrics: Dict, prefs: Dict) -> str:
-    # keep arrays short
-    small = {}
-    for k, v in metrics.items():
-        if isinstance(v, list):
-            small[k] = v[-20:]
-        else:
-            small[k] = v
+    # ---- strict filters ----
+    if not btc_calm_filter():
+        return json.dumps({"score": 0, "mode": "quick", "reason": "BTC volatile"})
+    if not spread_filter(metrics):
+        return json.dumps({"score": 0, "mode": "quick", "reason": "Spread wide"})
+    if kill_switch():
+        return json.dumps({"score": 0, "mode": "quick", "reason": "Kill-switch"})
+
+    base = 0
+    base += htf_alignment_score(metrics)
+    if not volume_spike_ok(metrics):
+        base = min(base, 60)
+    if not funding_oi_filter(symbol):
+        base = min(base, 50)
+
+    small = {k: v[-20:] if isinstance(v, list) else v for k, v in metrics.items()}
     metrics_text = json.dumps(small, default=str)
     prefs_text = json.dumps(prefs, default=str)
     logic_text = logic_descriptions_text()
@@ -199,14 +245,15 @@ Price: {price}
 Metrics: {metrics_text}
 Preferences: {prefs_text}
 
+Base filter score so far: {base}
+
 Logic descriptions (short):
 {logic_text}
 
 Rules:
-1) If BTC calm filter fails -> return score 0.
-2) Use HTF alignment + volume + ATR to increase score.
-3) Penalize wide spread / low liquidity.
-4) Choose mode by horizon: quick(mid scalp), mid(momentum), trend(multi-hour).
-5) Output strict JSON only.
+1) Add 0-50 more points based on HTF alignment, volume, ATR, orderflow, imbalance, liquidation distance, etc.
+2) If total >85 → mode "trend", >70 → "mid", else "quick"
+3) Penalize wide spread, low liquidity, extreme funding/OI
+4) Output strict JSON only.
 """
     return prompt.strip()
