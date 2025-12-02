@@ -1,4 +1,11 @@
-import os, asyncio, aiohttp, time, hmac, hashlib, pandas as pd
+import os
+import asyncio
+import aiohttp
+import time
+import hmac
+import hashlib
+import json
+import pandas as pd
 from dotenv import load_dotenv
 load_dotenv()
 from helpers import (
@@ -7,6 +14,7 @@ from helpers import (
     calc_exhaustion, calc_fvg, calc_ob
 )
 
+# ---------- env ----------
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT    = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("BINANCE_API_KEY")
@@ -37,18 +45,19 @@ async def retry_get(session, url, params=None, headers=None, max_retry=5):
                 data = await r.json()
                 if isinstance(data, dict) and data.get("code"):
                     print("Binance err", data, "retry", i+1)
-                    await asyncio.sleep(2**i)
+                    await asyncio.sleep(2 ** i)
                     continue
                 return data
         except Exception as e:
             print("Retry ex", e, i+1)
-            await asyncio.sleep(2**i)
+            await asyncio.sleep(2 ** i)
     return None
 
 # ---------- multi-symbol klines (weight 1) ----------
 async def fetch_klines_batch(session, symbols, interval="1m", limit=30):
     url  = "https://api.binance.com/api/v3/klines"
-    params = {"symbols": str(symbols).replace("'", '"'), "interval": interval, "limit": limit}
+    symbols = [s.upper() for s in symbols]                       # ➜ upper only
+    params = {"symbols": json.dumps(symbols, separators=(",", ":")), "interval": interval, "limit": limit}
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     if not isinstance(data, list) or len(data) != len(symbols):
@@ -69,7 +78,8 @@ async def fetch_klines_batch(session, symbols, interval="1m", limit=30):
 # ---------- batch bookTicker (weight 1) ----------
 async def fetch_spread_batch(session, symbols):
     url  = "https://api.binance.com/api/v3/ticker/bookTicker"
-    params = {"symbols": str(symbols).replace("'", '"')}
+    symbols = [s.upper() for s in symbols]                       # ➜ upper only
+    params = {"symbols": json.dumps(symbols, separators=(",", ":"))}
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     out = {}
@@ -84,10 +94,11 @@ async def fetch_spread_batch(session, symbols):
                 pass
     return out
 
-# ---------- batch EMA (spot) ----------
+# ---------- batch EMA ----------
 async def fetch_ema_batch(session, symbols, interval, length=20):
     url  = "https://api.binance.com/api/v3/klines"
-    params = {"symbols": str(symbols).replace("'", '"'), "interval": interval, "limit": length}
+    symbols = [s.upper() for s in symbols]                       # ➜ upper only
+    params = {"symbols": json.dumps(symbols, separators=(",", ":")), "interval": interval, "limit": length}
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     out = {}
@@ -101,7 +112,15 @@ async def fetch_ema_batch(session, symbols, interval, length=20):
                 pass
     return out
 
-# ---------- single symbol handle ----------
+# ---------- telegram ----------
+async def send(msg):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    async with aiohttp.ClientSession() as s:
+        await s.post(url, json={"chat_id": CHAT, "text": msg, "parse_mode": "HTML"})
+
+# ---------- single symbol handler ----------
+MODE_THRESH = {"quick": 55, "mid": 62, "trend": 70}
+
 async def handle_symbol(session, symbol, kdata, spreads, emas15, emas1h, emas4h, emas8h):
     if symbol not in kdata:
         return
@@ -112,7 +131,6 @@ async def handle_symbol(session, symbol, kdata, spreads, emas15, emas1h, emas4h,
     ema1h  = emas1h.get(symbol, price)
     ema4h  = emas4h.get(symbol, price)
     ema8h  = emas8h.get(symbol, price)
-    btc_ch = 0  # single call later
 
     if spread > 0.05:
         print("Risk skip", symbol)
@@ -150,7 +168,6 @@ async def scanner():
     async with aiohttp.ClientSession() as session:
         while True:
             tasks = []
-            # split 48 → 2 batch (24 each) to keep URL length safe
             for i in range(0, len(WATCHLIST), 24):
                 batch = WATCHLIST[i:i+24]
                 tasks.append(process_batch(session, batch, sem))
@@ -159,7 +176,6 @@ async def scanner():
 
 async def process_batch(session, batch, sem):
     async with sem:
-        # cache check
         now = time.time()
         if cache.get("kl_time", 0) > now - CACHE_TTL:
             kdata   = cache.get("kl", {})
@@ -177,7 +193,6 @@ async def process_batch(session, batch, sem):
             em8h    = await fetch_ema_batch(session, batch, "4h", 40)
             cache.update({"kl": kdata, "spr": spreads, "em15": em15, "em1h": em1h, "em4h": em4h, "em8h": em8h, "kl_time": now})
 
-        # handle each symbol
         await asyncio.gather(*[handle_symbol(session, sym, kdata, spreads, em15, em1h, em4h, em8h) for sym in batch])
 
 if __name__ == "__main__":
