@@ -1,5 +1,5 @@
 # ============================
-# main.py — FINAL (45 coins, 4/30s, 70 score)
+# main.py — FINAL (IST 12 AM-7 AM OFF, 45 coins, 4/30s, 70 score)
 # ============================
 
 import os, time, json, asyncio, random, hashlib, sqlite3, logging
@@ -7,6 +7,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from aiohttp import web
 import aiohttp
+import pytz
 
 load_dotenv()
 
@@ -18,9 +19,6 @@ from helpers import (
     compute_ema_from_closes, atr, rsi_from_closes
 )
 
-# ------------------------- rsi_from_closes
-
-
 # -------------------------
 # ENV
 # -------------------------
@@ -29,7 +27,7 @@ CHAT_ID          = os.getenv("CHAT_ID", "").strip()
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL     = "gpt-4o-mini"
 CYCLE_TIME       = 30          # 30 sec
-SCORE_THRESHOLD  = 70          # relaxed
+SCORE_THRESHOLD  = 70
 COOLDOWN_SECONDS = 1800
 USE_TESTNET      = True
 BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY", "").strip()
@@ -179,13 +177,15 @@ async def worker():
     prefs = {"BTC_CALM_REQUIRED": True}
     BATCH = 4
     idx = 0
-    logging.info("Bot Started • 45 coins • 4/30s • 70 score • sleep 00-07 UTC")
+    logging.info("Bot Started • 45 coins • 4/30s • 70 score • IST 12 AM-7 AM OFF")
+
+    IST = pytz.timezone("Asia/Kolkata")
 
     try:
         while True:
-            utc_hour = datetime.utcnow().hour
-            if 0 <= utc_hour < 7:          # night mode
-                logging.info("Night mode – sleeping 30 min")
+            now = datetime.now(IST)
+            if 0 <= now.hour < 7:          # IST night mode
+                logging.info("Night mode (IST 12-7 AM) – sleeping 30 min")
                 await asyncio.sleep(1800)
                 continue
 
