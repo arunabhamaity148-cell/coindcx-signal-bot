@@ -20,15 +20,31 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 API_SEC = os.getenv("BINANCE_SECRET")
 INTERVAL = 60
 
-WATCHLIST = [
-"BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","MATICUSDT",
-"DOTUSDT","LINKUSDT","UNIUSDT","LTCUSDT","BCHUSDT","ALGOUSDT","VETUSDT","FILUSDT",
-"TRXUSDT","ETCUSDT","XLMUSDT","ATOMUSDT","XTZUSDT","ONTUSDT","ICXUSDT","ZILUSDT",
-"BATUSDT","ENJUSDT","COMPUSDT","MKRUSDT","SNXUSDT","SUSHIUSDT","YFIUSDT","AAVEUSDT",
-"AVAXUSDT","FTMUSDT","HOTUSDT","ZECUSDT","QTUMUSDT","EGLDUSDT","BTTUSDT","MANAUSDT",
-"CHZUSDT","HBARUSDT","NEARUSDT","OCEANUSDT","CTSIUSDT","RLCUSDT","BANDUSDT","IOSTUSDT"
+# ---------- 48 coin full list ----------
+WATCHLIST_RAW = [
+"BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","AVAXUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
+"LINKUSDT","DOTUSDT","MATICUSDT","TRXUSDT","LTCUSDT","ATOMUSDT","FILUSDT","INJUSDT",
+"OPUSDT","ARBUSDT","AAVEUSDT","SANDUSDT","DYDXUSDT","NEARUSDT","FTMUSDT","RUNEUSDT",
+"PYTHUSDT","TIAUSDT","SEIUSDT","RNDRUSDT","WLDUSDT","MINAUSDT","JTOUSDT","GALAUSDT",
+"SUIUSDT","FLOWUSDT","CHZUSDT","CTSIUSDT","EGLDUSDT","APTUSDT","LDOUSDT","MKRUSDT",
+"CRVUSDT","SKLUSDT","ENSUSDT","XLMUSDT","XTZUSDT","CFXUSDT","KAVAUSDT","PEPEUSDT","SHIBUSDT"
 ]
 
+# ---------- auto-fetch valid spot coins ----------
+async def fetch_valid_spot_symbols():
+    url = "https://api.binance.com/api/v3/exchangeInfo"
+    async with aiohttp.ClientSession() as s:
+        res = await s.get(url)
+        data = await res.json()
+    if isinstance(data, dict):
+        return [i["symbol"] for i in data.get("symbols", []) if i.get("status") == "TRADING" and i.get("quoteAsset") == "USDT"]
+    return []
+
+# ---------- startup filter ----------
+import asyncio
+valid_symbols = asyncio.run(fetch_valid_spot_symbols())
+WATCHLIST = [s for s in WATCHLIST_RAW if s in valid_symbols]
+print("Valid coins", len(WATCHLIST), WATCHLIST)
 
 cache = {}
 CACHE_TTL = 60
@@ -59,10 +75,11 @@ async def fetch_klines_batch(session, symbols, interval="1m", limit=30):
         print("Empty symbols – skipping klines")
         return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":")), "interval": interval, "limit": limit}
-    print("klines params", params)   # ➜ debug
+    print("klines params", params)
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     if not isinstance(data, list) or len(data) != len(symbols):
+        print("Invalid / delist coins for", symbols)
         return {}
     out = {}
     for idx, klines in enumerate(data):
@@ -85,7 +102,7 @@ async def fetch_spread_batch(session, symbols):
         print("Empty symbols – skipping spread")
         return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":"))}
-    print("spread params", params)   # ➜ debug
+    print("spread params", params)
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     out = {}
@@ -108,7 +125,7 @@ async def fetch_ema_batch(session, symbols, interval, length=20):
         print("Empty symbols – skipping ema")
         return {}
     params = {"symbols": json.dumps(symbols, separators=(",", ":")), "interval": interval, "limit": length}
-    print("ema params", params)   # ➜ debug
+    print("ema params", params)
     headers = {"X-MBX-APIKEY": API_KEY} if API_KEY else {}
     data = await retry_get(session, url, params, headers)
     out = {}
@@ -178,20 +195,18 @@ async def scanner():
     async with aiohttp.ClientSession() as session:
         while True:
             tasks = []
-            # ➜ 20 করে batch করো (min 2 guarantee)
             for i in range(0, len(WATCHLIST), 20):
                 batch = WATCHLIST[i:i+20]
                 tasks.append(process_batch(session, batch, sem))
             await asyncio.gather(*tasks)
             await asyncio.sleep(INTERVAL)
 
-
 async def process_batch(session, batch, sem):
     async with sem:
         if not batch:
             print("Empty batch – skipping")
             return
-        print("Processing batch", batch)   # ➜ debug
+        print("Processing batch", batch)
         now = time.time()
         if cache.get("kl_time", 0) > now - CACHE_TTL:
             kdata   = cache.get("kl", {})
