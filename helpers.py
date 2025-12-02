@@ -1,16 +1,9 @@
-import time
-import pandas as pd
-import numpy as np
+import time, hmac, hashlib, pandas as pd, numpy as np, os
+from dotenv import load_dotenv
+load_dotenv()
 
 COOLDOWN = 1800
 last_signal = {}
-
-def cooldown_ok(symbol):
-    return (time.time() - last_signal.get(symbol, 0)) > COOLDOWN
-
-def update_cd(symbol):
-    last_signal[symbol] = time.time()
-
 MODE_THRESH = {"quick": 55, "mid": 62, "trend": 70}
 TP_SL = {"quick": (1.2, 0.7), "mid": (1.8, 1.0), "trend": (2.5, 1.2)}
 
@@ -47,7 +40,7 @@ def calc_ob(klines):
     bear = (o < c) and (float(klines[-1][2]) > h)
     return bull or bear
 
-# 30-logic core
+# 30-logic
 def HTF_EMA_1h_15m(d): return 2 if d['ema_15m'] > d['ema_1h'] else 0
 def HTF_EMA_1h_4h(d): return 2 if d['ema_1h'] > d['ema_4h'] else 0
 def HTF_EMA_1h_8h(d): return 2 if d['ema_4h'] > d['ema_8h'] else 0
