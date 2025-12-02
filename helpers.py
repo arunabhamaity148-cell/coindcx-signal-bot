@@ -140,3 +140,4 @@ def format_signal(symbol, side, mode, price, score, tp, sl, liq):
 📊 Mode: <b>{mode}</b>
 
 #ArunSystem #HybridAI
+"""
