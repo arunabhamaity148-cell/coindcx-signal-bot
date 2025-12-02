@@ -1,16 +1,23 @@
-# main.py — FULL AUTONOMOUS SIGNAL BOT (NO MANUAL APPROVAL)
+# main.py — FULL REAL BINANCE AUTO-SIGNAL BOT (FINAL)
 import os
+import time
 import asyncio
 import aiohttp
-import time
 from dotenv import load_dotenv
 
 load_dotenv()
-from helpers import final_process, format_signal, cooldown_ok, update_cd
+
+from helpers import (
+    final_process,
+    format_signal,
+    cooldown_ok,
+    update_cd
+)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT  = os.getenv("TELEGRAM_CHAT_ID")
-INTERVAL = 8
+
+INTERVAL = 8   # seconds
 
 WATCHLIST = [
 "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","AVAXUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
@@ -23,52 +30,75 @@ WATCHLIST = [
 
 MODES = ["quick", "mid", "trend"]
 
+# ----------------------------------------------------------
+# TELEGRAM
+# ----------------------------------------------------------
 async def send_telegram(msg):
     if not TOKEN:
-        print("Telegram token missing")
+        print("❌ Telegram Token Missing")
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
         async with aiohttp.ClientSession() as s:
-            await s.post(url, json={"chat_id": CHAT, "text": msg, "parse_mode": "HTML"})
+            await s.post(url, json={
+                "chat_id": CHAT,
+                "text": msg,
+                "parse_mode": "HTML"
+            })
     except Exception as e:
         print("Telegram error:", e)
 
+# ----------------------------------------------------------
+# PROCESS EACH SYMBOL
+# ----------------------------------------------------------
 async def handle_symbol(session, symbol):
     for mode in MODES:
         try:
-            sig = await final_process(session, symbol, mode)
-            if not sig:
+            res = await final_process(session, symbol, mode)
+            if not res:
                 continue
 
             if not cooldown_ok(symbol):
                 return
 
-            msg = format_signal(sig)
+            msg = format_signal(res)
             await send_telegram(msg)
             update_cd(symbol)
 
-            print(f"SIGNAL SENT → {symbol} | {mode} | {sig['direction']} | score={sig['score']}")
-            return
-        except Exception as e:
-            print("ERR", symbol, mode, e)
+            print(f"✅ SIGNAL SENT | {symbol} | {mode} | {res['direction']} | Score={res['score']}")
             return
 
+        except Exception as e:
+            print("ERR:", symbol, mode, e)
+            return
+
+# ----------------------------------------------------------
+# MAIN LOOP
+# ----------------------------------------------------------
 async def scanner():
-    print("🚀 Bot Started — AUTO DECISION MODE — Hybrid AI v3")
+    print("🚀 Real Binance AI Bot Started — AUTO-DECISION ACTIVE")
+
     async with aiohttp.ClientSession() as session:
         while True:
-            t0 = time.time()
+            start = time.time()
+
             tasks = [handle_symbol(session, s) for s in WATCHLIST]
 
+            # Run in chunks to avoid overload
             for i in range(0, len(tasks), 10):
-                chunk = tasks[i:i+10]
-                await asyncio.gather(*chunk)
+                batch = tasks[i:i+10]
+                await asyncio.gather(*batch)
 
-            dt = time.time() - t0
-            slp = max(1, INTERVAL - dt)
-            print(f"Cycle = {dt:.2f}s | sleep {slp}s")
-            await asyncio.sleep(slp)
+            t = time.time() - start
+            sleep_time = max(1, INTERVAL - t)
+            print(f"Cycle: {t:.2f}s | Sleep: {sleep_time}s")
+            await asyncio.sleep(sleep_time)
 
+# ----------------------------------------------------------
+# ENTRY POINT
+# ----------------------------------------------------------
 if __name__ == "__main__":
-    asyncio.run(scanner())
+    try:
+        asyncio.run(scanner())
+    except KeyboardInterrupt:
+        print("Bot stopped manually.")
