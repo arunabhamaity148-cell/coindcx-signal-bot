@@ -19,7 +19,7 @@ from helpers import (
 
 # -------------------------
 , rsi_from_closes
-)
+
 
 # -------------------------
 # ENV
