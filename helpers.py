@@ -1,123 +1,257 @@
-import time, hmac, hashlib, pandas as pd, numpy as np, os
-from dotenv import load_dotenv
-load_dotenv()
+# helpers.py — FULL AI DECISION LAYER + Direction + Score + HTF + TP/SL + Format
+import aiohttp
+import asyncio
+import os
+import time
+import json
+import math
+from collections import defaultdict
 
-COOLDOWN = 1800
-last_signal = {}
-
-def cooldown_ok(symbol):
-    return (time.time() - last_signal.get(symbol, 0)) > COOLDOWN
-
-def update_cd(symbol):
-    last_signal[symbol] = time.time()
-
+# ==========================================================
+# CONFIG
+# ==========================================================
+COOLDOWN = 1800  # 30 minutes
 MODE_THRESH = {"quick": 55, "mid": 62, "trend": 70}
 TP_SL = {"quick": (1.2, 0.7), "mid": (1.8, 1.0), "trend": (2.5, 1.2)}
+LEVERAGE = 50
 
-def auto_leverage(score, mode):
-    base = {"quick": 15, "mid": 20, "trend": 25}
-    if score >= 90: return min(base[mode] + 5, 30)
-    if score >= 80: return base[mode]
-    if score >= 70: return base[mode] - 2
-    return 15
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = "gpt-4o-mini"
+AUTO_APPROVE = True   # FULL AUTO (NO MANUAL APPROVAL)
 
-def ema(closes, period):
-    return pd.Series(closes).ewm(span=period, adjust=False).mean().iloc[-1]
+# ==========================================================
+# CACHE SYSTEM (HTF optimization)
+# ==========================================================
+_cache = {}
+_cache_time = {}
 
-def calc_exhaustion(k):
-    o, h, l, c = float(k[1]), float(k[2]), float(k[3]), float(k[4])
-    rng = h - l
-    if rng == 0: return False
-    wick_top = h - max(o, c)
-    wick_bot = min(o, c) - l
-    return (wick_top / rng >= 0.7) or (wick_bot / rng >= 0.7)
+def cache_get(key, ttl=5):
+    v = _cache.get(key)
+    t = _cache_time.get(key, 0)
+    if not v:
+        return None
+    if time.time() - t > ttl:
+        return None
+    return v
 
-def calc_fvg(klines):
-    for i in range(1, len(klines) - 1):
-        prev_high, prev_low = float(klines[i - 1][2]), float(klines[i - 1][3])
-        curr_low, curr_high = float(klines[i][3]), float(klines[i][2])
-        nxt_low = float(klines[i + 1][3])
-        if curr_low > prev_high and nxt_low > prev_high: return True
-        if curr_high < prev_low and float(klines[i + 1][2]) < prev_low: return True
-    return False
+def cache_set(key, val):
+    _cache[key] = val
+    _cache_time[key] = time.time()
 
-def calc_ob(klines):
-    o, h, l, c = float(klines[-2][1]), float(klines[-2][2]), float(klines[-2][3]), float(klines[-2][4])
-    bull = (o > c) and (float(klines[-1][3]) < l)
-    bear = (o < c) and (float(klines[-1][2]) > h)
-    return bull or bear
+# ==========================================================
+# UTILS
+# ==========================================================
+def ema(values, length):
+    if len(values) < 1:
+        return values[-1] if values else 0
+    k = 2 / (length + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = e * (1 - k) + v * k
+    return e
 
-# 30-logic
-def HTF_EMA_1h_15m(d): return 2 if d['ema_15m'] > d['ema_1h'] else 0
-def HTF_EMA_1h_4h(d): return 2 if d['ema_1h'] > d['ema_4h'] else 0
-def HTF_EMA_1h_8h(d): return 2 if d['ema_4h'] > d['ema_8h'] else 0
-def HTF_Structure_Break(d): return 3 if d['trend'] == "bull_break" else 0
-def HTF_Structure_Reject(d): return 3 if d['trend'] == "reject" else 0
-def Trend_Continuation(d): return 3 if d['trend_strength'] > 0.7 else 0
-def Micro_Pullback(d): return 2 if d['micro_pb'] else 0
-def Trend_Exhaustion(d): return 1 if d['exhaustion'] else 0
-def Imbalance_FVG(d): return 2 if d['fvg'] else 0
-def Order_Block(d): return 2 if d['orderblock'] else 0
-def Vol_Sweep_1m(d): return 2 if d['vol_1m'] > d['vol_5m'] else 0
-def Vol_Sweep_5m(d): return 2 if d['vol_5m'] > d['vol_1m'] else 0
-def ADR_DayRange(d): return 1 if d['adr_ok'] else 0
-def ATR_Expansion(d): return 1 if d['atr_expanding'] else 0
-def Tight_Spread_Filter(d): return 1 if d['spread'] < 0.03 else 0
-def Spread_Safety(d): return 1 if d['spread'] < 0.05 else 0
-def BTC_Risk_Filter_L1(d): return -8 if not d['btc_calm'] else 2
-def Kill_Switch_Primary(d): return -25 if d['kill_primary'] else 0
-def Wick_Strength(d): return 2 if d['wick_ratio'] > 1.5 else 0
-def Liquidity_Wall(d): return 2 if d['liq_wall'] else 0
-def Liquidity_Bend(d): return 2 if d['liq_bend'] else 0
-def Orderbook_Wall_Shift(d): return 2 if d['wall_shift'] else 0
-def Speed_Imbalance(d): return 2 if d['speed_imbalance'] else 0
-def Absorption(d): return 2 if d['absorption'] else 0
-def Sweep_Reversal(d): return 2 if d['liquidation_sweep'] else 0
-def Micro_Slip(d): return -1 if d['slippage'] else 0
-def Liquidation_Distance(d): return 2 if d['liq_dist'] < 0.5 else 0
-def Spread_Snap_025(d): return 1 if d['spread'] < 0.0025 else 0
-def Spread_Snap_05(d): return 1 if d['spread'] < 0.005 else 0
-def Taker_Pressure(d): return 2 if d['taker_pressure'] else 0
+_last_signal = {}
 
-def final_score(d):
-    return max(0, min(sum([
-        HTF_EMA_1h_15m(d), HTF_EMA_1h_4h(d), HTF_EMA_1h_8h(d),
-        HTF_Structure_Break(d), HTF_Structure_Reject(d),
-        Trend_Continuation(d), Micro_Pullback(d), Trend_Exhaustion(d),
-        Imbalance_FVG(d), Order_Block(d),
-        Vol_Sweep_1m(d), Vol_Sweep_5m(d),
-        ADR_DayRange(d), ATR_Expansion(d),
-        Tight_Spread_Filter(d), Spread_Safety(d),
-        BTC_Risk_Filter_L1(d), Kill_Switch_Primary(d),
-        Wick_Strength(d), Liquidity_Wall(d), Liquidity_Bend(d),
-        Orderbook_Wall_Shift(d), Speed_Imbalance(d), Absorption(d),
-        Sweep_Reversal(d), Micro_Slip(d), Liquidation_Distance(d),
-        Spread_Snap_025(d), Spread_Snap_05(d), Taker_Pressure(d)
-    ]), 100))
+def cooldown_ok(symbol):
+    t = _last_signal.get(symbol, 0)
+    return (time.time() - t) >= COOLDOWN
 
-def trade_side(price, prev, ema1h):
-    if price > prev and price > ema1h:
+def update_cd(symbol):
+    _last_signal[symbol] = time.time()
+
+# ==========================================================
+# HTF FETCH MODULE
+# ==========================================================
+BIN = "https://api.binance.com"
+
+async def fetch_klines(session, symbol, interval, limit):
+    key = f"{symbol}:{interval}:{limit}"
+    c = cache_get(key, ttl=10)
+    if c: return c
+    url = f"{BIN}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    try:
+        async with session.get(url, timeout=8) as r:
+            data = await r.json()
+            cache_set(key, data)
+            return data
+    except:
+        return None
+
+async def get_htf(session, symbol):
+    k15, k1h, k4h = await asyncio.gather(
+        fetch_klines(session, symbol, "15m", 60),
+        fetch_klines(session, symbol, "1h", 60),
+        fetch_klines(session, symbol, "4h", 60)
+    )
+
+    if not k15 or not k1h or not k4h:
+        return None
+
+    c15 = [float(x[4]) for x in k15]
+    c1h = [float(x[4]) for x in k1h]
+    c4h = [float(x[4]) for x in k4h]
+
+    ema15 = ema(c15[-15:], 15)
+    ema50 = ema(c15[-50:], 50) if len(c15) >= 50 else ema15
+    ema200 = ema(c15[-200:], 200) if len(c15) >= 200 else ema50
+
+    ema1h_50 = ema(c1h[-50:], 50) if len(c1h) >= 50 else c1h[-1]
+    ema4h_50 = ema(c4h[-50:], 50) if len(c4h) >= 50 else c4h[-1]
+
+    return {
+        "close_15": c15[-1],
+        "prev_15": c15[-2],
+        "ema_15": ema15,
+        "ema_50": ema50,
+        "ema_200": ema200,
+        "ema_1h": ema1h_50,
+        "ema_4h": ema4h_50,
+        "trend_15": "up" if c15[-1] > ema50 else "down",
+        "trend_1h": "up" if c1h[-1] > ema1h_50 else "down",
+        "trend_4h": "up" if c4h[-1] > ema4h_50 else "down",
+        "closes": c15
+    }
+
+# ==========================================================
+# DIRECTION ENGINE v2
+# ==========================================================
+def get_direction(htf):
+    ema_bull = htf["ema_15"] > htf["ema_50"] > htf["ema_200"]
+    ema_bear = htf["ema_15"] < htf["ema_50"] < htf["ema_200"]
+
+    bull = htf["trend_15"] == "up" and htf["trend_1h"] == "up"
+    bear = htf["trend_15"] == "down" and htf["trend_1h"] == "down"
+
+    if ema_bull and bull:
         return "BUY"
-    elif price < prev and price < ema1h:
+    if ema_bear and bear:
         return "SELL"
     return None
 
-def calc_tp_sl(price, mode):
+# ==========================================================
+# SCORE ENGINE V3
+# ==========================================================
+def score_v3(htf, mode):
+    s = 0
+    momentum = abs(htf["close_15"] - htf["prev_15"]) / max(htf["prev_15"], 1)
+
+    if mode == "quick":
+        if momentum > 0.004: s += 15
+        if htf["trend_15"] == "up": s += 10
+        if htf["ema_15"] > htf["ema_50"]: s += 10
+
+    if mode == "mid":
+        if htf["trend_1h"] == "up": s += 20
+        if htf["ema_50"] > htf["ema_200"]: s += 15
+        if momentum > 0.002: s += 10
+
+    if mode == "trend":
+        if htf["trend_4h"] == "up": s += 25
+        if htf["trend_1h"] == "up": s += 20
+        if htf["ema_50"] > htf["ema_200"]: s += 15
+
+    return min(100, s)
+
+# ==========================================================
+# AI VERIFIER (AUTO DECISION)
+# ==========================================================
+async def ai_verify(sig):
+    if not OPENAI_KEY:
+        return {"approve": True, "tp": None, "sl": None, "note": "no_key_fail_open"}
+
+    prompt = f"""
+You are a crypto risk manager. Verify this signal:
+
+{json.dumps(sig)}
+
+Return only JSON:
+{{"approve": true/false, "tp": null or number, "sl": null or number, "note": "short text"}}
+"""
+
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are strict but concise."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0,
+        "max_tokens": 100
+    }
+
+    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post("https://api.openai.com/v1/chat/completions", json=body, headers=headers, timeout=6) as r:
+                data = await r.json()
+                c = data["choices"][0]["message"]["content"]
+                j = json.loads(c)
+                return j
+    except:
+        return {"approve": True, "tp": None, "sl": None, "note": "fail_open"}
+
+# ==========================================================
+# FINAL PROCESS
+# ==========================================================
+async def final_process(session, symbol, mode):
+    htf = await get_htf(session, symbol)
+    if not htf:
+        return None
+
+    direction = get_direction(htf)
+    if not direction:
+        return None
+
+    score = score_v3(htf, mode)
+    if score < MODE_THRESH[mode]:
+        return None
+
+    price = htf["close_15"]
     tp_pct, sl_pct = TP_SL[mode]
     tp = price * (1 + tp_pct / 100)
     sl = price * (1 - sl_pct / 100)
-    return round(tp, 6), round(sl, 6)
 
-def format_signal(symbol, side, mode, price, score, tp, sl, liq, lev):
-    return f"""🔥 <b>{mode.upper()} {side} SIGNAL</b>
-<b>Pair:</b> {symbol}
-<b>Entry:</b> <code>{price}</code>
-<b>Score:</b> <b>{score}</b>/100
-🎯 <b>TP:</b> <code>{tp}</code>
-🛑 <b>SL:</b> <code>{sl}</code>
-🟩 <b>BE-SL:</b> Enabled
-📉 <b>LiQ Distance:</b> {liq}
-⚙️ <b>Leverage:</b> {lev}x
+    signal = {
+        "symbol": symbol,
+        "direction": direction,
+        "mode": mode,
+        "price": round(price, 6),
+        "tp": round(tp, 6),
+        "sl": round(sl, 6),
+        "score": score,
+        "liq_dist": 0.6
+    }
+
+    # AI DECISION
+    ai = await ai_verify(signal)
+
+    if not ai.get("approve", True):
+        return None
+
+    if ai.get("tp") is not None:
+        signal["tp"] = ai["tp"]
+    if ai.get("sl") is not None:
+        signal["sl"] = ai["sl"]
+
+    return signal
+
+# ==========================================================
+# TELEGRAM FORMAT
+# ==========================================================
+def format_signal(sig):
+    return f"""
+🔥 <b>{sig['mode'].upper()} {sig['direction']} SIGNAL</b>
+
+<b>Pair:</b> {sig['symbol']}
+<b>Entry:</b> <code>{sig['price']}</code>
+<b>Score:</b> {sig['score']}
+
+🎯 <b>TP:</b> <code>{sig['tp']}</code>
+🛑 <b>SL:</b> <code>{sig['sl']}</code>
+
+⚡ Leverage: {LEVERAGE}x
+📉 LiQ Dist: {sig['liq_dist']}%
 ⏱ Cooldown: 30m
-📊 Mode: <b>{mode}</b>
-#ArunSystem #HybridAI"""
+
+#ArunSystem #HybridAI
+"""
