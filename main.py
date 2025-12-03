@@ -84,7 +84,7 @@ class SignalBot:
                 await self.process_signal(symbol, "TREND", trend, data)
 
         except Exception as e:
-            logger.error(f"Error analyzing {symbol}: {e}")
+            logger.exception(f"Error analyzing {symbol}: {e}")
 
     async def process_signal(self, symbol, mode, result, data):
         try:
@@ -158,7 +158,7 @@ class SignalBot:
                 lev_sugg = SUGGESTED_LEVERAGE.get(mode, 20)
                 leverage_use = max(15, min(30, int(lev_sugg)))
 
-            # Calculate TP/SL (support both calc_single_tp_sl and calc_tp_sl)
+            # Calculate TP/SL (support both calc_single_tp_sl returns)
             tp, sl, codeblock = None, None, None
             try:
                 tp_sl = calc_single_tp_sl(price, direction, mode)
@@ -168,24 +168,35 @@ class SignalBot:
                     codeblock = tp_sl.get("code")
                 elif isinstance(tp_sl, (list, tuple)) and len(tp_sl) >= 2:
                     tp, sl = tp_sl[0], tp_sl[1]
+                else:
+                    # fallback: try tuple return (tp, sl, lev, code)
+                    try:
+                        tp, sl, _, codeblock = calc_single_tp_sl(price, direction, mode)
+                    except Exception:
+                        tp, sl, codeblock = None, None, None
             except Exception:
+                logger.debug("calc_single_tp_sl primary parsing failed, attempted fallback", exc_info=True)
                 try:
-                    tp, sl, lev_tmp, codeblock = calc_single_tp_sl(price, direction, mode)
+                    tp, sl, _, codeblock = calc_single_tp_sl(price, direction, mode)
                 except Exception:
                     tp, sl, codeblock = None, None, None
 
             # Format message (USD)
             msg, code_msg = telegram_formatter_style_c(symbol, mode, direction, result, data)
-            # Ensure leverage in codeblock
+            # Ensure leverage in codeblock if exists
             if code_msg and isinstance(code_msg, str):
-                code_msg = code_msg.replace("LEVERAGE = ", f"LEVERAGE = {leverage_use}")
+                # try to replace placeholder or add line with LEVERAGE
+                if "LEVERAGE" in code_msg:
+                    code_msg = code_msg.replace("LEVERAGE = ", f"LEVERAGE = {leverage_use}")
+                else:
+                    code_msg = (code_msg + f"\n```python\nLEVERAGE = {leverage_use}\n```")
 
             # Auto-send or save candidate
             if AUTO_PUBLISH and not ASSISTANT_CONTROLLED_PUBLISH:
                 # Rate limiter check
                 minute_key = int(time.time()) // 60
                 hour_key = int(time.time()) // 3600
-                # cleanup old keys
+                # cleanup old keys (keep only current window)
                 self.tg_rate["by_min"] = {k: v for k, v in self.tg_rate["by_min"].items() if k == minute_key}
                 self.tg_rate["by_hour"] = {k: v for k, v in self.tg_rate["by_hour"].items() if k == hour_key}
 
@@ -225,7 +236,8 @@ class SignalBot:
                     "ai": ai_res,
                     "saved_at": datetime.utcnow().isoformat()
                 }
-                saved = save_pending_signal(PENDING_SIGNALS_FILE, candidate)
+                # use symbol_mode key for dedupe & easy lookup
+                saved = save_pending_signal(f"{symbol}_{mode}", candidate)
                 if saved:
                     self._global_symbol_last[symbol] = now_ts
                     logger.info(f"💾 Candidate saved for manual review: {symbol} {mode} (conf {conf}%)")
@@ -233,7 +245,7 @@ class SignalBot:
                     logger.error("❌ Failed to save candidate")
 
         except Exception as e:
-            logger.error(f"❌ Error in process_signal for {symbol}: {e}")
+            logger.exception(f"❌ Error in process_signal for {symbol}: {e}")
 
     async def run(self):
         logger.info("🚀 Signal Bot Started!")
@@ -246,7 +258,7 @@ class SignalBot:
         except asyncio.CancelledError:
             logger.info("Shutdown requested")
         except Exception as e:
-            logger.error(f"Main loop error: {e}")
+            logger.exception(f"Main loop error: {e}")
         finally:
             await self.shutdown()
 
@@ -254,7 +266,7 @@ class SignalBot:
         logger.info("🛑 Shutting down...")
         try:
             await self.market.close()
-        except:
+        except Exception:
             pass
         logger.info("✅ Shutdown complete")
 
