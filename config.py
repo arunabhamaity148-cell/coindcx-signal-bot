@@ -73,8 +73,8 @@ TP_SL_CONFIG = {
 # LEVERAGE CONFIG (DEFAULT = 50× for QUICK/MID)
 # ==========================================
 SUGGESTED_LEVERAGE = {
-    "QUICK": 30,   # Your preference
-    "MID":   30,   # Your preference
+    "QUICK": 50,   # Your preference
+    "MID":   50,   # Your preference
     "TREND": 20    # Trend trades are safer with lower leverage
 }
 
