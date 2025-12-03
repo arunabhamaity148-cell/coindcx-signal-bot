@@ -40,9 +40,9 @@ TRADING_PAIRS = [
 # ==========================================
 # SIGNAL MINIMUM SCORE (Balanced Mode)
 # ==========================================
-QUICK_MIN_SCORE = 5.0       # Balanced mode
-MID_MIN_SCORE   = 5.0       # Balanced mode
-TREND_MIN_SCORE = 5.0       # Balanced mode
+QUICK_MIN_SCORE = 7.0       # Balanced mode
+MID_MIN_SCORE   = 7.0       # Balanced mode
+TREND_MIN_SCORE = 7.0       # Balanced mode
 
 
 # ==========================================
