@@ -1,86 +1,52 @@
-# ==============================================
-# ai_decision_layer.py
-# ARUN HYBRID TRADER GPT V2 — Decision Layer
-# ==============================================
-
-import json
-import logging
 import os
-from dotenv import load_dotenv
-from openai import OpenAI
+import aiohttp
+import json
 
-load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = "gpt-4o-mini"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not set in .env")
+async def ai_review_signal(symbol, mode, direction, score, triggers, price):
+    # Fallback heuristic if API key missing
+    if not OPENAI_API_KEY:
+        if score >= 8.5:
+            return {"allow": True, "confidence": 92, "reason": "Strong internal score"}
+        if score >= 6:
+            return {"allow": True, "confidence": 80, "reason": "Medium score, allowed"}
+        return {"allow": False, "confidence": 50, "reason": "Weak score"}
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-logger = logging.getLogger("decision_layer_v2")
-
-
-async def decision_layer_v2(signal_payload: dict):
-    """
-    The bot sends raw signal data here.
-    ChatGPT V2 analyzes the data and returns a JSON decision.
-    """
-
-    prompt = f"""
-You are ARUN HYBRID TRADER GPT V2, a safe self-improving trading AI.
-
-Rules (apply strictly):
-- Reject if btc_calm is false.
-- Reject if spread > 0.10 (percentage).
-- Reject if depth < 3000 (USD).
-- Reject if sl_distance_pct < 5 (percent).
-- Reject if score < 5.0.
-- Determine side from triggers (bullish vs bearish words).
-- Leverage rules:
-    * score >= 9.0 and market stable -> 50
-    * score >= 9.0 and market volatile -> max 30
-    * score 7-8 -> 20-25
-    * score 5-6 -> 15-20
-- Adjust TP/SL if market regime suggests (return modifiers).
-- Suggest small weight adjustments for learning.
-
-Return ONLY valid JSON with EXACT keys:
-{
-  "decision": "APPROVE" | "MODIFY" | "REJECT" | "DELAY",
-  "side": "LONG" | "SHORT",
-  "confidence": 0-100,
-  "recommended_leverage": 15-50,
-  "tp_modifier": 1.0,
-  "sl_modifier": 1.0,
-  "adjusted_weights": { "name": 0.1, ... },
-  "reason": "short explanation"
-}
-
-Here is the raw payload:
-{json.dumps(signal_payload, indent=2)}
-"""
+    prompt = (
+        f"Signal review:\n"
+        f"Symbol: {symbol}\nMode: {mode}\nDirection: {direction}\n"
+        f"Score: {score}\nPrice: {price}\nTriggers: {triggers}\n"
+        f"Reply JSON with: allow, confidence, reason."
+    )
 
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.0,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        async with aiohttp.ClientSession() as s:
+            r = await s.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 100,
+                    "temperature": 0.0
+                }
+            )
+            data = await r.json()
+            text = data["choices"][0]["message"]["content"]
 
-        content = resp.choices[0].message.content.strip()
-        # Parse JSON safely
-        decision = json.loads(content)
-        return decision
+            # extract JSON
+            idx = text.find("{")
+            if idx >= 0:
+                raw = text[idx:]
+                return json.loads(raw)
 
-    except Exception as e:
-        logger.error(f"Decision Layer Error: {e}")
-        # On error, be safe and reject
-        return {
-            "decision": "REJECT",
-            "side": None,
-            "confidence": 0,
-            "recommended_leverage": 15,
-            "tp_modifier": 1.0,
-            "sl_modifier": 1.0,
-            "adjusted_weights": {},
-            "reason": f"Decision error: {e}"
-        }
+    except Exception:
+        pass
+
+    # fallback
+    return {"allow": True, "confidence": 80, "reason": "Fallback allow"}
