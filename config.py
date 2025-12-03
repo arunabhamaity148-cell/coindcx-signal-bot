@@ -88,7 +88,7 @@ GLOBAL_SYMBOL_COOLDOWN = 1800
 # 🤖 AI Control & Auto-Publish
 # ---------------------------------------
 ASSISTANT_CONTROLLED_PUBLISH = False     # False → AI allowed → bot auto publish
-AUTO_PUBLISH = true                     # Start safe-mode first 24 hours
+AUTO_PUBLISH = True                     # Start safe-mode first 24 hours
 AI_MIN_CONFIDENCE_TO_SEND = 90           # Only high confidence signals go to Telegram
 
 
