@@ -50,21 +50,24 @@ class WS:
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = json.loads(msg.data)
-                        await self._handle(data)
-    async def _handle(self, data):
-        r = await redis()
-        stream = data.get("stream")
-        payload = data.get("data")
-        if "@ticker" in stream:
-            s = payload["s"]
-            await r.hset(f"t:{s}", mapping={"last": payload["c"], "vol": payload["v"], "E": payload["E"]})
-        elif "@depth20" in stream:
-            s = payload["s"]
-            await r.hset(f"d:{s}", mapping={"bids": json.dumps(payload["bids"]), "asks": json.dumps(payload["asks"])})
-        elif "@trade" in stream:
-            s = payload["s"]
-            await r.lpush(f"tr:{s}", json.dumps({"p": payload["p"], "q": payload["q"], "m": payload["m"], "t": payload["T"]}))
-            await r.ltrim(f"tr:{s}", 0, 199)
+                        await self._handle(data) 
+async def _handle(self, data):
+    r = await redis()
+    stream = data.get("stream", "")
+    payload = data.get("data", {})
+    if "@ticker" in stream:
+        s = payload.get("s")
+        if s: await r.hset(f"t:{s}", mapping={"last": payload.get("c"), "vol": payload.get("v"), "E": payload.get("E")})
+    elif "@depth20" in stream:
+        s = payload.get("s")
+        bids = payload.get("bids", [])
+        asks = payload.get("asks", [])
+        if s and (bids or asks): await r.hset(f"d:{s}", mapping={"bids": json.dumps(bids), "asks": json.dumps(asks)})
+    elif "@trade" in stream:
+        s = payload.get("s")
+        if s: await r.lpush(f"tr:{s}", json.dumps({"p": payload.get("p"), "q": payload.get("q"), "m": payload.get("m"), "t": payload.get("T")}))
+        await r.ltrim(f"tr:{s}", 0, 199)
+
 
 # ---------- regime ----------
 def adx_np(close, high, low, n=14):
