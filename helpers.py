@@ -1,702 +1,181 @@
-# ==========================================
-# helpers.py — PART 1
-# ==========================================
-
-import aiohttp
-import asyncio
-import os
-import time
-import hmac
-import hashlib
-import json
-import logging
-import math
-from datetime import datetime, timedelta
-
-import pandas as pd
-import numpy as np
-import ccxt.async_support as ccxt
-
-from config import *
-
-logger = logging.getLogger("signal_bot")
-
-# ==============================
-# SAFE FLOAT (CRITICAL PATCH)
-# ==============================
-def safe_float(v, default=0.0):
-    """Convert API/string values safely to float"""
-    try:
-        return float(v)
-    except:
-        try:
-            return float(str(v).replace(",", "").strip())
-        except:
-            return default
-
-# ==============================
-# SYMBOL NORMALIZATION
-# ==============================
-def normalize_symbol(sym: str) -> str:
-    if "/" in sym:
-        return sym
-    if sym.endswith("USDT"):
-        return f"{sym[:-4]}/USDT"
-    return sym
-
-# ==============================
-# SCORE SMOOTHING (EMA)
-# ==============================
-score_history = {}
-
-def smooth_score(key, new_score, alpha=0.35):
-    old = score_history.get(key)
-    if old is None:
-        score_history[key] = new_score
-    else:
-        score_history[key] = (old * (1 - alpha)) + (new_score * alpha)
-    return score_history[key]
-
-# ==============================
-# COOLDOWN + DEDUPE MANAGER
-# ==============================
-class CooldownManager:
-    def __init__(self):
-        self.last_sent = {}
-        self.signal_hashes = {}
-
-    def can_send(self, symbol, mode, cooldown_seconds):
-        key = f"{symbol}_{mode}"
-        now = datetime.utcnow()
-        last = self.last_sent.get(key)
-
-        if last and (now - last).total_seconds() < cooldown_seconds:
-            return False
-
-        self.last_sent[key] = now
-        return True
-
-    def generate_hash(self, rule_key, triggers, price, mode):
-        try:
-            if isinstance(triggers, str):
-                t = triggers.split("\n")
-            else:
-                t = triggers
-            t_sorted = sorted([x.strip() for x in t if x.strip()])
-            data = json.dumps({
-                "rule": rule_key,
-                "triggers": t_sorted,
-                "price": safe_float(price),
-                "mode": mode
-            }, separators=(",", ":"))
-            return hashlib.md5(data.encode()).hexdigest()
-        except:
-            return hashlib.md5(str(time.time()).encode()).hexdigest()
-
-    def ensure_single_alert(self, rule_key, triggers, price, mode):
-        h = self.generate_hash(rule_key, triggers, price, mode)
-        now = datetime.utcnow()
-
-        if h in self.signal_hashes:
-            if (now - self.signal_hashes[h]).total_seconds() < 1800:
-                return False
-
-        self.signal_hashes[h] = now
-        return True
-
-cooldown_manager = CooldownManager()
-
-# ==============================
-# MARKET DATA WRAPPER
-# ==============================
-class MarketData:
-    def __init__(self, api_key, secret):
-        self.rate_sema = asyncio.Semaphore(6)
-        self.exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": secret,
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "future",
-                "test": USE_TESTNET
-            }
-        })
-
-    async def fetch_with_retry(self, fn, retries=3):
-        for attempt in range(retries):
-            try:
-                async with self.rate_sema:
-                    return await fn()
-            except Exception as e:
-                if attempt == retries - 1:
-                    logger.error(f"Fetch failed permanently: {e}")
-                    return None
-                backoff = 2 ** attempt
-                logger.warning(f"Retry {attempt+1} after {backoff}s: {e}")
-                await asyncio.sleep(backoff)
-
-    async def get_all_data(self, symbol):
-        try:
-            sym = normalize_symbol(symbol)
-
-            ticker = await self.fetch_with_retry(lambda: self.exchange.fetch_ticker(sym))
-            if not ticker:
-                return None
-
-            # -------------------------
-            # SAFE FLOAT PATCH
-            # -------------------------
-            last = safe_float(ticker.get("last", 0))
-            vol = safe_float(ticker.get("baseVolume", ticker.get("volume", 0)))
-
-            ohlcv_1m = await self.fetch_with_retry(lambda: self.exchange.fetch_ohlcv(sym, "1m", limit=200))
-            ohlcv_5m = await self.fetch_with_retry(lambda: self.exchange.fetch_ohlcv(sym, "5m", limit=200))
-            ohlcv_15m = await self.fetch_with_retry(lambda: self.exchange.fetch_ohlcv(sym, "15m", limit=200))
-            ohlcv_1h = await self.fetch_with_retry(lambda: self.exchange.fetch_ohlcv(sym, "1h", limit=200))
-            ohlcv_4h = await self.fetch_with_retry(lambda: self.exchange.fetch_ohlcv(sym, "4h", limit=200))
-
-            orderbook = await self.fetch_with_retry(lambda: self.exchange.fetch_order_book(sym, limit=20))
-            if not orderbook or not orderbook.get("bids") or not orderbook.get("asks"):
-                logger.error(f"Orderbook empty for {symbol}")
-                return None
-
-            bid = safe_float(orderbook["bids"][0][0]) if orderbook["bids"] else None
-            ask = safe_float(orderbook["asks"][0][0]) if orderbook["asks"] else None
-
-            if bid is None or ask is None or bid == 0:
-                spread = 999
-            else:
-                spread = (ask - bid) / ((ask + bid) / 2) * 100
-
-            return {
-                "symbol": symbol,
-                "price": last,
-                "volume": vol,
-                "ohlcv_1m": ohlcv_1m,
-                "ohlcv_5m": ohlcv_5m,
-                "ohlcv_15m": ohlcv_15m,
-                "ohlcv_1h": ohlcv_1h,
-                "ohlcv_4h": ohlcv_4h,
-                "orderbook": orderbook,
-                "spread": spread
-            }
-
-        except Exception as e:
-            logger.error(f"Market fetch error for {symbol}: {e}")
-            return None
-
-    async def close(self):
-        try:
-            await self.exchange.close()
-        except:
-            pass
-
-# ==============================
-# VALIDATION / FORMATTING
-# ==============================
-def validate_ohlcv(ohlcv, required):
-    return bool(ohlcv and len(ohlcv) >= required)
-
-def format_price_usd(p):
-    p = safe_float(p)
-    if p >= 1000:
-        return f"${p:,.2f}"
-    if p >= 1:
-        return f"${p:.2f}"
-    return f"${p:.4f}"
-# ==========================================
-# helpers.py — PART 2
-# ==========================================
-
-# ==============================
-# INDICATORS (Stable Versions)
-# ==============================
-def safe_rsi(ohlcv, period=14):
-    if not validate_ohlcv(ohlcv, period + 10):
-        return 50
-    closes = np.array([c[4] for c in ohlcv], dtype=float)
-    delta = np.diff(closes)
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(period).mean().iloc[-1]
-    avg_loss = pd.Series(loss).rolling(period).mean().iloc[-1]
-    if avg_loss == 0:
-        return 70
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def safe_macd(ohlcv):
-    if not validate_ohlcv(ohlcv, 35):
-        return (0, 0, 0, 0)
-    closes = pd.Series([c[4] for c in ohlcv])
-    exp1 = closes.ewm(span=12, adjust=False).mean()
-    exp2 = closes.ewm(span=26, adjust=False).mean()
-    macd = exp1 - exp2
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd.iloc[-1], signal.iloc[-1], macd.iloc[-2], signal.iloc[-2]
-
-
-def safe_ema(ohlcv, period):
-    if not validate_ohlcv(ohlcv, period + 10):
-        return 0
-    closes = pd.Series([c[4] for c in ohlcv])
-    return closes.ewm(span=period, adjust=False).mean().iloc[-1]
-
-
-def safe_atr(ohlcv, period=14):
-    if not validate_ohlcv(ohlcv, period + 10):
-        return 0
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-    df["tr"] = df[["high", "low", "close"]].apply(
-        lambda x: max(
-            x["high"] - x["low"],
-            abs(x["high"] - x["close"]),
-            abs(x["low"] - x["close"])
-        ), axis=1
-    )
-    atr = df["tr"].rolling(period).mean().iloc[-1]
-    return 0 if pd.isna(atr) else atr
-
-
-def safe_vwap(ohlcv):
-    if not validate_ohlcv(ohlcv, 10):
-        return safe_float(ohlcv[-1][4])
-    typical = [(c[2] + c[3] + c[4]) / 3 for c in ohlcv]
-    vol = [c[5] for c in ohlcv]
-    total = sum(vol)
-    if total == 0:
-        return safe_float(ohlcv[-1][4])
-    return sum([t * v for t, v in zip(typical, vol)]) / total
-
-
-# ==============================
-# BTC CALM CHECK
-# ==============================
-async def btc_calm_check(market):
-    try:
-        data = await market.get_all_data("BTCUSDT")
-        if not data:
-            return True
-
-        o1 = data["ohlcv_1m"]
-        o5 = data["ohlcv_5m"]
-
-        if not validate_ohlcv(o1, 3) or not validate_ohlcv(o5, 3):
-            return True
-
-        c1_now = safe_float(o1[-1][4])
-        c1_prev = safe_float(o1[-2][4])
-        change_1m = abs(c1_now - c1_prev) / c1_prev * 100
-
-        c5_now = safe_float(o5[-1][4])
-        c5_prev = safe_float(o5[-2][4])
-        change_5m = abs(c5_now - c5_prev) / c5_prev * 100
-
-        if change_1m > BTC_VOLATILITY_THRESHOLDS["1m"]:
-            logger.warning(f"BTC volatile (1m): {change_1m:.2f}%")
-            return False
-        if change_5m > BTC_VOLATILITY_THRESHOLDS["5m"]:
-            logger.warning(f"BTC volatile (5m): {change_5m:.2f}%")
-            return False
-
-        return True
-
-    except Exception as e:
-        logger.error(f"BTC calm error: {e}")
-        return True
-
-
-# ==============================
-# SPREAD / DEPTH CHECK
-# ==============================
-def spread_ok(data):
-    if data["spread"] > MAX_SPREAD_PCT:
-        logger.warning(f"❌ Spread too wide on {data['symbol']}: {data['spread']:.3f}%")
-        return False
-    return True
-
-
-def depth_ok(orderbook):
-    try:
-        bid_depth = sum(b[0] * b[1] for b in orderbook["bids"][:5])
-        ask_depth = sum(a[0] * a[1] for a in orderbook["asks"][:5])
-        return bid_depth >= MIN_ORDERBOOK_DEPTH and ask_depth >= MIN_ORDERBOOK_DEPTH
-    except:
-        return False
-
-
-# ==============================
-# SCORE ENGINE
-# ==============================
-def get_weight_safe(name, weights, cap=3.0):
-    try:
-        return max(0.0, min(float(weights.get(name, 1.0)), cap))
-    except:
-        return 1.0
-
-
-def compute_weighted_score(triggers, weights):
-    raw = 0
-    max_poss = 0
-    for name, active in triggers.items():
-        w = get_weight_safe(name, weights)
-        if active:
-            raw += w
-        max_poss += w
-    if max_poss <= 0:
-        max_poss = 1
-    return raw, max_poss
-
-
-def conflict_penalty(trigger_names, raw, pct=0.15):
-    long_like = sum(1 for t in trigger_names if "long" in t or "bull" in t)
-    short_like = sum(1 for t in trigger_names if "short" in t or "bear" in t)
-    if long_like and short_like:
-        return raw * (1 - pct)
-    return raw
-
-
-def normalize_score(raw, max_poss):
-    score = (raw / max_poss) * 10
-    return max(0, min(score, 10))
-
-
-# ==============================
-# TP/SL ENGINE (SAFE)
-# ==============================
-def calc_tp_sl(entry, side, mode):
-    entry = safe_float(entry)
-
-    cfg = TP_SL_CONFIG.get(mode, TP_SL_CONFIG["MID"])
-    tp_pct = cfg["tp"]
-    sl_pct = cfg["sl"]
-
-    if side == "long":
-        tp = entry * (1 + tp_pct / 100)
-        sl = entry * (1 - sl_pct / 100)
-    else:
-        tp = entry * (1 - tp_pct / 100)
-        sl = entry * (1 + sl_pct / 100)
-
-    leverage = SUGGESTED_LEVERAGE.get(mode, 20)
-
-    code_block = f"""```python
-ENTRY = {entry}
-TP = {tp}
-SL = {sl}
-LEVERAGE = {leverage}
-```"""
-
-    return tp, sl, leverage, code_block
-# ======================================================
-# CONFIDENCE-BASED TP/SL (Used by AI Layer)
-# ======================================================
-def calc_single_tp_sl(entry_price, direction, mode, confidence_pct=None):
-    entry_price = safe_float(entry_price)
-
-    cfg = TP_SL_CONFIG.get(mode, TP_SL_CONFIG["MID"])
-    tp_pct = cfg["tp"]
-    sl_pct = cfg["sl"]
-
-    # AI-based leverage boost
-    if confidence_pct is not None and confidence_pct >= 90:
-        lev = 50
-    else:
-        lev = SUGGESTED_LEVERAGE.get(mode, 20)
-
-    if direction == "long":
-        tp = entry_price * (1 + tp_pct / 100)
-        sl = entry_price * (1 - sl_pct / 100)
-    else:
-        tp = entry_price * (1 - tp_pct / 100)
-        sl = entry_price * (1 + sl_pct / 100)
-
-    code = f"""```python
-ENTRY = {entry_price}
-TP = {tp}
-SL = {sl}
-LEVERAGE = {lev}
-```"""
-
-    return {
-        "tp": tp,
-        "sl": sl,
-        "leverage": lev,
-        "code": code
-    }
-
-
-# ==============================
-# TELEGRAM SENDER
-# ==============================
-async def send_telegram_message(token, chat_id, msg, retries=3):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
-
-    for attempt in range(retries):
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(url, json=payload, timeout=10) as r:
-                    out = await r.json()
-                    if out.get("ok"):
-                        return out
-        except Exception as e:
-            logger.warning(f"Telegram retry {attempt+1}: {e}")
-            await asyncio.sleep(2 ** attempt)
-
-    logger.error("Telegram failed after retries")
-    return None
-
-
-async def send_copy_block(token, chat_id, code):
-    await send_telegram_message(token, chat_id, code)
-
-
-# ==============================
-# SIGNAL BUILDERS
-# ==============================
-def calculate_quick_signals(data):
-    price = safe_float(data["price"])
-    o1 = data["ohlcv_1m"]
-    o5 = data["ohlcv_5m"]
-
-    triggers = {}
-    labels = []
-
-    r = safe_rsi(o1)
-    if 25 < r < 35:
-        triggers["RSI_long"] = 1
-        labels.append("RSI Long Zone")
-    elif 65 < r < 75:
-        triggers["RSI_short"] = 1
-        labels.append("RSI Short Zone")
-
-    m, s, pm, ps = safe_macd(o5)
-    if m > s and pm <= ps:
-        triggers["MACD_bull"] = 1
-        labels.append("MACD Bull Cross")
-    elif m < s and pm >= ps:
-        triggers["MACD_bear"] = 1
-        labels.append("MACD Bear Cross")
-
-    vw = safe_vwap(o5)
-    if price > vw:
-        triggers["VWAP_long"] = 1
-        labels.append("VWAP Reclaim")
-    else:
-        triggers["VWAP_short"] = 1
-        labels.append("VWAP Reject")
-
-    e9 = safe_ema(o5, 9)
-    e21 = safe_ema(o5, 21)
-    if price > e9 > e21:
-        triggers["EMA_bull"] = 1
-        labels.append("EMA Bull Structure")
-    elif price < e9 < e21:
-        triggers["EMA_bear"] = 1
-        labels.append("EMA Bear Structure")
-
-    # score
-    raw, max_poss = compute_weighted_score(triggers, LOGIC_WEIGHTS)
-    raw = conflict_penalty(list(triggers.keys()), raw)
-    score = normalize_score(raw, max_poss)
-    score = smooth_score(f"{data['symbol']}_QUICK", score)
-
-    longs = sum(1 for k in triggers if "long" in k or "bull" in k)
-    shorts = sum(1 for k in triggers if "short" in k or "bear" in k)
-    side = "long" if longs > shorts else "short" if shorts > longs else "none"
-
-    return {
-        "score": round(score, 1),
-        "triggers": "\n".join(labels) if labels else "No triggers",
-        "direction": side
-    }
-
-
-def calculate_mid_signals(data):
-    price = safe_float(data["price"])
-    o15 = data["ohlcv_15m"]
-    o1h = data["ohlcv_1h"]
-
-    triggers = {}
-    labels = []
-
-    r = safe_rsi(o15)
-    if r < 30:
-        triggers["RSI_os"] = 1
-        labels.append("RSI Oversold")
-    elif r > 70:
-        triggers["RSI_ob"] = 1
-        labels.append("RSI Overbought")
-
-    m, s, _, _ = safe_macd(o15)
-    if m > s:
-        triggers["MACD_bull"] = 1
-        labels.append("MACD Up")
-
-    e50 = safe_ema(o1h, 50)
-    if abs(price - e50) / e50 < 0.01:
-        triggers["EMA50_touch"] = 1
-        labels.append("EMA50 Reaction")
-
-    raw, max_poss = compute_weighted_score(triggers, LOGIC_WEIGHTS)
-    raw = conflict_penalty(list(triggers.keys()), raw)
-    score = normalize_score(raw, max_poss)
-    score = smooth_score(f"{data['symbol']}_MID", score)
-
-    longs = sum(1 for k in triggers if "os" in k or "bull" in k)
-    shorts = sum(1 for k in triggers if "ob" in k)
-    side = "long" if longs > shorts else "short" if shorts > longs else "none"
-
-    return {
-        "score": round(score, 1),
-        "triggers": "\n".join(labels),
-        "direction": side
-    }
-
-
-def calculate_trend_signals(data):
-    price = safe_float(data["price"])
-    o4h = data["ohlcv_4h"]
-
-    triggers = {}
-    labels = []
-
-    e50 = safe_ema(o4h, 50)
-    e200 = safe_ema(o4h, 200)
-
-    if e50 > e200 and price > e50:
-        triggers["ST_long"] = 1
-        labels.append("Supertrend Bull")
-    elif e50 < e200 and price < e50:
-        triggers["ST_short"] = 1
-        labels.append("Supertrend Bear")
-
-    atr = safe_atr(o4h)
-    if atr:
-        triggers["ATR_ok"] = 1
-
-    raw, max_poss = compute_weighted_score(triggers, LOGIC_WEIGHTS)
-    raw = conflict_penalty(list(triggers.keys()), raw)
-    score = normalize_score(raw, max_poss)
-    score = smooth_score(f"{data['symbol']}_TREND", score, alpha=0.25)
-
-    longs = sum(1 for k in triggers if "long" in k)
-    shorts = sum(1 for k in triggers if "short" in k)
-    side = "long" if longs > shorts else "short" if shorts > longs else "none"
-
-    return {
-        "score": round(score, 1),
-        "triggers": "\n".join(labels),
-        "direction": side
-    }
-
-
-# ==============================
-# TELEGRAM FINAL FORMATTER
-# ==============================
-def telegram_formatter_style_c(symbol, mode, direction, result, data):
-
-    emoji_map = {
-        "QUICK": "⚡",
-        "MID": "🔵",
-        "TREND": "🟣",
-    }
-    emoji = emoji_map.get(mode, "📊")
-
-    dir_txt = "🟢 LONG" if direction == "long" else "🔴 SHORT"
-
-    entry = safe_float(data["price"])
-
-    tp, sl, lev, code = calc_tp_sl(entry, direction, mode)
-
-    msg = f"""
-{emoji} <b>{mode} {dir_txt} SIGNAL</b>
-━━━━━━━━━━━━━━━━━━
-<b>Pair:</b> {symbol}
-<b>Entry:</b> {format_price_usd(entry)}
-<b>TP:</b> {format_price_usd(tp)}
-<b>SL:</b> {format_price_usd(sl)}
-<b>Leverage:</b> {lev}x
-
-<b>Score:</b> {result['score']}/10
-<b>Triggers:</b>
-{result['triggers']}
-
-<b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S')} UTC
-━━━━━━━━━━━━━━━━━━
 """
+helpers.py — ML + LLM AI layer, regime, orderflow, dynamic TP/SL, position size
+"""
+import os, json, asyncio, hmac, hashlib, math, logging, joblib, aiohttp, aioredis, pandas as pd, numpy as np
+from datetime import datetime
+from sklearn.ensemble import GradientBoostingClassifier
+import openai, ccxt.async_support as ccxt
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
 
-    return msg, code
-# ==========================================
-# PENDING SIGNAL MEMORY (robust + file-backed)
-# ==========================================
+# ---------- config ----------
+CFG = dict(
+    key=os.getenv("BINANCE_KEY"),
+    secret=os.getenv("BINANCE_SECRET"),
+    redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
+    testnet=os.getenv("USE_TESTNET", "false").lower() == "true",
+    tg_token=os.getenv("TELEGRAM_TOKEN"),
+    tg_chat=os.getenv("TELEGRAM_CHAT_ID"),
+    equity=float(os.getenv("EQUITY_USD", 6000)),
+    risk_perc=float(os.getenv("RISK_PERC", 1.0)),
+    max_lev=int(os.getenv("MAX_LEV", 20)),
+    pairs=json.loads(os.getenv("TOP_PAIRS", '["BTCUSDT"]')),
+    openai_key=os.getenv("OPENAI_KEY"),
+)
+openai.api_key = CFG["openai_key"]
 
-import json
-import os
-from threading import Lock
+# ---------- redis ----------
+redis_pool = None
+async def redis():
+    global redis_pool
+    if redis_pool is None:
+        redis_pool = aioredis.from_url(CFG["redis_url"], decode_responses=True)
+    return redis_pool
 
-_pending_memory = {}
-_pending_lock = Lock()
-_PENDING_FILE = "/tmp/pending_signals.json"
+# ---------- websocket ----------
+class WS:
+    def __init__(self):
+        self.url = "wss://fstream.binance.com/stream?streams="
+    def build(self):
+        streams = [f"{p.lower()}@ticker/{p.lower()}@depth20@100ms/{p.lower()}@trade" for p in CFG["pairs"]]
+        self.url += "/".join(streams)
+    async def run(self):
+        self.build()
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(self.url) as ws:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        await self._handle(data)
+    async def _handle(self, data):
+        r = await redis()
+        stream = data.get("stream")
+        payload = data.get("data")
+        if "@ticker" in stream:
+            s = payload["s"]
+            await r.hset(f"t:{s}", mapping={"last": payload["c"], "vol": payload["v"], "E": payload["E"]})
+        elif "@depth20" in stream:
+            s = payload["s"]
+            await r.hset(f"d:{s}", mapping={"bids": json.dumps(payload["bids"]), "asks": json.dumps(payload["asks"])})
+        elif "@trade" in stream:
+            s = payload["s"]
+            await r.lpush(f"tr:{s}", json.dumps({"p": payload["p"], "q": payload["q"], "m": payload["m"], "t": payload["T"]}))
+            await r.ltrim(f"tr:{s}", 0, 199)
 
-def _load_file_to_memory():
+# ---------- regime ----------
+def adx_np(close, high, low, n=14):
+    tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
+    dmplus = np.where((high - np.roll(high, 1)) > (np.roll(low, 1) - low), np.maximum(high - np.roll(high, 1), 0), 0)
+    dmminus = np.where((np.roll(low, 1) - low) > (high - np.roll(high, 1)), np.maximum(np.roll(low, 1) - low, 0), 0)
+    tr_smooth = pd.Series(tr).rolling(n).sum(); dmplus_smooth = pd.Series(dmplus).rolling(n).sum(); dmminus_smooth = pd.Series(dmminus).rolling(n).sum()
+    dx = 100 * np.abs(dmplus_smooth - dmminus_smooth) / (dmplus_smooth + dmminus_smooth)
+    adx = dx.rolling(n).mean()
+    return adx.iloc[-1] if len(adx) > 0 else 0
+def atr_np(df, n=14):
+    tr = np.maximum(df["h"] - df["l"], np.maximum(np.abs(df["h"] - df["c"].shift()), np.abs(df["l"] - df["c"].shift())))
+    return tr.rolling(n).mean().iloc[-1] if len(tr) > n else 0.4
+async def regime(sym):
+    r = await redis()
+    h = await r.hget(f"ohlcv_1h:{sym}", "data")
+    if not h: return "CHOP"
+    df = pd.read_json(h)
+    adx = adx_np(df["c"], df["h"], df["l"])
+    atr = atr_np(df)
+    if adx > 25 and atr > np.median(df["atr"].dropna()[-24:]): return "TREND"
+    if adx < 20: return "CHOP"
+    return "VOLATILE"
+
+# ---------- features ----------
+async def features(sym):
+    r = await redis()
+    last = float(await r.hget(f"t:{sym}", "last") or 0)
+    trades = [json.loads(x) for x in await r.lrange(f"tr:{sym}", 0, 199)]
+    depth_raw = await r.hgetall(f"d:{sym}")
+    if not depth_raw: return None
+    bids = json.loads(depth_raw["bids"]); asks = json.loads(depth_raw["asks"])
+    # 1-s ohlcv
+    df_trades = pd.DataFrame(trades, columns=["p","q","m","t"])
+    df_trades["p"] = df_trades["p"].astype(float)
+    ohlc = df_trades["p"].resample("1s").ohlc().ffill()
+    close = ohlc["close"].dropna().values
+    # indicators
+    rsi = 50 if len(close) < 14 else 100 - 100/(1+(close[-14:].diff().clip(lower=0).mean()/(close[-14:].diff().clip(upper=0).abs().mean()+1e-6)))
+    macd, macdsig = (0,0) if len(close) < 26 else (
+        close.ewm(span=12).mean().iloc[-1] - close.ewm(span=26).mean().iloc[-1],
+        (close.ewm(span=12).mean() - close.ewm(span=26).mean()).ewm(span=9).mean().iloc[-1]
+    )
+    # orderflow
+    imb = (float(bids[0][1]) - float(asks[0][1])) / (float(bids[0][1]) + float(asks[0][1]) + 1e-6)
+    delta = sum(float(t["q"]) if t["m"] == "false" else -float(t["q"]) for t in trades[-50:])
+    sweep = int(any(float(t["q"]) > 50 and float(t["q"]) > 2 * np.mean([float(x["q"]) for x in trades[-100:]]) for t in trades[-10:]))
+    # micro
+    spread = (float(asks[0][0]) - float(bids[0][0])) / last * 100
+    depth_usd = sum(float(b[0]) * float(b[1]) for b in bids[:5]) + sum(float(a[0]) * float(a[1]) for a in asks[:5])
+    return dict(last=last, rsi=rsi, macd=macd, macdsig=macdsig, imb=imb, delta=delta, sweep=sweep, spread=spread, depth_usd=depth_usd)
+
+# ---------- ML model ----------
+MODEL_PATH = "ml_model.pkl"
+FEATURE_COLS = ["rsi", "macd_slope", "imb", "delta_norm", "sweep", "spread_atr", "depth_norm", "btc_1m", "reg_trend", "reg_chop"]
+def build_vector(f, btc_change, regime):
+    macd_slope = np.tanh(f["macd"] - f["macdsig"])
+    delta_norm = np.tanh(f["delta"] / 1e6)
+    spread_atr = f["spread"] / 0.5
+    depth_norm = np.tanh(f["depth_usd"] / 5e6)
+    reg_trend = 1 if regime == "TREND" else 0
+    reg_chop  = 1 if regime == "CHOP" else 0
+    return np.array([f["rsi"]/100, macd_slope, (f["imb"]+1)/2, delta_norm, float(f["sweep"]),
+                     spread_atr, depth_norm, btc_change, reg_trend, reg_chop]).reshape(1, -1)
+async def ai_review_ml(sym, mode, direction, score, triggers, spread_ok, depth_ok, btc_calm):
+    model = joblib.load(MODEL_PATH) if os.path.exists(MODEL_PATH) else None
+    if not model: return {"allow": True, "confidence": 80, "reason": "no-ml"}
+    r = await redis()
+    f = await features(sym)
+    if not f: return {"allow": False, "confidence": 40, "reason": "no-features"}
+    btc_change = float(await r.get("btc_1m_change") or 0)
+    regime = await regime(sym)
+    X = build_vector(f, btc_change, regime)
+    prob_long, prob_short = model.predict_proba(X)[0]
+    confidence = int(max(prob_long, prob_short) * 100)
+    ai_side = "long" if prob_long > 0.58 else "short" if prob_short > 0.58 else "none"
+    if ai_side != direction: return {"allow": False, "confidence": confidence, "reason": "ml-disagree"}
+    if not CFG["openai_key"]: return {"allow": True, "confidence": confidence, "reason": "ml-ok"}
     try:
-        if os.path.exists(_PENDING_FILE):
-            with open(_PENDING_FILE, "r") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    _pending_memory.update(data)
-    except Exception as e:
-        logger.warning(f"Failed to load pending file: {e}")
+        prompt = (f"Crypto quant AI. Return JSON:{{allow(bool),confidence(0-100),reason(str)}}.\n"
+                  f"Symbol:{sym} Mode:{mode} Direction:{direction} Score:{score}/10 MLconf:{confidence}\n"
+                  f"SpreadOK:{spread_ok} DepthOK:{depth_ok} BTCcalm:{btc_calm}\nTriggers:\n{triggers}\n"
+                  f"Approve only if MLconf>=60,SpreadOK,DepthOK,BTCcalm.")
+        res = await openai.ChatCompletion.acreate(model="gpt-3.5-turbo", messages=[{"role":"user","content":prompt}],
+                                                  temperature=0, max_tokens=60)
+        llm = json.loads(res.choices[0].message.content.strip())
+        return {"allow": llm["allow"] and confidence >= 60, "confidence": min(confidence, llm["confidence"]),
+                "reason": f"ml:{confidence} llm:{llm['reason']}"}
+    except: return {"allow": True, "confidence": confidence, "reason": "ml-ok"}
 
-def _dump_memory_to_file():
-    try:
-        with open(_PENDING_FILE, "w") as f:
-            json.dump(_pending_memory, f)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to write pending file: {e}")
-        return False
+# ---------- TP/SL + size ----------
+def calc_tp_sl(entry, atr, side):
+    entry = float(entry)
+    if side == "long":
+        sl = entry - 0.8 * atr
+        tp = entry + 1.5 * (entry - sl)
+    else:
+        sl = entry + 0.8 * atr
+        tp = entry - 1.5 * (sl - entry)
+    return round(tp, 6), round(sl, 6)
+def position_size(equity, entry, sl):
+    risk_usd = equity * CFG["risk_perc"] / 100
+    qty = risk_usd / abs(entry - sl)
+    return qty
 
-# init load (safe)
-_load_file_to_memory()
+# ---------- telegram ----------
+async def send_telegram(txt):
+    if not CFG["tg_token"]: return
+    url = f"https://api.telegram.org/bot{CFG['tg_token']}/sendMessage"
+    async with aiohttp.ClientSession() as s:
+        await s.post(url, json={"chat_id": CFG["tg_chat"], "text": txt, "parse_mode": "HTML"})
 
-def save_pending_signal(key, data):
-    """
-    Save last signal snapshot for dedupe and reference.
-    Returns True on success, False on failure.
-    key = "BTCUSDT_QUICK"
-    data = {"triggers": "...", "price": 1234, "mode": "QUICK", "time": "2025-12-03T..."}
-    """
-    try:
-        with _pending_lock:
-            _pending_memory[key] = data
-            ok = _dump_memory_to_file()
-            return ok
-    except Exception as e:
-        logger.error(f"save_pending_signal error: {e}")
-        return False
-
-def load_pending_signals():
-    """Return a shallow copy of full memory dictionary"""
-    with _pending_lock:
-        return dict(_pending_memory)
-
-def get_pending_signal(key):
-    """Return single pending signal or None"""
-    with _pending_lock:
-        return _pending_memory.get(key)
-
-def clear_pending_signal(key):
-    """Delete one pending key"""
-    try:
-        with _pending_lock:
-            if key in _pending_memory:
-                del _pending_memory[key]
-                _dump_memory_to_file()
-                return True
-    except Exception as e:
-        logger.error(f"clear_pending_signal error: {e}")
-    return False
+# ---------- exchange ----------
+class Exchange:
+    def __init__(self): self.ex = ccxt.binance({"apiKey": CFG["key"], "secret": CFG["secret"], "options": {"defaultType": "future", "testnet": CFG["testnet"]}, "enableRateLimit": True})
+    async def limit(self, sym, side, qty, price, post_only=True): return await self.ex.create_order(sym, "LIMIT", side, qty, price, params={"postOnly": post_only})
+    async def market(self, sym, side, qty): return await self.ex.create_order(sym, "MARKET", side, qty)
+    async def close(self): await self.ex.close()
