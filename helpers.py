@@ -630,24 +630,73 @@ def telegram_formatter_style_c(symbol, mode, direction, result, data):
 
     return msg, code
 # ==========================================
-# PENDING SIGNAL MEMORY (for dedupe)
+# PENDING SIGNAL MEMORY (robust + file-backed)
 # ==========================================
 
+import json
+import os
+from threading import Lock
+
 _pending_memory = {}
+_pending_lock = Lock()
+_PENDING_FILE = "/tmp/pending_signals.json"
+
+def _load_file_to_memory():
+    try:
+        if os.path.exists(_PENDING_FILE):
+            with open(_PENDING_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _pending_memory.update(data)
+    except Exception as e:
+        logger.warning(f"Failed to load pending file: {e}")
+
+def _dump_memory_to_file():
+    try:
+        with open(_PENDING_FILE, "w") as f:
+            json.dump(_pending_memory, f)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to write pending file: {e}")
+        return False
+
+# init load (safe)
+_load_file_to_memory()
 
 def save_pending_signal(key, data):
     """
-    Save last signal snapshot for dedupe.
+    Save last signal snapshot for dedupe and reference.
+    Returns True on success, False on failure.
     key = "BTCUSDT_QUICK"
-    data = {"triggers": "...", "price": 1234, "mode": "QUICK"}
+    data = {"triggers": "...", "price": 1234, "mode": "QUICK", "time": "2025-12-03T..."}
     """
-    _pending_memory[key] = data
+    try:
+        with _pending_lock:
+            _pending_memory[key] = data
+            ok = _dump_memory_to_file()
+            return ok
+    except Exception as e:
+        logger.error(f"save_pending_signal error: {e}")
+        return False
 
 def load_pending_signals():
-    """Return full memory dictionary"""
-    return _pending_memory
+    """Return a shallow copy of full memory dictionary"""
+    with _pending_lock:
+        return dict(_pending_memory)
+
+def get_pending_signal(key):
+    """Return single pending signal or None"""
+    with _pending_lock:
+        return _pending_memory.get(key)
 
 def clear_pending_signal(key):
     """Delete one pending key"""
-    if key in _pending_memory:
-        del _pending_memory[key]
+    try:
+        with _pending_lock:
+            if key in _pending_memory:
+                del _pending_memory[key]
+                _dump_memory_to_file()
+                return True
+    except Exception as e:
+        logger.error(f"clear_pending_signal error: {e}")
+    return False
