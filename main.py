@@ -1,5 +1,4 @@
 import asyncio
-import os
 import logging
 from datetime import datetime
 
@@ -13,6 +12,8 @@ from helpers import (
     send_copy_block,
     cooldown_manager,
     btc_calm_check,
+    spread_ok,
+    depth_ok,
     calc_single_tp_sl,
 )
 
@@ -30,11 +31,7 @@ from config import (
     COOLDOWN_SECONDS,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("main_bot")
 
 
@@ -47,6 +44,15 @@ class SignalBot:
         try:
             data = await self.market.get_all_data(symbol)
             if not data:
+                logger.debug(f"⚠️ No data for {symbol}")
+                return
+
+            # basic liquidity/spread checks early
+            if not spread_ok(data):
+                logger.info(f"❌ {symbol} rejected (spread too high)")
+                return
+            if not depth_ok(data["orderbook"]):
+                logger.info(f"❌ {symbol} rejected (low orderbook depth)")
                 return
 
             quick = calculate_quick_signals(data)
@@ -70,67 +76,91 @@ class SignalBot:
             direction = result["direction"]
             price = data["price"]
 
-            # Cooldown
+            # Cooldown check
             cooldown = COOLDOWN_SECONDS.get(mode, 1800)
             if not cooldown_manager.can_send(symbol, mode, cooldown):
                 logger.info(f"⏳ {symbol} {mode} skipped (cooldown)")
                 return
 
-            # BTC calm
-            if not await btc_calm_check(self.market):
-                logger.warning("⚠️ BTC volatile — skipping signal")
+            # Dedupe check
+            rule_key = f"{symbol}_{mode}"
+            if not cooldown_manager.ensure_single_alert(rule_key, result["triggers"], price, mode):
+                logger.info(f"🔁 {symbol} {mode} duplicate signal")
                 return
 
-            # AI review layer
+            # BTC calm check (pass result into AI too)
+            btc_ok = await btc_calm_check(self.market)
+            if not btc_ok:
+                logger.warning("⚠️ BTC volatile — skipping all signals temporarily")
+                return
+
+            # Compute spread_ok and depth_ok to pass to AI
+            s_ok = spread_ok(data)
+            d_ok = depth_ok(data["orderbook"])
+
+            # AI review (low-cost call)
             ai_res = await ai_review_signal(
                 symbol=symbol,
                 mode=mode,
                 direction=direction,
                 score=result["score"],
                 triggers=result["triggers"],
-                price=price
+                spread_ok=s_ok,
+                depth_ok=d_ok,
+                btc_calm=btc_ok
             )
 
+            logger.info(f"🤖 AI decision for {symbol} {mode}: {ai_res}")
+
             if not ai_res.get("allow", False):
-                logger.info(f"🤖 AI BLOCKED {symbol} {mode}: {ai_res['reason']}")
+                logger.info(f"🚫 AI blocked {symbol} {mode} — {ai_res.get('reason')}")
                 return
 
-            confidence = ai_res.get("confidence")
-
-            # TP/SL
+            confidence = ai_res.get("confidence", None)
+            # TP/SL with confidence-aware leverage
             tp_sl = calc_single_tp_sl(price, direction, mode, confidence)
-            tp = tp_sl["tp"]
-            sl = tp_sl["sl"]
-            lev = tp_sl["leverage"]
 
-            # FORMAT + SEND
-            msg, code_block = telegram_formatter_style_c(symbol, mode, direction, result, data)
+            # Final safety: check SL vs liquidation quickly
+            # (helpers' safety functions will already warn; skip here for brevity)
+
+            # Format & send Telegram message
+            msg, _ = telegram_formatter_style_c(symbol, mode, direction, result, data)
+            if not msg:
+                logger.warning(f"⚠️ Formatter blocked message for {symbol} {mode}")
+                return
 
             await send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
-            await asyncio.sleep(1)
-            await send_copy_block(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, tp_sl["code"])
+            await asyncio.sleep(0.8)
+            if tp_sl and tp_sl.get("code"):
+                await send_copy_block(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, tp_sl["code"])
 
-            logger.info(f"✅ SENT {mode} {direction.upper()} for {symbol}")
+            logger.info(f"✅ Sent {mode} {direction.upper()} for {symbol} (conf {confidence}%)")
 
         except Exception as e:
             logger.error(f"❌ Error in process_signal for {symbol}: {e}")
 
     async def run(self):
         logger.info("🚀 Signal Bot Started!")
-        logger.info(f"📊 Tracking {len(TRADING_PAIRS)} pairs")
-
-        while self.running:
-            try:
+        logger.info(f"📊 Monitoring {len(TRADING_PAIRS)} pairs")
+        try:
+            while self.running:
                 for symbol in TRADING_PAIRS:
                     await self.analyze_symbol(symbol)
                     await asyncio.sleep(1)
-
-            except Exception as e:
-                logger.error(f"Main loop error: {e}")
-                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.info("Shutdown requested")
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+        finally:
+            await self.shutdown()
 
     async def shutdown(self):
-        await self.market.close()
+        logger.info("🛑 Shutting down...")
+        try:
+            await self.market.close()
+        except:
+            pass
+        logger.info("✅ Shutdown complete")
 
 
 if __name__ == "__main__":
@@ -138,4 +168,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
-        logger.info("Bot stopped manually")
+        logger.info("Bot stopped by user")
