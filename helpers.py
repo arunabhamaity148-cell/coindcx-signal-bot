@@ -50,24 +50,25 @@ class WS:
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = json.loads(msg.data)
-                        await self._handle(data) 
-async def _handle(self, data):
-    r = await redis()
-    stream = data.get("stream", "")
-    payload = data.get("data", {})
-    if "@ticker" in stream:
-        s = payload.get("s")
-        if s: await r.hset(f"t:{s}", mapping={"last": payload.get("c"), "vol": payload.get("v"), "E": payload.get("E")})
-    elif "@depth20" in stream:
-        s = payload.get("s")
-        bids = payload.get("bids", [])
-        asks = payload.get("asks", [])
-        if s and (bids or asks): await r.hset(f"d:{s}", mapping={"bids": json.dumps(bids), "asks": json.dumps(asks)})
-    elif "@trade" in stream:
-        s = payload.get("s")
-        if s: await r.lpush(f"tr:{s}", json.dumps({"p": payload.get("p"), "q": payload.get("q"), "m": payload.get("m"), "t": payload.get("T")}))
-        await r.ltrim(f"tr:{s}", 0, 199)
-
+                        await self._handle(data)
+                    elif msg.type == aiohttp.WSMsgType.CLOSED:
+                        break
+    async def _handle(self, data):
+        r = await redis()
+        stream = data.get("stream", "")
+        payload = data.get("data", {})
+        if "@ticker" in stream:
+            s = payload.get("s")
+            if s: await r.hset(f"t:{s}", mapping={"last": payload.get("c"), "vol": payload.get("v"), "E": payload.get("E")})
+        elif "@depth20" in stream:
+            s = payload.get("s")
+            bids = payload.get("bids", [])
+            asks = payload.get("asks", [])
+            if s and (bids or asks): await r.hset(f"d:{s}", mapping={"bids": json.dumps(bids), "asks": json.dumps(asks)})
+        elif "@trade" in stream:
+            s = payload.get("s")
+            if s: await r.lpush(f"tr:{s}", json.dumps({"p": payload.get("p"), "q": payload.get("q"), "m": payload.get("m"), "t": payload.get("T")}))
+            await r.ltrim(f"tr:{s}", 0, 199)
 
 # ---------- regime ----------
 def adx_np(close, high, low, n=14):
@@ -99,7 +100,8 @@ async def features(sym):
     trades = [json.loads(x) for x in await r.lrange(f"tr:{sym}", 0, 199)]
     depth_raw = await r.hgetall(f"d:{sym}")
     if not depth_raw: return None
-    bids = json.loads(depth_raw["bids"]); asks = json.loads(depth_raw["asks"])
+    bids = json.loads(depth_raw.get("bids", "[]"))
+    asks = json.loads(depth_raw.get("asks", "[]"))
     # 1-s ohlcv
     df_trades = pd.DataFrame(trades, columns=["p","q","m","t"])
     df_trades["p"] = df_trades["p"].astype(float)
@@ -112,11 +114,11 @@ async def features(sym):
         (close.ewm(span=12).mean() - close.ewm(span=26).mean()).ewm(span=9).mean().iloc[-1]
     )
     # orderflow
-    imb = (float(bids[0][1]) - float(asks[0][1])) / (float(bids[0][1]) + float(asks[0][1]) + 1e-6)
+    imb = (float(bids[0][1]) - float(asks[0][1])) / (float(bids[0][1]) + float(asks[0][1]) + 1e-6) if bids and asks else 0
     delta = sum(float(t["q"]) if t["m"] == "false" else -float(t["q"]) for t in trades[-50:])
     sweep = int(any(float(t["q"]) > 50 and float(t["q"]) > 2 * np.mean([float(x["q"]) for x in trades[-100:]]) for t in trades[-10:]))
     # micro
-    spread = (float(asks[0][0]) - float(bids[0][0])) / last * 100
+    spread = (float(asks[0][0]) - float(bids[0][0])) / last * 100 if bids and asks else 0.1
     depth_usd = sum(float(b[0]) * float(b[1]) for b in bids[:5]) + sum(float(a[0]) * float(a[1]) for a in asks[:5])
     return dict(last=last, rsi=rsi, macd=macd, macdsig=macdsig, imb=imb, delta=delta, sweep=sweep, spread=spread, depth_usd=depth_usd)
 
