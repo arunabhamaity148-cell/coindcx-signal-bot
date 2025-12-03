@@ -1,5 +1,5 @@
 # ==========================================
-# helpers.py — PRO VERSION (Part 1)
+# helpers.py — BLOCK 1 (imports, utils, cooldown)
 # ==========================================
 
 import aiohttp
@@ -91,15 +91,18 @@ class CooldownManager:
         self.signal_hashes[h] = now
         return True
 
+# create global instance
 cooldown_manager = CooldownManager()
+# ==========================================
+# helpers.py — BLOCK 2 (market wrapper + validation + scoring)
+# ==========================================
 
-# ======================================================
+# -----------------------
 # EXCHANGE MARKET WRAPPER
-# ======================================================
+# -----------------------
 class MarketData:
     def __init__(self, api_key, secret):
         self.rate_sema = asyncio.Semaphore(6)
-
         self.exchange = ccxt.binance({
             "apiKey": api_key,
             "secret": secret,
@@ -170,15 +173,12 @@ class MarketData:
         except:
             pass
 
-# ======================================================
-# OHLCV VALIDATION
-# ======================================================
+# -----------------------
+# OHLCV VALIDATION + FORMAT
+# -----------------------
 def validate_ohlcv(ohlcv, req):
     return bool(ohlcv and len(ohlcv) >= req)
 
-# ======================================================
-# PRICE FORMAT
-# ======================================================
 def format_price_usd(p):
     if p >= 1000:
         return f"${p:,.2f}"
@@ -186,9 +186,9 @@ def format_price_usd(p):
         return f"${p:.2f}"
     return f"${p:.4f}"
 
-# ======================================================
-# SCORING ENGINE
-# ======================================================
+# -----------------------
+# SCORING ENGINE (weighted + normalize)
+# -----------------------
 def get_weight_safe(name, weights, cap=3.0):
     w = weights.get(name, 1.0)
     try:
@@ -198,15 +198,15 @@ def get_weight_safe(name, weights, cap=3.0):
     return max(0.0, min(w, cap))
 
 def compute_weighted_score(triggers, weights):
-    raw = 0
-    maxp = 0
+    raw = 0.0
+    maxp = 0.0
     for name, val in triggers.items():
         w = get_weight_safe(name, weights)
-        v = 1 if val else 0
+        v = 1.0 if val else 0.0
         raw += v * w
         maxp += w
     if maxp <= 0:
-        maxp = 1
+        maxp = 1.0
     return raw, maxp
 
 def conflict_penalty(names, raw, pct=0.15):
@@ -215,13 +215,21 @@ def conflict_penalty(names, raw, pct=0.15):
     return raw * (1 - pct) if long_like and short_like else raw
 
 def normalize_score(raw, maxp):
-    return max(0, min((raw / maxp) * 10, 10))
+    score = (raw / maxp) * 10.0
+    return max(0.0, min(score, 10.0))
+# ==========================================
+# helpers.py — BLOCK 3 (Safety + Indicators)
+# ==========================================
 
-# ======================================================
+# -----------------------
 # LIQUIDATION SAFETY
-# ======================================================
+# -----------------------
 def calc_liquidation(entry, sl, lev, side):
-    liq = entry * (1 - 1/lev) if side == "long" else entry * (1 + 1/lev)
+    if side == "long":
+        liq = entry * (1 - 1/lev)
+    else:
+        liq = entry * (1 + 1/lev)
+
     dist = abs(liq - sl) / entry * 100
     return {"liq": liq, "dist_pct": dist}
 
@@ -229,9 +237,10 @@ def safety_sl_check(entry, sl, lev, side):
     info = calc_liquidation(entry, sl, lev, side)
     return info["dist_pct"] >= MIN_SAFE_LIQ_DISTANCE_PCT
 
-# ======================================================
+
+# -----------------------
 # SPREAD / DEPTH CHECK
-# ======================================================
+# -----------------------
 def spread_ok(data):
     return data["spread"] <= MAX_SPREAD_PCT
 
@@ -242,24 +251,12 @@ def depth_ok(orderbook):
         return bd >= MIN_ORDERBOOK_DEPTH and ad >= MIN_ORDERBOOK_DEPTH
     except:
         return False
-# ==========================================
-# helpers.py — PRO VERSION (Part 2)
-# ==========================================
 
-import aiohttp
-import logging
-from datetime import datetime
 
-import pandas as pd
-import numpy as np
-
-from config import * import helpers.py — PRO VERSION (Part 1) validate_ohlcv, calc_liquidation  # reuse functions
-
-logger = logging.getLogger("signal_bot")
-
-# ======================================================
+# -----------------------
 # SAFE INDICATORS
-# ======================================================
+# -----------------------
+
 def safe_rsi(o, period=14):
     if not validate_ohlcv(o, period+10):
         return 50
@@ -267,28 +264,37 @@ def safe_rsi(o, period=14):
     delta = np.diff(closes)
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
+
     avg_gain = pd.Series(gain).rolling(period).mean().iloc[-1]
     avg_loss = pd.Series(loss).rolling(period).mean().iloc[-1]
+
     if avg_loss == 0:
         return 70
+
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
+
 
 def safe_macd(o):
     if not validate_ohlcv(o, 35):
         return (0, 0, 0, 0)
+
     closes = pd.Series([c[4] for c in o])
     e12 = closes.ewm(span=12, adjust=False).mean()
     e26 = closes.ewm(span=26, adjust=False).mean()
+
     macd = e12 - e26
     sig = macd.ewm(span=9, adjust=False).mean()
+
     return macd.iloc[-1], sig.iloc[-1], macd.iloc[-2], sig.iloc[-2]
+
 
 def safe_ema(o, p):
     if not validate_ohlcv(o, p+10):
         return 0
     closes = pd.Series([c[4] for c in o])
     return closes.ewm(span=p, adjust=False).mean().iloc[-1]
+
 
 def safe_vwap(o):
     if not validate_ohlcv(o, 10):
@@ -300,37 +306,48 @@ def safe_vwap(o):
         return o[-1][4]
     return sum([t*v for t, v in zip(tp, vol)]) / tot
 
+
 def safe_adx(o, period=14):
     if not validate_ohlcv(o, period+10):
         return 20
+
     df = pd.DataFrame(o, columns=["ts","open","high","low","close","vol"])
     df["+dm"] = (df["high"].diff()).clip(lower=0)
     df["-dm"] = (-df["low"].diff()).clip(lower=0)
     df["tr"] = (df["high"] - df["low"]).abs()
+
     atr = df["tr"].rolling(period).mean()
     di_plus = 100 * (df["+dm"].rolling(period).mean() / atr)
     di_minus = 100 * (df["-dm"].rolling(period).mean() / atr)
+
     dx = 100 * abs(di_plus - di_minus) / (di_plus + di_minus)
     adx = dx.rolling(period).mean()
+
     v = adx.iloc[-1]
     return 20 if pd.isna(v) else v
+
 
 def safe_atr(o, period=14):
     if not validate_ohlcv(o, period+10):
         return 0
+
     df = pd.DataFrame(o, columns=["ts","open","high","low","close","vol"])
     df["tr"] = df[["high","low","close"]].apply(
         lambda x: max(
             x["high"] - x["low"],
             abs(x["high"] - x["close"]),
             abs(x["low"] - x["close"])
-        ), axis=1)
+        ),
+        axis=1
+    )
+
     atr = df["tr"].rolling(period).mean().iloc[-1]
     return 0 if pd.isna(atr) else atr
 
-# ======================================================
+
+# -----------------------
 # BTC CALM CHECK
-# ======================================================
+# -----------------------
 async def btc_calm_check(market):
     try:
         data = await market.get_all_data("BTCUSDT")
@@ -352,34 +369,36 @@ async def btc_calm_check(market):
         change_5m = abs(c5_now - c5_prev) / c5_prev * 100
 
         if change_1m > BTC_VOLATILITY_THRESHOLDS["1m"]:
-            logger.warning(f"BTC too volatile (1m): {change_1m:.2f}%")
             return False
         if change_5m > BTC_VOLATILITY_THRESHOLDS["5m"]:
-            logger.warning(f"BTC too volatile (5m): {change_5m:.2f}%")
             return False
 
         return True
-    except Exception as e:
-        logger.error(f"BTC calm check error: {e}")
+    except:
         return True
+# ==========================================
+# helpers.py — BLOCK 4 (TP/SL + Telegram Senders)
+# ==========================================
 
-# ======================================================
-# TP/SL ENGINE
-# ======================================================
+# -----------------------
+# TP/SL ENGINE (Safe Version)
+# -----------------------
 def calc_tp_sl(entry, side, mode):
     cfg = TP_SL_CONFIG.get(mode, TP_SL_CONFIG["MID"])
     tp_pct = cfg["tp"]
     sl_pct = cfg["sl"]
 
+    # Long / Short logic
     if side == "long":
-        tp = entry * (1 + tp_pct/100)
-        sl = entry * (1 - sl_pct/100)
+        tp = entry * (1 + tp_pct / 100)
+        sl = entry * (1 - sl_pct / 100)
     else:
-        tp = entry * (1 - tp_pct/100)
-        sl = entry * (1 + sl_pct/100)
+        tp = entry * (1 - tp_pct / 100)
+        sl = entry * (1 + sl_pct / 100)
 
     lev = SUGGESTED_LEVERAGE.get(mode, 20)
 
+    # CLEAN, SAFE CODE BLOCK
     code = f'''```python
 ENTRY = {entry}
 TP = {tp}
@@ -389,19 +408,26 @@ LEVERAGE = {lev}
 
     return tp, sl, lev, code
 
-# ======================================================
-# calc_single_tp_sl (AI Compatible)
-# ======================================================
+
+# -----------------------
+# AI-Compatible TP/SL Engine
+# -----------------------
 def calc_single_tp_sl(entry_price, direction, mode, confidence_pct=None):
     cfg = TP_SL_CONFIG.get(mode, TP_SL_CONFIG["MID"])
     tp_pct = cfg["tp"]
     sl_pct = cfg["sl"]
 
+    # Dynamic adjustment based on AI confidence
     if confidence_pct is not None:
-        boost = max(0, min(float(confidence_pct), 100)) / 100
-        tp_pct *= (1 + boost * 0.30)
-        sl_pct *= (1 - boost * 0.20)
+        try:
+            boost = max(0, min(float(confidence_pct), 100)) / 100
+        except:
+            boost = 0
 
+        tp_pct = tp_pct * (1 + 0.30 * boost)     # up to +30%
+        sl_pct = sl_pct * (1 - 0.20 * boost)     # up to -20%
+
+    # Direction logic
     if direction == "long":
         tp = entry_price * (1 + tp_pct/100)
         sl = entry_price * (1 - sl_pct/100)
@@ -409,18 +435,27 @@ def calc_single_tp_sl(entry_price, direction, mode, confidence_pct=None):
         tp = entry_price * (1 - tp_pct/100)
         sl = entry_price * (1 + sl_pct/100)
 
-    leverage = SUGGESTED_LEVERAGE.get(mode, 20)
+    lev = SUGGESTED_LEVERAGE.get(mode, 20)
 
-    return {"tp": tp, "sl": sl, "leverage": leverage}
+    return {
+        "tp": tp,
+        "sl": sl,
+        "leverage": lev
+    }
 
-# ======================================================
-# TELEGRAM SENDER
-# ======================================================
+
+# -----------------------
+# TELEGRAM MESSAGE SENDER
+# -----------------------
 async def send_telegram_message(token, chat_id, message, retries=3):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML"
+    }
 
-    for a in range(retries):
+    for attempt in range(retries):
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.post(url, json=payload, timeout=10) as r:
@@ -428,16 +463,20 @@ async def send_telegram_message(token, chat_id, message, retries=3):
                     if out.get("ok"):
                         return out
         except Exception as e:
-            await asyncio.sleep(2 ** a)
+            await asyncio.sleep(2 ** attempt)
 
     return None
 
+
 async def send_copy_block(token, chat_id, code):
     await send_telegram_message(token, chat_id, code)
+# ==========================================
+# helpers.py — BLOCK 5 (Signal Engine + Formatter)
+# ==========================================
 
-# ======================================================
-# SIGNAL BUILDERS
-# ======================================================
+# -----------------------
+# QUICK SIGNAL ENGINE
+# -----------------------
 def calculate_quick_signals(data):
     price = data["price"]
     o1 = data["ohlcv_1m"]
@@ -446,30 +485,34 @@ def calculate_quick_signals(data):
     triggers = {}
     labels = []
 
+    # 1) RSI
     r = safe_rsi(o1)
     if 25 < r < 35:
         triggers["RSI_long"] = 1
-        labels.append("RSI Long")
+        labels.append("RSI Long Zone")
     elif 65 < r < 75:
         triggers["RSI_short"] = 1
-        labels.append("RSI Short")
+        labels.append("RSI Short Zone")
 
+    # 2) MACD
     m, s, pm, ps = safe_macd(o5)
     if m > s and pm <= ps:
         triggers["MACD_bull"] = 1
-        labels.append("MACD Bull Cross")
+        labels.append("MACD Bullish Cross")
     elif m < s and pm >= ps:
         triggers["MACD_bear"] = 1
-        labels.append("MACD Bear Cross")
+        labels.append("MACD Bearish Cross")
 
-    vwap = safe_vwap(o5)
-    if price > vwap:
+    # 3) VWAP
+    vw = safe_vwap(o5)
+    if price > vw:
         triggers["VWAP_long"] = 1
         labels.append("VWAP Reclaim")
     else:
         triggers["VWAP_short"] = 1
         labels.append("VWAP Reject")
 
+    # 4) EMA
     e9 = safe_ema(o5, 9)
     e21 = safe_ema(o5, 21)
     if price > e9 > e21:
@@ -479,24 +522,28 @@ def calculate_quick_signals(data):
         triggers["EMA_bear"] = 1
         labels.append("EMA Bear Structure")
 
-    raw, maxp = compute_weighted_score(triggers, LOGIC_WEIGHTS)
+    # -----------------------
+    # SCORING
+    raw, max_poss = compute_weighted_score(triggers, LOGIC_WEIGHTS)
     raw = conflict_penalty(list(triggers.keys()), raw)
-    score = normalize_score(raw, maxp)
-    score = smooth_score(
-        f"{data['symbol']}_QUICK",
-        score
-    )
+    score = normalize_score(raw, max_poss)
+    score = smooth_score(f"{data['symbol']}_QUICK", score)
 
-    longs = sum(1 for k in triggers if "long" in k or "bull" in k)
-    shorts = sum(1 for k in triggers if "short" in k or "bear" in k)
-    side = "long" if longs > shorts else "short" if shorts > longs else "none"
+    # Direction
+    long_count = sum(1 for k in triggers if "long" in k or "bull" in k)
+    short_count = sum(1 for k in triggers if "short" in k or "bear" in k)
+    side = "long" if long_count > short_count else "short" if short_count > long_count else "none"
 
     return {
         "score": round(score, 1),
-        "triggers": "\n".join(labels),
+        "triggers": "\n".join(labels) if labels else "No triggers",
         "direction": side
     }
 
+
+# -----------------------
+# MID SIGNAL ENGINE
+# -----------------------
 def calculate_mid_signals(data):
     price = data["price"]
     o15 = data["ohlcv_15m"]
@@ -505,6 +552,7 @@ def calculate_mid_signals(data):
     triggers = {}
     labels = []
 
+    # 1) RSI
     r = safe_rsi(o15)
     if r < 30:
         triggers["RSI_os"] = 1
@@ -513,31 +561,39 @@ def calculate_mid_signals(data):
         triggers["RSI_ob"] = 1
         labels.append("RSI Overbought")
 
+    # 2) MACD
     m, s, _, _ = safe_macd(o15)
     if m > s:
         triggers["MACD_bull"] = 1
         labels.append("MACD Up")
 
+    # 3) EMA50 Reaction
     e50 = safe_ema(o1h, 50)
-    if abs(price - e50) / e50 < 0.01:
+    if e50 > 0 and abs(price - e50) / e50 < 0.01:
         triggers["EMA50_touch"] = 1
-        labels.append("EMA50 Reaction")
+        labels.append("EMA 50 Reaction")
 
-    raw, maxp = compute_weighted_score(triggers, LOGIC_WEIGHTS)
+    # -----------------------
+    # SCORING
+    raw, max_poss = compute_weighted_score(triggers, LOGIC_WEIGHTS)
     raw = conflict_penalty(list(triggers.keys()), raw)
-    score = normalize_score(raw, maxp)
+    score = normalize_score(raw, max_poss)
     score = smooth_score(f"{data['symbol']}_MID", score)
 
-    longs = sum(1 for k in triggers if "os" in k or "bull" in k)
-    shorts = sum(1 for k in triggers if "ob" in k)
-    side = "long" if longs > shorts else "short" if shorts > longs else "none"
+    long_count = sum(1 for k in triggers if "os" in k or "bull" in k)
+    short_count = sum(1 for k in triggers if "ob" in k)
+    side = "long" if long_count > short_count else "short" if short_count > long_count else "none"
 
     return {
         "score": round(score, 1),
-        "triggers": "\n".join(labels),
+        "triggers": "\n".join(labels) if labels else "No triggers",
         "direction": side
     }
 
+
+# -----------------------
+# TREND SIGNAL ENGINE
+# -----------------------
 def calculate_trend_signals(data):
     price = data["price"]
     o4h = data["ohlcv_4h"]
@@ -545,38 +601,44 @@ def calculate_trend_signals(data):
     triggers = {}
     labels = []
 
+    # 1) Supertrend-like condition
     e50 = safe_ema(o4h, 50)
     e200 = safe_ema(o4h, 200)
+
     if e50 > e200 and price > e50:
-        triggers["ST_long"] = 1
-        labels.append("Supertrend Bull")
+        triggers["Trend_long"] = 1
+        labels.append("Trend Bullish (50>200)")
     elif e50 < e200 and price < e50:
-        triggers["ST_short"] = 1
-        labels.append("Supertrend Bear")
+        triggers["Trend_short"] = 1
+        labels.append("Trend Bearish (50<200)")
 
+    # 2) ATR confirmation
     atr = safe_atr(o4h)
-    if atr:
+    if atr > 0:
         triggers["ATR_ok"] = 1
-        labels.append("ATR Confirmed")
+        labels.append("ATR Stable")
 
-    raw, maxp = compute_weighted_score(triggers, LOGIC_WEIGHTS)
+    # -----------------------
+    # SCORING
+    raw, max_poss = compute_weighted_score(triggers, LOGIC_WEIGHTS)
     raw = conflict_penalty(list(triggers.keys()), raw)
-    score = normalize_score(raw, maxp)
+    score = normalize_score(raw, max_poss)
     score = smooth_score(f"{data['symbol']}_TREND", score, alpha=0.25)
 
-    longs = sum(1 for k in triggers if "long" in k)
-    shorts = sum(1 for k in triggers if "short" in k)
-    side = "long" if longs > shorts else "short" if shorts > longs else "none"
+    long_count = sum(1 for k in triggers if "long" in k)
+    short_count = sum(1 for k in triggers if "short" in k)
+    side = "long" if long_count > short_count else "short" if short_count > long_count else "none"
 
     return {
         "score": round(score, 1),
-        "triggers": "\n".join(labels),
+        "triggers": "\n".join(labels) if labels else "No triggers",
         "direction": side
     }
 
-# ======================================================
-# TELEGRAM FORMATTER (STYLE-C)
-# ======================================================
+
+# -----------------------
+# PREMIUM TELEGRAM FORMATTER (STYLE C)
+# -----------------------
 def telegram_formatter_style_c(symbol, mode, direction, result, data):
     emoji_map = {
         "QUICK": "⚡",
@@ -585,16 +647,17 @@ def telegram_formatter_style_c(symbol, mode, direction, result, data):
     }
 
     emoji = emoji_map.get(mode, "📊")
-    dir_txt = "🟢 LONG" if direction == "long" else "🔴 SHORT"
+    dir_text = "🟢 LONG" if direction == "long" else "🔴 SHORT"
 
     entry = data["price"]
     tp, sl, lev, code = calc_tp_sl(entry, direction, mode)
 
+    # SL safety check
     if not safety_sl_check(entry, sl, lev, direction):
         return None, None
 
     msg = f"""
-{emoji} <b>{mode} {dir_txt} SIGNAL</b>
+{emoji} <b>{mode} {dir_text} SIGNAL</b>
 ━━━━━━━━━━━━━━━━━━
 <b>Pair:</b> {symbol}
 <b>Entry:</b> {format_price_usd(entry)}
@@ -609,4 +672,90 @@ def telegram_formatter_style_c(symbol, mode, direction, result, data):
 <b>Time:</b> {datetime.utcnow().strftime('%H:%M:%S')} UTC
 ━━━━━━━━━━━━━━━━━━
 """
+
     return msg, code
+# ==========================================
+# helpers.py — BLOCK 6 (Final Utilities + Polish)
+# ==========================================
+
+# -----------------------
+# SPREAD CHECK
+# -----------------------
+def spread_ok(data):
+    spread = data.get("spread", 0)
+    symbol = data.get("symbol", "UNKNOWN")
+    if spread > MAX_SPREAD_PCT:
+        logger.warning(f"❌ Spread too wide on {symbol}: {spread:.3f}%")
+        return False
+    return True
+
+
+# -----------------------
+# ORDERBOOK DEPTH CHECK
+# -----------------------
+def depth_ok(orderbook):
+    try:
+        bid_depth = sum(bid[0] * bid[1] for bid in orderbook["bids"][:5])
+        ask_depth = sum(ask[0] * ask[1] for ask in orderbook["asks"][:5])
+        return bid_depth >= MIN_ORDERBOOK_DEPTH and ask_depth >= MIN_ORDERBOOK_DEPTH
+    except:
+        return False
+
+
+# -----------------------
+# BTC CALM CHECK (already linked to bot)
+# -----------------------
+async def btc_calm_check(market):
+    try:
+        data = await market.get_all_data("BTCUSDT")
+        if not data:
+            return True
+
+        o1 = data["ohlcv_1m"]
+        o5 = data["ohlcv_5m"]
+
+        if not validate_ohlcv(o1, 3) or not validate_ohlcv(o5, 3):
+            return True
+
+        # 1m volatility
+        c1_now = o1[-1][4]
+        c1_prev = o1[-2][4]
+        ch1 = abs(c1_now - c1_prev) / c1_prev * 100
+
+        # 5m volatility
+        c5_now = o5[-1][4]
+        c5_prev = o5[-2][4]
+        ch5 = abs(c5_now - c5_prev) / c5_prev * 100
+
+        if ch1 > BTC_VOLATILITY_THRESHOLDS["1m"]:
+            logger.warning(f"⚠️ BTC volatile (1m {ch1:.2f}%)")
+            return False
+
+        if ch5 > BTC_VOLATILITY_THRESHOLDS["5m"]:
+            logger.warning(f"⚠️ BTC volatile (5m {ch5:.2f}%)")
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.error(f"BTC Calm Error: {e}")
+        return True
+
+
+# -----------------------
+# SAFE IMPORT CHECK (optional)
+# -----------------------
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except:
+        return default
+
+
+# -----------------------
+# LOG HELPER FOR CLEAN OUTPUT
+# -----------------------
+def log_score(symbol, mode, score, dir_text):
+    logger.info(
+        f"📊 {symbol} | {mode} | Score: {score}/10 | Direction: {dir_text}"
+    )
