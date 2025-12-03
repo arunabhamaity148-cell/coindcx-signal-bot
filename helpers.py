@@ -629,3 +629,25 @@ def telegram_formatter_style_c(symbol, mode, direction, result, data):
 """
 
     return msg, code
+# ==========================================
+# PENDING SIGNAL MEMORY (for dedupe)
+# ==========================================
+
+_pending_memory = {}
+
+def save_pending_signal(key, data):
+    """
+    Save last signal snapshot for dedupe.
+    key = "BTCUSDT_QUICK"
+    data = {"triggers": "...", "price": 1234, "mode": "QUICK"}
+    """
+    _pending_memory[key] = data
+
+def load_pending_signals():
+    """Return full memory dictionary"""
+    return _pending_memory
+
+def clear_pending_signal(key):
+    """Delete one pending key"""
+    if key in _pending_memory:
+        del _pending_memory[key]
