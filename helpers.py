@@ -389,6 +389,42 @@ LEVERAGE = {leverage}
 ```"""
 
     return tp, sl, leverage, code_block
+# ======================================================
+# CONFIDENCE-BASED TP/SL (Used by AI Layer)
+# ======================================================
+def calc_single_tp_sl(entry_price, direction, mode, confidence_pct=None):
+    entry_price = safe_float(entry_price)
+
+    cfg = TP_SL_CONFIG.get(mode, TP_SL_CONFIG["MID"])
+    tp_pct = cfg["tp"]
+    sl_pct = cfg["sl"]
+
+    # AI-based leverage boost
+    if confidence_pct is not None and confidence_pct >= 90:
+        lev = 50
+    else:
+        lev = SUGGESTED_LEVERAGE.get(mode, 20)
+
+    if direction == "long":
+        tp = entry_price * (1 + tp_pct / 100)
+        sl = entry_price * (1 - sl_pct / 100)
+    else:
+        tp = entry_price * (1 - tp_pct / 100)
+        sl = entry_price * (1 + sl_pct / 100)
+
+    code = f"""```python
+ENTRY = {entry_price}
+TP = {tp}
+SL = {sl}
+LEVERAGE = {lev}
+```"""
+
+    return {
+        "tp": tp,
+        "sl": sl,
+        "leverage": lev,
+        "code": code
+    }
 
 
 # ==============================
