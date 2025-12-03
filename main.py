@@ -1,28 +1,20 @@
-#!/usr/bin/env python3
-"""
-30-Logic Binance Futures Signal Bot
-Railway-ready entry point
-"""
-
 import asyncio
 import os
-import signal
-import sys
 import logging
 from datetime import datetime
-
-from dotenv import load_dotenv
 from helpers import (
-    MarketData,
-    calculate_quick_signals,
-    calculate_mid_signals,
+    MarketData, 
+    calculate_quick_signals, 
+    calculate_mid_signals, 
     calculate_trend_signals,
     telegram_formatter_style_c,
     send_telegram_message,
     send_copy_block,
     cooldown_manager,
-    spread_and_depth_check,
     btc_calm_check,
+    spread_and_depth_check,
+    safety_check_sl_vs_liq,
+    calc_single_tp_sl
 )
 from config import (
     BINANCE_API_KEY,
@@ -33,151 +25,157 @@ from config import (
     QUICK_MIN_SCORE,
     MID_MIN_SCORE,
     TREND_MIN_SCORE,
-    COOLDOWN_SECONDS,
+    COOLDOWN_SECONDS
 )
+from dotenv import load_dotenv
 
-# ---------- logging ----------
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger("signal-bot")
+logger = logging.getLogger(__name__)
 
-# ---------- graceful shutdown ----------
-shutdown_event = asyncio.Event()
-
-def _handle_signal(signum, frame):
-    logger.warning(f"Signal {signum} received – shutting down gracefully…")
-    shutdown_event.set()
-
-signal.signal(signal.SIGINT, _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
-
-# ---------- bot ----------
 class SignalBot:
     def __init__(self):
         self.market = MarketData(BINANCE_API_KEY, BINANCE_SECRET)
-
-    # ---------------- analyse one symbol ----------------
-    async def analyse_symbol(self, symbol: str) -> None:
+        self.running = True
+        
+    async def analyze_symbol(self, symbol):
+        """Analyze symbol for all signal types"""
         try:
+            # Fetch market data
             data = await self.market.get_all_data(symbol)
             if not data:
                 return
-
-            # safety checks
+            
+            # Safety checks
             if not spread_and_depth_check(data):
+                logger.info(f"❌ {symbol} failed spread/depth check")
                 return
-            if not await btc_calm_check(self.market):
-                return
-
-            price = data["price"]
-
-            # ---------- QUICK ----------
+            
+            # Calculate all signals
             quick = calculate_quick_signals(data)
-            if (
-                quick["score"] >= QUICK_MIN_SCORE
-                and quick["direction"] != "none"
-                and cooldown_manager.can_send(
-                    symbol, "QUICK", COOLDOWN_SECONDS["QUICK"]
-                )
-                and cooldown_manager.ensure_single_alert(
-                    "QUICK", quick["triggers"], price, "QUICK"
-                )
-            ):
-                await self._dispatch_signal(symbol, "QUICK", quick, data)
-
-            # ---------- MID ----------
             mid = calculate_mid_signals(data)
-            if (
-                mid["score"] >= MID_MIN_SCORE
-                and mid["direction"] != "none"
-                and cooldown_manager.can_send(
-                    symbol, "MID", COOLDOWN_SECONDS["MID"]
-                )
-                and cooldown_manager.ensure_single_alert(
-                    "MID", mid["triggers"], price, "MID"
-                )
-            ):
-                await self._dispatch_signal(symbol, "MID", mid, data)
-
-            # ---------- TREND ----------
             trend = calculate_trend_signals(data)
-            if (
-                trend["score"] >= TREND_MIN_SCORE
-                and trend["direction"] != "none"
-                and cooldown_manager.can_send(
-                    symbol, "TREND", COOLDOWN_SECONDS["TREND"]
-                )
-                and cooldown_manager.ensure_single_alert(
-                    "TREND", trend["triggers"], price, "TREND"
-                )
-            ):
-                await self._dispatch_signal(symbol, "TREND", trend, data)
-
+            
+            # Send signals if threshold met
+            if quick['score'] >= QUICK_MIN_SCORE and quick['direction'] != 'none':
+                await self.process_signal(symbol, 'QUICK', quick, data)
+            
+            if mid['score'] >= MID_MIN_SCORE and mid['direction'] != 'none':
+                await self.process_signal(symbol, 'MID', mid, data)
+            
+            if trend['score'] >= TREND_MIN_SCORE and trend['direction'] != 'none':
+                await self.process_signal(symbol, 'TREND', trend, data)
+                
         except Exception as e:
-            logger.exception(f"Error analysing {symbol}: {e}")
-
-    # ---------------- send one signal ----------------
-    async def _dispatch_signal(self, symbol: str, mode: str, result: dict, data: dict):
+            logger.error(f"Error analyzing {symbol}: {e}")
+    
+    async def process_signal(self, symbol, mode, result, data):
+        """Process and send signal with all checks"""
         try:
-            msg, code = telegram_formatter_style_c(
-                symbol, mode, result["direction"], result, data
-            )
-            await send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
-            await send_copy_block(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, code)
-            logger.info(f"📤 {mode} {result['direction'].upper()} signal sent for {symbol}")
+            direction = result['direction']
+            price = data['price']
+            
+            # Cooldown check
+            cooldown = COOLDOWN_SECONDS.get(mode, 1800)
+            if not cooldown_manager.can_send(symbol, mode, cooldown):
+                logger.info(f"⏳ {symbol} {mode} in cooldown")
+                return
+            
+            # Dedupe check
+            rule_key = f"{symbol}_{mode}"
+            if not cooldown_manager.ensure_single_alert(rule_key, result['triggers'], price, mode):
+                logger.info(f"🔁 {symbol} {mode} duplicate signal")
+                return
+            
+            # BTC calm check
+            if not await btc_calm_check(self.market):
+                logger.warning(f"⚠️ BTC volatile, skipping {symbol} {mode} signal")
+                return
+            
+            # Calculate TP/SL
+            tp_sl = calc_single_tp_sl(price, direction, mode)
+            
+            # Safety check
+            if not safety_check_sl_vs_liq(price, tp_sl['sl'], tp_sl['leverage']):
+                logger.warning(f"⚠️ {symbol} {mode} SL too close to liquidation")
+                return
+            
+            # Format and send message
+            message, code_block = telegram_formatter_style_c(symbol, mode, direction, result, data)
+            
+            await send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, message)
+            await asyncio.sleep(1)
+            await send_copy_block(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, code_block)
+            
+            logger.info(f"✅ {mode} {direction.upper()} signal sent for {symbol}")
+            
         except Exception as e:
-            logger.exception(f"Telegram dispatch failed: {e}")
-
-    # ---------------- main loop ----------------
-    async def run(self) -> None:
-        logger.info("🚀 30-Logic Signal-Bot started!")
-        await send_telegram_message(
-            TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "🤖 <b>30-Logic Signal-Bot is ONLINE</b>"
-        )
-
-        while not shutdown_event.is_set():
+            logger.error(f"Error processing signal for {symbol}: {e}")
+    
+    async def run(self):
+        """Main bot loop"""
+        logger.info("🚀 Signal Bot Started!")
+        logger.info(f"📊 Monitoring: {', '.join(TRADING_PAIRS)}")
+        
+        try:
+            await send_telegram_message(
+                TELEGRAM_TOKEN, 
+                TELEGRAM_CHAT_ID, 
+                "🤖 <b>30 Logic Signal Bot Online!</b>\n\n"
+                f"📊 Pairs: {', '.join(TRADING_PAIRS)}\n"
+                f"⚡ Quick Min Score: {QUICK_MIN_SCORE}/10\n"
+                f"🔵 Mid Min Score: {MID_MIN_SCORE}/10\n"
+                f"🟣 Trend Min Score: {TREND_MIN_SCORE}/10\n\n"
+                "✅ All systems operational"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send startup message: {e}")
+        
+        while self.running:
             try:
-                for sym in TRADING_PAIRS:
-                    await self.analyse_symbol(sym)
-                    await asyncio.sleep(1)  # tiny breath between symbols
-                await asyncio.sleep(8)  # ~10 s total per round
+                for symbol in TRADING_PAIRS:
+                    await self.analyze_symbol(symbol)
+                    await asyncio.sleep(2)
+                
+                # Wait before next cycle
+                await asyncio.sleep(10)
+                
+            except KeyboardInterrupt:
+                logger.info("⚠️ Bot stopped by user")
+                self.running = False
+                break
             except Exception as e:
-                logger.exception("Outer loop error – retrying in 5 s")
+                logger.error(f"Main loop error: {e}")
                 await asyncio.sleep(5)
+        
+        # Cleanup
+        await self.shutdown()
+    
+    async def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("🛑 Shutting down...")
+        try:
+            await self.market.close()
+            await send_telegram_message(
+                TELEGRAM_TOKEN,
+                TELEGRAM_CHAT_ID,
+                "🛑 <b>Signal Bot Stopped</b>\n\nBot has been shut down gracefully."
+            )
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+        logger.info("✅ Shutdown complete")
 
-        logger.info("Bot loop terminated.")
-        await self.market.close()
-
-# ---------- entry ----------
 if __name__ == "__main__":
-    # Railway provides PORT env var – bind to keep container alive
-    port = int(os.getenv("PORT", 8080))
-
-    async def dummy_server():
-        """Dummy async server to bind PORT (Railway requirement)"""
-        from aiohttp import web
-
-        async def handle(_):
-            return web.Response(text="30-Logic Signal-Bot is running\n")
-
-        app = web.Application()
-        app.router.add_get("/", handle)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        logger.info(f"Dummy web-server bound to port {port}")
-
-    async def main():
-        await asyncio.gather(
-            dummy_server(),
-            SignalBot().run(),
-        )
-
+    bot = SignalBot()
     try:
-        asyncio.run(main())
+        asyncio.run(bot.run())
     except KeyboardInterrupt:
-        logger.info("Keyboard exit")
+        logger.info("👋 Goodbye!")
