@@ -1,5 +1,10 @@
 .env
 __pycache__/
 *.pyc
-*.sqlite
-signals.db
+*.log
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
