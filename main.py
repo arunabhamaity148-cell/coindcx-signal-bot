@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
 
 from helpers import (
@@ -15,6 +16,7 @@ from helpers import (
     spread_ok,
     depth_ok,
     calc_single_tp_sl,
+    save_pending_signal,
 )
 
 from ai_layer import ai_review_signal
@@ -29,6 +31,15 @@ from config import (
     MID_MIN_SCORE,
     TREND_MIN_SCORE,
     COOLDOWN_SECONDS,
+    AUTO_PUBLISH,
+    ASSISTANT_CONTROLLED_PUBLISH,
+    AI_MIN_CONFIDENCE_TO_SEND,
+    GLOBAL_SYMBOL_COOLDOWN,
+    SUGGESTED_LEVERAGE,
+    SCORE_FOR_50X,
+    PENDING_SIGNALS_FILE,
+    MAX_TELEGRAM_PER_MINUTE,
+    MAX_TELEGRAM_PER_HOUR
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -39,6 +50,10 @@ class SignalBot:
     def __init__(self):
         self.market = MarketData(BINANCE_API_KEY, BINANCE_SECRET)
         self.running = True
+        # rate limiter trackers
+        self.tg_rate = {"by_min": {}, "by_hour": {}}
+        # per-symbol last publish time
+        self._global_symbol_last = {}
 
     async def analyze_symbol(self, symbol):
         try:
@@ -73,68 +88,149 @@ class SignalBot:
 
     async def process_signal(self, symbol, mode, result, data):
         try:
-            direction = result["direction"]
-            price = data["price"]
+            direction = result.get("direction", "none")
+            price = data.get("price")
 
-            # Cooldown check
-            cooldown = COOLDOWN_SECONDS.get(mode, 1800)
-            if not cooldown_manager.can_send(symbol, mode, cooldown):
-                logger.info(f"⏳ {symbol} {mode} skipped (cooldown)")
+            if direction == "none":
                 return
 
-            # Dedupe check
+            # Mode cooldown
+            cooldown = COOLDOWN_SECONDS.get(mode, 1800)
+            if not cooldown_manager.can_send(symbol, mode, cooldown):
+                logger.info(f"⏳ {symbol} {mode} skipped (mode cooldown)")
+                return
+
+            # Dedupe identical content
             rule_key = f"{symbol}_{mode}"
-            if not cooldown_manager.ensure_single_alert(rule_key, result["triggers"], price, mode):
+            if not cooldown_manager.ensure_single_alert(rule_key, result.get("triggers", ""), price, mode):
                 logger.info(f"🔁 {symbol} {mode} duplicate signal")
                 return
 
-            # BTC calm check (pass result into AI too)
-            btc_ok = await btc_calm_check(self.market)
-            if not btc_ok:
-                logger.warning("⚠️ BTC volatile — skipping all signals temporarily")
+            # Spread/depth quick reject
+            s_ok = spread_ok(data)
+            d_ok = depth_ok(data.get("orderbook", {}))
+            if not s_ok or not d_ok:
+                logger.info(f"❌ {symbol} rejected (spread/depth fail) s_ok={s_ok} d_ok={d_ok}")
                 return
 
-            # Compute spread_ok and depth_ok to pass to AI
-            s_ok = spread_ok(data)
-            d_ok = depth_ok(data["orderbook"])
+            # BTC calm check
+            btc_ok = await btc_calm_check(self.market)
+            if not btc_ok:
+                logger.warning("⚠️ BTC volatile — skipping signals temporarily")
+                return
 
-            # AI review (low-cost call)
+            # AI review
             ai_res = await ai_review_signal(
                 symbol=symbol,
                 mode=mode,
                 direction=direction,
-                score=result["score"],
-                triggers=result["triggers"],
+                score=result.get("score", 0),
+                triggers=result.get("triggers", ""),
                 spread_ok=s_ok,
                 depth_ok=d_ok,
                 btc_calm=btc_ok
             )
-
             logger.info(f"🤖 AI decision for {symbol} {mode}: {ai_res}")
 
+            # If AI denies -> stop
             if not ai_res.get("allow", False):
-                logger.info(f"🚫 AI blocked {symbol} {mode} — {ai_res.get('reason')}")
+                logger.info(f"🚫 AI rejected {symbol} {mode} — {ai_res.get('reason')}")
                 return
 
-            confidence = ai_res.get("confidence", None)
-            # TP/SL with confidence-aware leverage
-            tp_sl = calc_single_tp_sl(price, direction, mode, confidence)
-
-            # Final safety: check SL vs liquidation quickly
-            # (helpers' safety functions will already warn; skip here for brevity)
-
-            # Format & send Telegram message
-            msg, _ = telegram_formatter_style_c(symbol, mode, direction, result, data)
-            if not msg:
-                logger.warning(f"⚠️ Formatter blocked message for {symbol} {mode}")
+            # Enforce confidence threshold
+            conf = int(ai_res.get("confidence", 0))
+            if conf < AI_MIN_CONFIDENCE_TO_SEND:
+                logger.info(f"🚫 Not sending {symbol} {mode}: AI conf {conf} < {AI_MIN_CONFIDENCE_TO_SEND}")
                 return
 
-            await send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
-            await asyncio.sleep(0.8)
-            if tp_sl and tp_sl.get("code"):
-                await send_copy_block(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, tp_sl["code"])
+            # Prevent multi-mode publishes for same symbol
+            now_ts = datetime.utcnow().timestamp()
+            last_ts = self._global_symbol_last.get(symbol)
+            if last_ts and (now_ts - last_ts) < GLOBAL_SYMBOL_COOLDOWN:
+                logger.info(f"⏳ {symbol} recently published ({now_ts-last_ts:.0f}s) — skipping {mode}")
+                return
 
-            logger.info(f"✅ Sent {mode} {direction.upper()} for {symbol} (conf {confidence}%)")
+            # Decide leverage (score-based)
+            score_val = float(result.get("score", 0))
+            if score_val >= SCORE_FOR_50X:
+                leverage_use = 50
+            else:
+                lev_sugg = SUGGESTED_LEVERAGE.get(mode, 20)
+                leverage_use = max(15, min(30, int(lev_sugg)))
+
+            # Calculate TP/SL (support both calc_single_tp_sl and calc_tp_sl)
+            tp, sl, codeblock = None, None, None
+            try:
+                tp_sl = calc_single_tp_sl(price, direction, mode)
+                if isinstance(tp_sl, dict):
+                    tp = tp_sl.get("tp")
+                    sl = tp_sl.get("sl")
+                    codeblock = tp_sl.get("code")
+                elif isinstance(tp_sl, (list, tuple)) and len(tp_sl) >= 2:
+                    tp, sl = tp_sl[0], tp_sl[1]
+            except Exception:
+                try:
+                    tp, sl, lev_tmp, codeblock = calc_single_tp_sl(price, direction, mode)
+                except Exception:
+                    tp, sl, codeblock = None, None, None
+
+            # Format message (USD)
+            msg, code_msg = telegram_formatter_style_c(symbol, mode, direction, result, data)
+            # Ensure leverage in codeblock
+            if code_msg and isinstance(code_msg, str):
+                code_msg = code_msg.replace("LEVERAGE = ", f"LEVERAGE = {leverage_use}")
+
+            # Auto-send or save candidate
+            if AUTO_PUBLISH and not ASSISTANT_CONTROLLED_PUBLISH:
+                # Rate limiter check
+                minute_key = int(time.time()) // 60
+                hour_key = int(time.time()) // 3600
+                # cleanup old keys
+                self.tg_rate["by_min"] = {k: v for k, v in self.tg_rate["by_min"].items() if k == minute_key}
+                self.tg_rate["by_hour"] = {k: v for k, v in self.tg_rate["by_hour"].items() if k == hour_key}
+
+                min_count = self.tg_rate["by_min"].get(minute_key, 0)
+                hour_count = self.tg_rate["by_hour"].get(hour_key, 0)
+
+                if min_count >= MAX_TELEGRAM_PER_MINUTE:
+                    logger.warning(f"🔇 Telegram per-minute limit reached ({min_count} >= {MAX_TELEGRAM_PER_MINUTE}) — skipping send")
+                    return
+                if hour_count >= MAX_TELEGRAM_PER_HOUR:
+                    logger.warning(f"🔇 Telegram per-hour limit reached ({hour_count} >= {MAX_TELEGRAM_PER_HOUR}) — skipping send")
+                    return
+
+                # send
+                await send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
+                await asyncio.sleep(0.6)
+                if code_msg:
+                    await send_copy_block(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, code_msg)
+
+                # update counters & last published
+                self.tg_rate["by_min"][minute_key] = self.tg_rate["by_min"].get(minute_key, 0) + 1
+                self.tg_rate["by_hour"][hour_key] = self.tg_rate["by_hour"].get(hour_key, 0) + 1
+                self._global_symbol_last[symbol] = now_ts
+
+                logger.info(f"✅ Auto-published {mode} {direction} for {symbol} (conf {conf}%)")
+            else:
+                # Save candidate for manual review / assisted publish
+                candidate = {
+                    "symbol": symbol,
+                    "mode": mode,
+                    "direction": direction,
+                    "score": result.get("score"),
+                    "triggers": result.get("triggers"),
+                    "price_usd": price,
+                    "tp_usd": tp,
+                    "sl_usd": sl,
+                    "ai": ai_res,
+                    "saved_at": datetime.utcnow().isoformat()
+                }
+                saved = save_pending_signal(PENDING_SIGNALS_FILE, candidate)
+                if saved:
+                    self._global_symbol_last[symbol] = now_ts
+                    logger.info(f"💾 Candidate saved for manual review: {symbol} {mode} (conf {conf}%)")
+                else:
+                    logger.error("❌ Failed to save candidate")
 
         except Exception as e:
             logger.error(f"❌ Error in process_signal for {symbol}: {e}")
