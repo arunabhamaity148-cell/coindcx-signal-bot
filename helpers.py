@@ -1,41 +1,45 @@
 """
 helpers.py — ML + LLM AI layer, regime, orderflow, dynamic TP/SL, position size
+Redis-py 4.3.4 asyncio (aioredis crash fix)
 """
-import os, json, asyncio, hmac, hashlib, math, logging, joblib, aiohttp, aioredis, pandas as pd, numpy as np
+import os, json, asyncio, hmac, hashlib, math, logging, joblib, aiohttp
+import pandas as pd, numpy as np
 from datetime import datetime
 from sklearn.ensemble import GradientBoostingClassifier
 import openai, ccxt.async_support as ccxt
+# ---------- redis-py 4.3.4 async ----------
+from redis.asyncio import Redis
+
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("bot")
+log = logging.getLogger("helpers")
 
 # ---------- config ----------
-CFG = dict(
-    key=os.getenv("BINANCE_KEY"),
-    secret=os.getenv("BINANCE_SECRET"),
-    redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
-    testnet=os.getenv("USE_TESTNET", "false").lower() == "true",
-    tg_token=os.getenv("TELEGRAM_TOKEN"),
-    tg_chat=os.getenv("TELEGRAM_CHAT_ID"),
-    equity=float(os.getenv("EQUITY_USD", 6000)),
-    risk_perc=float(os.getenv("RISK_PERC", 1.0)),
-    max_lev=int(os.getenv("MAX_LEV", 20)),
-    pairs=json.loads(os.getenv("TOP_PAIRS", '["BTCUSDT"]')),
-    openai_key=os.getenv("OPENAI_KEY"),
-)
+CFG = {
+    "key": os.getenv("BINANCE_KEY"),
+    "secret": os.getenv("BINANCE_SECRET"),
+    "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379"),
+    "testnet": os.getenv("USE_TESTNET", "false").lower() == "true",
+    "tg_token": os.getenv("TELEGRAM_TOKEN"),
+    "tg_chat": os.getenv("TELEGRAM_CHAT_ID"),
+    "equity": float(os.getenv("EQUITY_USD", 6000)),
+    "risk_perc": float(os.getenv("RISK_PERC", 1.0)),
+    "max_lev": int(os.getenv("MAX_LEV", 20)),
+    "pairs": json.loads(os.getenv("TOP_PAIRS", '["BTCUSDT"]')),
+    "openai_key": os.getenv("OPENAI_KEY"),
+}
 openai.api_key = CFG["openai_key"]
 
 # ---------- redis ----------
-redis_pool = None
+redis_client: Redis = None
 async def redis():
-    global redis_pool
-    if redis_pool is None:
-        redis_pool = aioredis.from_url(CFG["redis_url"], decode_responses=True)
-    return redis_pool
+    global redis_client
+    if redis_client is None:
+        redis_client = Redis.from_url(CFG["redis_url"], decode_responses=True)
+    return redis_client
 
 # ---------- websocket ----------
 class WS:
-    def __init__(self):
-        self.url = "wss://fstream.binance.com/stream?streams="
+    def __init__(self): self.url = "wss://fstream.binance.com/stream?streams="
     def build(self):
         streams = [f"{p.lower()}@ticker/{p.lower()}@depth20@100ms/{p.lower()}@trade" for p in CFG["pairs"]]
         self.url += "/".join(streams)
@@ -68,7 +72,7 @@ def adx_np(close, high, low, n=14):
     dmplus = np.where((high - np.roll(high, 1)) > (np.roll(low, 1) - low), np.maximum(high - np.roll(high, 1), 0), 0)
     dmminus = np.where((np.roll(low, 1) - low) > (high - np.roll(high, 1)), np.maximum(np.roll(low, 1) - low, 0), 0)
     tr_smooth = pd.Series(tr).rolling(n).sum(); dmplus_smooth = pd.Series(dmplus).rolling(n).sum(); dmminus_smooth = pd.Series(dmminus).rolling(n).sum()
-    dx = 100 * np.abs(dmplus_smooth - dmminus_smooth) / (dmplus_smooth + dmminus_smooth)
+    dx = 100 * np.abs(dmplus_smooth - dmminus_smooth) / (dmplus_smooth + dmminus_smooth + 1e-6)
     adx = dx.rolling(n).mean()
     return adx.iloc[-1] if len(adx) > 0 else 0
 def atr_np(df, n=14):
@@ -132,8 +136,8 @@ async def ai_review_ml(sym, mode, direction, score, triggers, spread_ok, depth_o
     f = await features(sym)
     if not f: return {"allow": False, "confidence": 40, "reason": "no-features"}
     btc_change = float(await r.get("btc_1m_change") or 0)
-    regime = await regime(sym)
-    X = build_vector(f, btc_change, regime)
+    regime_val = await regime(sym)
+    X = build_vector(f, btc_change, regime_val)
     prob_long, prob_short = model.predict_proba(X)[0]
     confidence = int(max(prob_long, prob_short) * 100)
     ai_side = "long" if prob_long > 0.58 else "short" if prob_short > 0.58 else "none"
@@ -175,7 +179,14 @@ async def send_telegram(txt):
 
 # ---------- exchange ----------
 class Exchange:
-    def __init__(self): self.ex = ccxt.binance({"apiKey": CFG["key"], "secret": CFG["secret"], "options": {"defaultType": "future", "testnet": CFG["testnet"]}, "enableRateLimit": True})
-    async def limit(self, sym, side, qty, price, post_only=True): return await self.ex.create_order(sym, "LIMIT", side, qty, price, params={"postOnly": post_only})
-    async def market(self, sym, side, qty): return await self.ex.create_order(sym, "MARKET", side, qty)
+    def __init__(self):
+        self.ex = ccxt.binance({
+            "apiKey": CFG["key"], "secret": CFG["secret"],
+            "options": {"defaultType": "future", "testnet": CFG["testnet"]},
+            "enableRateLimit": True,
+        })
+    async def limit(self, sym, side, qty, price, post_only=True):
+        return await self.ex.create_order(sym, "LIMIT", side, qty, price, params={"postOnly": post_only})
+    async def market(self, sym, side, qty):
+        return await self.ex.create_order(sym, "MARKET", side, qty)
     async def close(self): await self.ex.close()
