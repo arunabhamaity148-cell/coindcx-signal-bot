@@ -1,407 +1,485 @@
-# === helpers.py PART 1 ===
+import ccxt.async_support as ccxt
+import pandas as pd
+import numpy as np
 import aiohttp
-import asyncio
-import os
-import time
-import hmac
-import hashlib
-import json
 
-DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
+class MarketData:
+    def __init__(self, api_key, secret):
+        self.exchange = ccxt.binance({
+            'apiKey': api_key,
+            'secret': secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'}
+        })
+    
+    async def get_all_data(self, symbol):
+        """Fetch all market data"""
+        ticker = await self.exchange.fetch_ticker(symbol)
+        ohlcv_1m = await self.exchange.fetch_ohlcv(symbol, '1m', limit=100)
+        ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, '5m', limit=100)
+        ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, '15m', limit=100)
+        ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, '1h', limit=100)
+        ohlcv_4h = await self.exchange.fetch_ohlcv(symbol, '4h', limit=100)
+        orderbook = await self.exchange.fetch_order_book(symbol, limit=20)
+        
+        return {
+            'symbol': symbol,
+            'price': ticker['last'],
+            'volume': ticker['volume'],
+            'ohlcv_1m': ohlcv_1m,
+            'ohlcv_5m': ohlcv_5m,
+            'ohlcv_15m': ohlcv_15m,
+            'ohlcv_1h': ohlcv_1h,
+            'ohlcv_4h': ohlcv_4h,
+            'orderbook': orderbook,
+            'spread': ((orderbook['asks'][0][0] - orderbook['bids'][0][0]) / orderbook['bids'][0][0]) * 100
+        }
 
-BIN_KEY = os.getenv("BINANCE_API_KEY")
-BIN_SECRET = os.getenv("BINANCE_SECRET_KEY", "").encode() if os.getenv("BINANCE_SECRET_KEY") else b""
-FUTURES = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
+def calculate_rsi(ohlcv, period=14):
+    """Calculate RSI"""
+    closes = [x[4] for x in ohlcv]
+    df = pd.DataFrame({'close': closes})
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
 
-COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "1800"))
-INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "8"))
+def calculate_macd(ohlcv):
+    """Calculate MACD"""
+    closes = [x[4] for x in ohlcv]
+    df = pd.DataFrame({'close': closes})
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    macd = exp1 - exp2
+    signal = macd.ewm(span=9, adjust=False).mean()
+    return macd.iloc[-1], signal.iloc[-1], macd.iloc[-2], signal.iloc[-2]
 
-MODE_THRESH = {
-    "quick": int(os.getenv("THRESH_QUICK", "65")),
-    "mid": int(os.getenv("THRESH_MID", "72")),
-    "trend": int(os.getenv("THRESH_TREND", "78")),
-}
+def calculate_ema(ohlcv, period):
+    """Calculate EMA"""
+    closes = [x[4] for x in ohlcv]
+    df = pd.DataFrame({'close': closes})
+    return df['close'].ewm(span=period, adjust=False).mean().iloc[-1]
 
-TP_SL = {
-    "quick": (1.2, 0.7),
-    "mid": (1.8, 1.0),
-    "trend": (2.5, 1.2),
-}
+def calculate_adx(ohlcv, period=14):
+    """Calculate ADX"""
+    highs = [x[2] for x in ohlcv]
+    lows = [x[3] for x in ohlcv]
+    closes = [x[4] for x in ohlcv]
+    
+    df = pd.DataFrame({'high': highs, 'low': lows, 'close': closes})
+    
+    df['tr'] = df[['high', 'low', 'close']].apply(
+        lambda x: max(x['high'] - x['low'], abs(x['high'] - x['close']), abs(x['low'] - x['close'])), axis=1)
+    
+    df['+dm'] = df['high'].diff()
+    df['-dm'] = -df['low'].diff()
+    df['+dm'] = df['+dm'].where((df['+dm'] > df['-dm']) & (df['+dm'] > 0), 0)
+    df['-dm'] = df['-dm'].where((df['-dm'] > df['+dm']) & (df['-dm'] > 0), 0)
+    
+    atr = df['tr'].rolling(period).mean()
+    di_plus = 100 * (df['+dm'].rolling(period).mean() / atr)
+    di_minus = 100 * (df['-dm'].rolling(period).mean() / atr)
+    
+    dx = 100 * abs(di_plus - di_minus) / (di_plus + di_minus)
+    adx = dx.rolling(period).mean()
+    
+    return adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0
 
-LEVERAGE = int(os.getenv("LEVERAGE", "50"))
+def calculate_bollinger_bands(ohlcv, period=20, std=2):
+    """Calculate Bollinger Bands"""
+    closes = [x[4] for x in ohlcv]
+    df = pd.DataFrame({'close': closes})
+    sma = df['close'].rolling(period).mean()
+    std_dev = df['close'].rolling(period).std()
+    upper = sma + (std_dev * std)
+    lower = sma - (std_dev * std)
+    return upper.iloc[-1], sma.iloc[-1], lower.iloc[-1]
 
-BTC_STABILITY_THRESHOLD = float(os.getenv("BTC_STABILITY_THRESHOLD", "1.2"))
-MIN_24H_VOL = float(os.getenv("MIN_24H_VOL", "20000"))
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.06"))
-MAX_LIQ_DIST = float(os.getenv("MAX_LIQ_DIST", "1.0"))
+def calculate_atr(ohlcv, period=14):
+    """Calculate ATR"""
+    highs = [x[2] for x in ohlcv]
+    lows = [x[3] for x in ohlcv]
+    closes = [x[4] for x in ohlcv]
+    
+    df = pd.DataFrame({'high': highs, 'low': lows, 'close': closes})
+    df['tr'] = df[['high', 'low', 'close']].apply(
+        lambda x: max(x['high'] - x['low'], abs(x['high'] - x['close']), abs(x['low'] - x['close'])), axis=1)
+    return df['tr'].rolling(period).mean().iloc[-1]
 
-VERBOSE_SCORE_MIN = int(os.getenv("VERBOSE_SCORE_MIN", "45"))
+def calculate_vwap(ohlcv):
+    """Calculate VWAP"""
+    typical_prices = [(x[2] + x[3] + x[4]) / 3 for x in ohlcv]
+    volumes = [x[5] for x in ohlcv]
+    return sum([tp * v for tp, v in zip(typical_prices, volumes)]) / sum(volumes)
 
-ENABLE_ICEBERG = os.getenv("ENABLE_ICEBERG", "true").lower() == "true"
-ENABLE_VOLSWEEP = os.getenv("ENABLE_VOLSWEEP", "true").lower() == "true"
-ENABLE_OI_SPIKE = os.getenv("ENABLE_OI_SPIKE", "true").lower() == "true"
-
-ICEBERG_FACTOR = float(os.getenv("ICEBERG_FACTOR", "3.0"))
-VOLSWEEP_MULT = float(os.getenv("VOLSWEEP_MULT", "3.0"))
-OI_SPIKE_PCT = float(os.getenv("OI_SPIKE_PCT", "5.0"))
-
-_last_signal = {}
-_cache = {}
-_cache_time = {}
-
-def cache_get(key, ttl=5):
-    v = _cache.get(key)
-    if not v:
-        return None
-    if time.time() - _cache_time.get(key, 0) > ttl:
-        _cache.pop(key, None)
-        _cache_time.pop(key, None)
-        return None
-    return v
-
-def cache_set(key, val):
-    _cache[key] = val
-    _cache_time[key] = time.time()
-
-def cooldown_ok(symbol):
-    return (time.time() - _last_signal.get(symbol, 0)) >= COOLDOWN
-
-def update_cd(symbol):
-    _last_signal[symbol] = time.time()
-
-def sign(query: str) -> str:
-    if not BIN_SECRET:
-        return ""
-    return hmac.new(BIN_SECRET, query.encode(), hashlib.sha256).hexdigest()
-
-async def public(session, path, params=""):
-    url = f"{FUTURES}{path}"
-    if params:
-        url += f"?{params}"
+# ==========================================
+# QUICK SIGNALS (10 logics)
+# ==========================================
+def calculate_quick_signals(data):
+    """Calculate Quick signal score"""
+    score = 0
+    triggers = []
+    direction = 'none'
+    long_signals = 0
+    short_signals = 0
+    
     try:
-        async with session.get(url, timeout=8) as r:
-            return await r.json()
-    except:
-        return None
-
-async def private(session, path, params=""):
-    ts = int(time.time()*1000)
-    q = f"{params}&timestamp={ts}" if params else f"timestamp={ts}"
-    sig = sign(q)
-    url = f"{FUTURES}{path}?{q}&signature={sig}"
-    headers = {"X-MBX-APIKEY": BIN_KEY} if BIN_KEY else {}
-    try:
-        async with session.get(url, headers=headers, timeout=8) as r:
-            return await r.json()
-    except:
-        return None
-
-async def depth(session, symbol, limit=50):
-    return await public(session, "/fapi/v1/depth", f"symbol={symbol}&limit={limit}")
-
-async def ticker_24h(session, symbol):
-    return await public(session, "/fapi/v1/ticker/24hr", f"symbol={symbol}")
-
-async def kline(session, symbol, interval="1m", limit=60):
-    return await public(session, "/fapi/v1/klines", f"symbol={symbol}&interval={interval}&limit={limit}")
-
-async def trades(session, symbol, limit=500):
-    return await public(session, "/fapi/v1/aggTrades", f"symbol={symbol}&limit={limit}")
-
-async def funding_rate(session, symbol):
-    r = await public(session, "/fapi/v1/fundingRate", f"symbol={symbol}&limit=1")
-    try:
-        return float(r[0].get("fundingRate", 0))
-    except:
-        return 0.0
-
-async def oi_history(session, symbol, limit=5):
-    return await public(session, "/fapi/futures/data/openInterestHist", f"symbol={symbol}&period=5m&limit={limit}")
-
-def ema(values, length=None):
-    if not values:
-        return 0.0
-    vals = list(values)
-    if length is None:
-        length = len(vals)
-    k = 2/(length+1)
-    e = float(vals[0])
-    for v in vals[1:]:
-        e = e*(1-k) + float(v)*k
-    return e
-
-async def get_htf(session, symbol):
-    cache_key = f"htf:{symbol}"
-    c = cache_get(cache_key, ttl=6)
-    if c:
-        return c
-
-    k15, k1h, k4h = await asyncio.gather(
-        kline(session, symbol, "15m", 60),
-        kline(session, symbol, "1h", 60),
-        kline(session, symbol, "4h", 60)
-    )
-
-    c15 = [float(x[4]) for x in k15]
-    c1h = [float(x[4]) for x in k1h]
-    c4h = [float(x[4]) for x in k4h]
-
-    out = {
-        "close_15": c15[-1],
-        "ema_15": ema(c15[-15:], 15),
-        "ema_50": ema(c15[-50:], 50) if len(c15)>=50 else ema(c15),
-        "ema_200": ema(c15[-200:], 200) if len(c15)>=200 else ema(c15),
-        "ema_1h": ema(c1h[-50:], 50),
-        "ema_4h": ema(c4h[-50:], 50),
-        "trend_15": "up" if c15[-1] > ema(c15[-50:], 50) else "down",
-        "trend_1h": "up" if c1h[-1] > ema(c1h[-50:], 50) else "down",
-        "trend_4h": "up" if c4h[-1] > ema(c4h[-50:], 50) else "down",
+        price = data['price']
+        ohlcv_1m = data['ohlcv_1m']
+        ohlcv_5m = data['ohlcv_5m']
+        
+        # 1. RSI_oversold_breakout
+        rsi = calculate_rsi(ohlcv_1m)
+        if 25 < rsi < 35:
+            score += 1
+            triggers.append("✅ RSI_oversold_breakout")
+            long_signals += 1
+        elif 65 < rsi < 75:
+            score += 1
+            triggers.append("✅ RSI_overbought_breakdown")
+            short_signals += 1
+        
+        # 2. MACD_bullish_cross
+        macd, signal, macd_prev, signal_prev = calculate_macd(ohlcv_5m)
+        if macd > signal and macd_prev <= signal_prev:
+            score += 1
+            triggers.append("✅ MACD_bullish_cross")
+            long_signals += 1
+        elif macd < signal and macd_prev >= signal_prev:
+            score += 1
+            triggers.append("✅ MACD_bearish_cross")
+            short_signals += 1
+        
+        # 3. Volume_spike_support
+        volumes = [x[5] for x in ohlcv_1m[-20:]]
+        avg_vol = np.mean(volumes[:-1])
+        current_vol = volumes[-1]
+        if current_vol > avg_vol * 2:
+            score += 1
+            triggers.append("✅ Volume_spike")
+            long_signals += 1
+        
+        # 4. VWAP_reclaim_long
+        vwap = calculate_vwap(ohlcv_5m)
+        if price > vwap * 1.001:
+            score += 1
+            triggers.append("✅ VWAP_reclaim_long")
+            long_signals += 1
+        elif price < vwap * 0.999:
+            score += 1
+            triggers.append("✅ VWAP_below_short")
+            short_signals += 1
+        
+        # 5. EMA_9_21_bull_cross
+        ema9 = calculate_ema(ohlcv_5m, 9)
+        ema21 = calculate_ema(ohlcv_5m, 21)
+        if price > ema9 > ema21:
+            score += 1
+            triggers.append("✅ EMA_9_21_bull")
+            long_signals += 1
+        elif price < ema9 < ema21:
+            score += 1
+            triggers.append("✅ EMA_9_21_bear")
+            short_signals += 1
+        
+        # 6. Orderblock_retest_long (simplified)
+        candles = ohlcv_1m[-10:]
+        for i in range(len(candles)-3):
+            if candles[i][5] > np.mean([c[5] for c in candles]) * 1.5:
+                score += 1
+                triggers.append("✅ Orderblock_detected")
+                long_signals += 1
+                break
+        
+        # 7. Liquidity_sweep_long
+        lows = [x[3] for x in ohlcv_1m[-5:]]
+        if price < min(lows[:-1]) and price > lows[-2]:
+            score += 1
+            triggers.append("✅ Liquidity_sweep")
+            long_signals += 1
+        
+        # 8. Bollinger_band_squeeze_break
+        upper, mid, lower = calculate_bollinger_bands(ohlcv_5m)
+        bb_width = (upper - lower) / mid
+        if bb_width < 0.02:
+            score += 1
+            triggers.append("✅ BB_squeeze")
+            if price > mid:
+                long_signals += 1
+            else:
+                short_signals += 1
+        
+        # 9. Spread_tight_low_latency
+        if data['spread'] < 0.03:
+            score += 1
+            triggers.append("✅ Tight_spread")
+        
+        # 10. Market_structure_HH_HL
+        highs = [x[2] for x in ohlcv_5m[-5:]]
+        if highs[-1] > highs[-2] > highs[-3]:
+            score += 1
+            triggers.append("✅ Higher_highs")
+            long_signals += 1
+        
+        # Determine direction
+        if long_signals > short_signals:
+            direction = 'long'
+        elif short_signals > long_signals:
+            direction = 'short'
+        
+    except Exception as e:
+        print(f"Quick signal error: {e}")
+    
+    return {
+        'score': score,
+        'triggers': '\n'.join(triggers) if triggers else 'No triggers',
+        'direction': direction
     }
 
-    cache_set(cache_key, out)
-    return out
-# === helpers.py PART 2 ===
-
-async def detect_iceberg(session, symbol, lookback_trades=200, large_trade_factor=ICEBERG_FACTOR):
+# ==========================================
+# MID SIGNALS (10 logics)
+# ==========================================
+def calculate_mid_signals(data):
+    """Calculate Mid signal score"""
+    score = 0
+    triggers = []
+    direction = 'none'
+    long_signals = 0
+    short_signals = 0
+    
     try:
-        ts = await trades(session, symbol, limit=lookback_trades)
-        if not ts:
-            return False
-        sizes = []
-        prices = []
-        for t in ts:
-            try:
-                p = float(t["p"]); q = float(t["q"])
-            except:
-                try:
-                    p = float(t[4]); q = float(t[5])
-                except:
-                    continue
-            prices.append(p); sizes.append(q)
-
-        if len(sizes) < 20:
-            return False
-
-        sorted_sizes = sorted(sizes)
-        med = sorted_sizes[len(sorted_sizes)//2]
-        threshold = med * large_trade_factor
-
-        large_idx = [i for i,s in enumerate(sizes) if s >= threshold]
-        if len(large_idx) < 3:
-            return False
-
-        large_prices = [prices[i] for i in large_idx]
-        avg_lp = sum(large_prices)/len(large_prices)
-        if (max(large_prices)-min(large_prices))/avg_lp > 0.001:
-            return False
-
-        if DEBUG_LOG:
-            print(f"[DETECT] {symbol} → ICEBERG TRUE")
-        return True
-    except:
-        return False
-
-
-async def detect_vol_sweep_1m(session, symbol, lookback=6, mult=VOLSWEEP_MULT):
-    try:
-        kl = await kline(session, symbol, "1m", lookback+1)
-        if not kl:
-            return False
-
-        prev_vols = [float(c[5]) for c in kl[:-1]]
-        last_vol = float(kl[-1][5])
-        avg_prev = sum(prev_vols)/len(prev_vols)
-
-        if last_vol >= avg_prev * mult:
-            if DEBUG_LOG:
-                print(f"[DETECT] {symbol} → VOL_SWEEP TRUE")
-            return True
-        return False
-    except:
-        return False
-
-
-async def detect_oi_spike(session, symbol, pct=OI_SPIKE_PCT):
-    try:
-        oi = await oi_history(session, symbol, 3)
-        if not oi or len(oi)<2:
-            return False
-
-        first = float(oi[0].get("sumOpenInterest", oi[0].get("openInterest", 0)))
-        last  = float(oi[-1].get("sumOpenInterest", oi[-1].get("openInterest", 0)))
-
-        if first > 0:
-            change = (last-first)/first*100
-            if change >= pct:
-                if DEBUG_LOG:
-                    print(f"[DETECT] {symbol} → OI_SPIKE TRUE ({change:.2f}%)")
-                return True
-        return False
-    except:
-        return False
-
-
-def score_engine(htf, meta, mode):
-    s = 0
-
-    if mode=="quick":
-        s += 15 if htf["trend_15"]=="up" else 0
-        s += 10 if htf["ema_15"] > htf["ema_50"] else 0
-        s += 12 if meta.get("imbalance",1) > 1.2 else 0
-        s += 10 if meta.get("vol_quote",0) > MIN_24H_VOL*1.5 else 0
-        s += 8  if abs(meta.get("funding",0)) < 0.02 else 0
-
-    elif mode=="mid":
-        s += 20 if htf["trend_1h"]=="up" else 0
-        s += 12 if htf["ema_50"] > htf["ema_200"] else 0
-        s += 12 if meta.get("imbalance",1) > 1.3 else 0
-        s += 10 if meta.get("oi_sustained",False) else 0
-        s += 8  if abs(meta.get("funding",0)) < 0.03 else 0
-
-    else:
-        s += 25 if htf["trend_4h"]=="up" else 0
-        s += 15 if htf["trend_1h"]=="up" else 0
-        s += 15 if htf["ema_50"] > htf["ema_200"] else 0
-        s += 10 if meta.get("oi_sustained",False) else 0
-        s += 10 if meta.get("imbalance",1)>1.4 else 0
-
-    if abs(meta.get("funding",0)) > 0.05:
-        s -= 15
-    if meta.get("liq_risk", False):
-        s -= 25
-
-    # --- TOP3 bonuses ---
-    if meta.get("iceberg"):
-        s += 3 if mode=="quick" else 4 if mode=="mid" else 5
-
-    if meta.get("vol_sweep_1m"):
-        s += 4
-
-    if meta.get("oi_spike"):
-        s += 3
-
-    return max(0, min(100, int(s)))
-# === helpers.py PART 3 ===
-
-def get_direction(htf):
-    try:
-        bull = htf["ema_15"] > htf["ema_50"] > htf["ema_200"] and htf["trend_1h"]=="up"
-        bear = htf["ema_15"] < htf["ema_50"] < htf["ema_200"] and htf["trend_1h"]=="down"
-        return "BUY" if bull else "SELL" if bear else None
-    except:
-        return None
-
-async def btc_calm_check(session):
-    try:
-        r = await ticker_24h(session, "BTCUSDT")
-        if not r:
-            return True
-        change = abs(float(r.get("priceChangePercent", 0)))
-        return change < BTC_STABILITY_THRESHOLD
-    except:
-        return True
-
-
-async def final_process(session, symbol, mode):
-
-    if DEBUG_LOG:
-        print(f"[CHECK] {symbol} ({mode}) scanning...")
-
-    if not await btc_calm_check(session):
-        if DEBUG_LOG:
-            print(f"[SKIP] {symbol} → BTC volatile")
-        return None
-
-    htf = await get_htf(session, symbol)
-    if not htf:
-        return None
-
-    ok, liq = await check_liq(session, symbol)
-    if not ok:
-        return None
-
-    funding = await funding_rate(session, symbol)
-
-    oi = await oi_history(session, symbol, 3)
-    oi_sustained = False
-    try:
-        a = float(oi[0].get("sumOpenInterest", oi[0].get("openInterest",0)))
-        b = float(oi[-1].get("sumOpenInterest", oi[-1].get("openInterest",0)))
-        oi_sustained = b > a
-    except:
-        pass
-
-    meta = {
-        "spread_pct": liq.get("spread_pct",0),
-        "imbalance": liq.get("imbalance",1),
-        "vol_quote": liq.get("vol_quote",0),
-        "funding": funding,
-        "oi_sustained": oi_sustained,
-        "liq_risk": False
+        price = data['price']
+        ohlcv_15m = data['ohlcv_15m']
+        ohlcv_1h = data['ohlcv_1h']
+        
+        # 1. RSI_overbought_reversal
+        rsi = calculate_rsi(ohlcv_15m)
+        if rsi > 70:
+            score += 1
+            triggers.append("✅ RSI_overbought")
+            short_signals += 1
+        elif rsi < 30:
+            score += 1
+            triggers.append("✅ RSI_oversold")
+            long_signals += 1
+        
+        # 2. MACD_hidden_bullish
+        macd, signal, _, _ = calculate_macd(ohlcv_15m)
+        if macd > 0 and macd > signal:
+            score += 1
+            triggers.append("✅ MACD_hidden_bull")
+            long_signals += 1
+        
+        # 3. MACD_divergence_support (simplified)
+        if macd < 0 and macd < signal:
+            score += 1
+            triggers.append("✅ MACD_divergence")
+            long_signals += 1
+        
+        # 4. ADX_trend_strength_up
+        adx = calculate_adx(ohlcv_1h)
+        if adx > 25:
+            score += 1
+            triggers.append("✅ ADX_strong_trend")
+            long_signals += 1
+        
+        # 5. Volume_delta_buy_pressure
+        volumes = [x[5] for x in ohlcv_15m[-10:]]
+        if volumes[-1] > np.mean(volumes) * 1.5:
+            score += 1
+            triggers.append("✅ Volume_delta_buy")
+            long_signals += 1
+        
+        # 6. EMA_50_bounce
+        ema50 = calculate_ema(ohlcv_1h, 50)
+        if abs(price - ema50) / ema50 < 0.01:
+            score += 1
+            triggers.append("✅ EMA50_bounce")
+            if price > ema50:
+                long_signals += 1
+            else:
+                short_signals += 1
+        
+        # 7. EMA_200_bounce
+        ema200 = calculate_ema(ohlcv_1h, 200)
+        if abs(price - ema200) / ema200 < 0.015:
+            score += 1
+            triggers.append("✅ EMA200_bounce")
+            if price > ema200:
+                long_signals += 1
+        
+        # 8. FVG_immediate_fill
+        candles = ohlcv_15m[-5:]
+        for i in range(len(candles)-2):
+            gap = candles[i+2][3] - candles[i][2]
+            if gap > 0:
+                score += 1
+                triggers.append("✅ FVG_detected")
+                long_signals += 1
+                break
+        
+        # 9. Keltner_breakout_up
+        atr = calculate_atr(ohlcv_1h)
+        ema20 = calculate_ema(ohlcv_1h, 20)
+        upper_keltner = ema20 + (2 * atr)
+        if price > upper_keltner:
+            score += 1
+            triggers.append("✅ Keltner_breakout")
+            long_signals += 1
+        
+        # 10. Trendline_break_retest
+        closes = [x[4] for x in ohlcv_1h[-10:]]
+        if closes[-1] > closes[-2] > closes[-3]:
+            score += 1
+            triggers.append("✅ Trendline_break")
+            long_signals += 1
+        
+        # Determine direction
+        if long_signals > short_signals:
+            direction = 'long'
+        elif short_signals > long_signals:
+            direction = 'short'
+        
+    except Exception as e:
+        print(f"Mid signal error: {e}")
+    
+    return {
+        'score': score,
+        'triggers': '\n'.join(triggers) if triggers else 'No triggers',
+        'direction': direction
     }
 
-    # ---- Top3 detection ----
-    meta["iceberg"] = await detect_iceberg(session, symbol) if ENABLE_ICEBERG else False
-    meta["vol_sweep_1m"] = await detect_vol_sweep_1m(session, symbol) if ENABLE_VOLSWEEP else False
-    meta["oi_spike"] = await detect_oi_spike(session, symbol) if ENABLE_OI_SPIKE else False
-
-    direction = get_direction(htf)
-    if not direction:
-        return None
-
-    score = score_engine(htf, meta, mode)
-    if score < MODE_THRESH.get(mode,100):
-        return None
-
-    if not cooldown_ok(symbol):
-        return None
-
-    price = float(htf["close_15"])
-    tp_pct, sl_pct = TP_SL.get(mode, (1.8, 1.0))
-
-    if direction=="BUY":
-        tp = price*(1+tp_pct/100)
-        sl = price*(1-sl_pct/100)
-    else:
-        tp = price*(1-tp_pct/100)
-        sl = price*(1+sl_pct/100)
-
-    sig = {
-        "symbol":symbol,
-        "direction":direction,
-        "mode":mode,
-        "price":round(price,6),
-        "tp":round(tp,6),
-        "sl":round(sl,6),
-        "score":score,
-        "meta":meta
+# ==========================================
+# TREND SIGNALS (10 logics)
+# ==========================================
+def calculate_trend_signals(data):
+    """Calculate Trend signal score"""
+    score = 0
+    triggers = []
+    direction = 'none'
+    long_signals = 0
+    short_signals = 0
+    
+    try:
+        price = data['price']
+        ohlcv_1h = data['ohlcv_1h']
+        ohlcv_4h = data['ohlcv_4h']
+        
+        # 1. Breaker_block_retest
+        candles = ohlcv_4h[-10:]
+        highs = [x[2] for x in candles]
+        if price > max(highs[:-1]):
+            score += 1
+            triggers.append("✅ Breaker_block")
+            long_signals += 1
+        
+        # 2. Chop_zone_exit_long
+        adx = calculate_adx(ohlcv_4h)
+        if adx > 20:
+            score += 1
+            triggers.append("✅ Chop_zone_exit")
+            long_signals += 1
+        
+        # 3. Bollinger_midband_reject_flip
+        upper, mid, lower = calculate_bollinger_bands(ohlcv_4h)
+        if price > mid:
+            score += 1
+            triggers.append("✅ BB_midband_above")
+            long_signals += 1
+        elif price < mid:
+            score += 1
+            triggers.append("✅ BB_midband_below")
+            short_signals += 1
+        
+        # 4. Supertrend_flip_bull (simplified using EMA)
+        ema50 = calculate_ema(ohlcv_4h, 50)
+        ema200 = calculate_ema(ohlcv_4h, 200)
+        if ema50 > ema200 and price > ema50:
+            score += 1
+            triggers.append("✅ Supertrend_bull")
+            long_signals += 1
+        elif ema50 < ema200 and price < ema50:
+            score += 1
+            triggers.append("✅ Supertrend_bear")
+            short_signals += 1
+        
+        # 5. ATR_volatility_drop_entry
+        atr = calculate_atr(ohlcv_4h)
+        atr_prev = calculate_atr(ohlcv_4h[:-10])
+        if atr < atr_prev * 0.8:
+            score += 1
+            triggers.append("✅ ATR_volatility_drop")
+            long_signals += 1
+        
+        # 6. Pullback_0_382_fib_entry
+        highs = [x[2] for x in ohlcv_4h[-20:]]
+        lows = [x[3] for x in ohlcv_4h[-20:]]
+        high = max(highs)
+        low = min(lows)
+        fib_382 = high - (high - low) * 0.382
+        if abs(price - fib_382) / price < 0.01:
+            score += 1
+            triggers.append("✅ Fib_0.382_level")
+            long_signals += 1
+        
+        # 7. Pullback_0_5_fib_entry
+        fib_50 = high - (high - low) * 0.5
+        if abs(price - fib_50) / price < 0.01:
+            score += 1
+            triggers.append("✅ Fib_0.5_level")
+            long_signals += 1
+        
+        # 8. Pullback_0_618_fib_entry
+        fib_618 = high - (high - low) * 0.618
+        if abs(price - fib_618) / price < 0.01:
+            score += 1
+            triggers.append("✅ Fib_0.618_level")
+            long_signals += 1
+        
+        # 9. Support_demand_zone_reaction
+        recent_lows = [x[3] for x in ohlcv_4h[-10:]]
+        support = min(recent_lows)
+        if abs(price - support) / price < 0.02:
+            score += 1
+            triggers.append("✅ Support_zone")
+            long_signals += 1
+        
+        # 10. Imbalance_fill_continuation
+        closes = [x[4] for x in ohlcv_4h[-5:]]
+        if all(closes[i] < closes[i+1] for i in range(len(closes)-1)):
+            score += 1
+            triggers.append("✅ Imbalance_continuation")
+            long_signals += 1
+        
+        # Determine direction
+        if long_signals > short_signals:
+            direction = 'long'
+        elif short_signals > long_signals:
+            direction = 'short'
+        
+    except Exception as e:
+        print(f"Trend signal error: {e}")
+    
+    return {
+        'score': score,
+        'triggers': '\n'.join(triggers) if triggers else 'No triggers',
+        'direction': direction
     }
 
-    update_cd(symbol)
-
-    if DEBUG_LOG:
-        print(f"[SEND] {symbol} ({mode}) SCORE={score}")
-
-    return sig
-
-
-def format_signal(sig):
-    m = sig["meta"]
-    return f"""
-🔥 <b>{sig['mode'].upper()} {sig['direction']} SIGNAL</b>
-
-Pair: {sig['symbol']}
-Entry: <code>{sig['price']}</code>
-Score: {sig['score']}
-
-🎯 TP → <code>{sig['tp']}</code>
-🛑 SL → <code>{sig['sl']}</code>
-
-📊 Imbalance: {m.get('imbalance')}
-⚡ VolSweep1m: {m.get('vol_sweep_1m')}
-🧊 Iceberg: {m.get('iceberg')}
-📈 OI Spike: {m.get('oi_spike')}
-💰 24h Vol: {m.get('vol_quote')}
-
-#HybridAI #ArunSystem
-"""
+async def send_telegram_message(token, chat_id, message):
+    """Send message to Telegram"""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': message,
+        'parse_mode': 'HTML'
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                return await response.json()
+    except Exception as e:
+        print(f"Telegram error: {e}")
