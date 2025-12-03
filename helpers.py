@@ -381,12 +381,12 @@ def calc_tp_sl(entry, side, mode):
 
     lev = SUGGESTED_LEVERAGE.get(mode, 20)
 
-    code = f\"\"\"```python
+    code = f'''```python
 ENTRY = {entry}
 TP = {tp}
 SL = {sl}
 LEVERAGE = {lev}
-```\"\"\"
+```'''
 
     return tp, sl, lev, code
 
