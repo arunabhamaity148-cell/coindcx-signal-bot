@@ -1,9 +1,8 @@
-# AI-Only Crypto Futures Signal Bot (Hybrid Indicators + Caching + SQLite)
+# 2k-INR-Daily-Bot
+ML + LLM filtered, 50 coins, 2-3 quality alerts/day, Railway deploy, Android notify.
 
-Minimal, production-ready 2-file core with extras:
-- main.py  — driver, live price fetch (ccxt), OpenAI scoring, Telegram send, caching, sqlite logging
-- helpers.py — indicators, prompt builder, TP/SL, small cache
-
-## Setup
-1. Copy `.env.example` → `.env` and fill credentials (BOT_TOKEN, CHAT_ID, OPENAI_API_KEY).
-2. Install dependencies:
+## Deploy
+1. railway.app → New → GitHub repo  
+2. Add env vars (see .env.example)  
+3. Deploy → container live 24×7  
+4. Join Telegram channel → alerts on phone
