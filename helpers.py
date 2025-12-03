@@ -253,8 +253,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from config import *
-from helpers_part1 import validate_ohlcv, calc_liquidation  # reuse functions
+from config import * import helpers.py — PRO VERSION (Part 1) validate_ohlcv, calc_liquidation  # reuse functions
 
 logger = logging.getLogger("signal_bot")
 
