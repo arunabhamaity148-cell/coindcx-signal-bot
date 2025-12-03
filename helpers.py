@@ -7,7 +7,6 @@ import pandas as pd, numpy as np
 from datetime import datetime
 from sklearn.ensemble import GradientBoostingClassifier
 import openai, ccxt.async_support as ccxt
-logging.info("REDIS_URL=%s", os.getenv("REDIS_URL"))
 # ---------- redis-py 4.3.4 async ----------
 from redis.asyncio import Redis
 
