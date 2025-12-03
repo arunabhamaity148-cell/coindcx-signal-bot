@@ -14,26 +14,33 @@ class MarketData:
     
     async def get_all_data(self, symbol):
         """Fetch all market data"""
-        ticker = await self.exchange.fetch_ticker(symbol)
-        ohlcv_1m = await self.exchange.fetch_ohlcv(symbol, '1m', limit=100)
-        ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, '5m', limit=100)
-        ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, '15m', limit=100)
-        ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, '1h', limit=100)
-        ohlcv_4h = await self.exchange.fetch_ohlcv(symbol, '4h', limit=100)
-        orderbook = await self.exchange.fetch_order_book(symbol, limit=20)
-        
-        return {
-            'symbol': symbol,
-            'price': ticker['last'],
-            'volume': ticker['volume'],
-            'ohlcv_1m': ohlcv_1m,
-            'ohlcv_5m': ohlcv_5m,
-            'ohlcv_15m': ohlcv_15m,
-            'ohlcv_1h': ohlcv_1h,
-            'ohlcv_4h': ohlcv_4h,
-            'orderbook': orderbook,
-            'spread': ((orderbook['asks'][0][0] - orderbook['bids'][0][0]) / orderbook['bids'][0][0]) * 100
-        }
+        try:
+            ticker = await self.exchange.fetch_ticker(symbol)
+            ohlcv_1m = await self.exchange.fetch_ohlcv(symbol, '1m', limit=100)
+            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, '5m', limit=100)
+            ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, '15m', limit=100)
+            ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, '1h', limit=100)
+            ohlcv_4h = await self.exchange.fetch_ohlcv(symbol, '4h', limit=100)
+            orderbook = await self.exchange.fetch_order_book(symbol, limit=20)
+            
+            # Fix volume key issue
+            volume = ticker.get('baseVolume', ticker.get('volume', 0))
+            
+            return {
+                'symbol': symbol,
+                'price': ticker['last'],
+                'volume': volume,
+                'ohlcv_1m': ohlcv_1m,
+                'ohlcv_5m': ohlcv_5m,
+                'ohlcv_15m': ohlcv_15m,
+                'ohlcv_1h': ohlcv_1h,
+                'ohlcv_4h': ohlcv_4h,
+                'orderbook': orderbook,
+                'spread': ((orderbook['asks'][0][0] - orderbook['bids'][0][0]) / orderbook['bids'][0][0]) * 100
+            }
+        except Exception as e:
+            print(f"Error fetching data for {symbol}: {e}")
+            raise
 
 def calculate_rsi(ohlcv, period=14):
     """Calculate RSI"""
