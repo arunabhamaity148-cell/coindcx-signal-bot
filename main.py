@@ -1,5 +1,5 @@
 """
-main.py — Production FastAPI + Trading Bot  (final)
+main.py — Production FastAPI + Trading Bot  (FINAL)
 Keeps Railway alive 24/7, runs ML-powered trading bot
 """
 import os
@@ -10,7 +10,7 @@ from datetime import datetime
 from fastapi import FastAPI
 import uvicorn
 import aiohttp
-from helpers_part2 import (   # helpers.py part-2 এখানে import
+from helpers_part2 import (   # ← helpers.py part-2
     WS, Exchange, calculate_advanced_score, ai_review_ensemble,
     calc_smart_tp_sl, position_size, send_telegram,
     check_risk_limits, update_daily_pnl, cleanup, CFG
@@ -135,8 +135,12 @@ async def bot_loop():
                 last_trade_time[sym] = datetime.utcnow()
                 await asyncio.sleep(0.5)
 
-                            await asyncio.sleep(2)          # next symbol
-            await asyncio.sleep(1)              # next loop
+            except Exception as e:
+                log.error(f"Bot sym {sym} error: {e}")
+                await asyncio.sleep(1)
+
+            await asyncio.sleep(2)          # next symbol
+        await asyncio.sleep(1)              # next loop
 
     except asyncio.CancelledError:
         log.info("🛑 Bot loop cancelled")
@@ -145,7 +149,6 @@ async def bot_loop():
     except Exception as e:
         log.exception(f"💥 Bot loop crashed: {e}")
         raise
-
 
 # ---------- lifespan ----------
 @asynccontextmanager
