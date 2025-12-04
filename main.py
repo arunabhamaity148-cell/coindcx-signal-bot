@@ -54,90 +54,91 @@ async def bot_loop():
     while True:
         try:
             for sym in CFG["pairs"]:
-                # --- cooldown ---
-                if sym in last_trade_time:
-                    if (datetime.utcnow() - last_trade_time[sym]).seconds < 300:
+                try:
+                    # --- cooldown ---
+                    if sym in last_trade_time:
+                        if (datetime.utcnow() - last_trade_time[sym]).seconds < 300:
+                            continue
+
+                    # --- position already open ---
+                    if sym in open_positions:
+                        pos = await ex.get_position(sym)
+                        if pos:
+                            open_positions[sym] = pos
+                        else:                                               # position closed
+                            pnl = open_positions[sym].get("unrealizedPnl", 0)
+                            del open_positions[sym]
+                            await update_daily_pnl(pnl)
+                            log.info(f"✓ {sym} closed | PnL ${pnl:.2f}")
                         continue
 
-                # --- position already open ---
-                if sym in open_positions:
-                    pos = await ex.get_position(sym)
-                    if pos:
-                        open_positions[sym] = pos
-                    else:                                               # position closed
-                        pnl = open_positions[sym].get("unrealizedPnl", 0)
-                        del open_positions[sym]
-                        await update_daily_pnl(pnl)
-                        log.info(f"✓ {sym} closed | PnL ${pnl:.2f}")
-                    continue
+                    # --- risk limits ---
+                    ok, reason = await check_risk_limits(CFG["equity"], open_positions)
+                    if not ok:
+                        log.info(f"⚠ Risk limit: {reason}")
+                        continue
 
-                # --- risk limits ---
-                ok, reason = await check_risk_limits(CFG["equity"], open_positions)
-                if not ok:
-                    log.info(f"⚠ Risk limit: {reason}")
-                    continue
+                    # --- signal ---
+                    signal = await calculate_advanced_score(sym)
+                    if not signal or signal["side"] == "none":
+                        continue
 
-                # --- signal ---
-                signal = await calculate_advanced_score(sym)
-                if not signal or signal["side"] == "none":
-                    continue
+                    side, score, last = signal["side"], signal["score"], signal["last"]
 
-                side, score, last = signal["side"], signal["score"], signal["last"]
+                    # --- thresholds ---
+                    if side == "long"  and score < CFG["min_score"]:
+                        continue
+                    if side == "short" and score > (10 - CFG["min_score"]):
+                        continue
 
-                # --- thresholds ---
-                if side == "long"  and score < CFG["min_score"]:
-                    continue
-                if side == "short" and score > (10 - CFG["min_score"]):
-                    continue
+                    # --- AI review ---
+                    ai = await ai_review_ensemble(sym, side, score)
+                    if not ai["allow"]:
+                        log.info(f"❌ {sym} blocked: {ai['reason']} (conf {ai['confidence']}%)")
+                        continue
 
-                # --- AI review ---
-                ai = await ai_review_ensemble(sym, side, score)
-                if not ai["allow"]:
-                    log.info(f"❌ {sym} blocked: {ai['reason']} (conf {ai['confidence']}%)")
-                    continue
+                    # --- TP/SL ---
+                    tp, sl = await calc_smart_tp_sl(sym, side, last)
+                    risk       = abs(last - sl)
+                    reward     = abs(tp - last)
+                    rrr        = reward / risk if risk else 0
+                    if rrr < CFG["min_rrr"]:
+                        continue
 
-                # --- TP/SL ---
-                tp, sl = await calc_smart_tp_sl(sym, side, last)
-                risk       = abs(last - sl)
-                reward     = abs(tp - last)
-                rrr        = reward / risk if risk else 0
-                if rrr < CFG["min_rrr"]:
-                    continue
+                    # --- sizing ---
+                    qty = position_size(CFG["equity"], last, sl, CFG["risk_perc"])
+                    if qty < 0.001:
+                        continue
+                    leverage = min(int(1 / (risk / last)), CFG["max_lev"])
+                    await ex.set_leverage(sym, leverage)
 
-                # --- sizing ---
-                qty = position_size(CFG["equity"], last, sl, CFG["risk_perc"])
-                if qty < 0.001:
-                    continue
-                leverage = min(int(1 / (risk / last)), CFG["max_lev"])
-                await ex.set_leverage(sym, leverage)
+                    # --- SIGNAL LOG ---
+                    log.info(f"🎯 SIGNAL: {sym} {side.upper()} | Entry {last:.6f} | TP {tp:.6f} | SL {sl:.6f}")
+                    log.info(f"   Qty {qty:.4f} | Lev {leverage}x | RRR {rrr:.2f} | ML conf {ai['confidence']}%")
 
-                # --- SIGNAL LOG ---
-                log.info(f"🎯 SIGNAL: {sym} {side.upper()} | Entry {last:.6f} | TP {tp:.6f} | SL {sl:.6f}")
-                log.info(f"   Qty {qty:.4f} | Lev {leverage}x | RRR {rrr:.2f} | ML conf {ai['confidence']}%")
+                    # --- Telegram ---
+                    msg = (
+                        f"🎯 <b>{sym}</b> {side.upper()}\n"
+                        f"Entry <code>{last:.6f}</code>\n"
+                        f"TP <code>{tp:.6f}</code> | SL <code>{sl:.6f}</code>\n"
+                        f"Qty <b>{qty:.4f}</b> | Lev <b>{leverage}x</b>\n"
+                        f"Score {score:.2f}/10 | RRR {rrr:.2f} | ML {ai['confidence']}%"
+                    )
+                    await send_telegram(msg)
 
-                # --- Telegram ---
-                msg = (
-                    f"🎯 <b>{sym}</b> {side.upper()}\n"
-                    f"Entry <code>{last:.6f}</code>\n"
-                    f"TP <code>{tp:.6f}</code> | SL <code>{sl:.6f}</code>\n"
-                    f"Qty <b>{qty:.4f}</b> | Lev <b>{leverage}x</b>\n"
-                    f"Score {score:.2f}/10 | RRR {rrr:.2f} | ML {ai['confidence']}%"
-                )
-                await send_telegram(msg)
+                    # --- LIVE ORDER (Paper=False hard-coded) ---
+                    order = await ex.limit(sym, side, qty, last, post_only=True)
+                    if order:
+                        await ex.set_sl_tp(sym, side, sl, tp)
+                        open_positions[sym] = await ex.get_position(sym)
+                        log.info(f"✅ {sym} order {order['id']}")
 
-                # --- LIVE ORDER (Paper=False hard-coded) ---
-                order = await ex.limit(sym, side, qty, last, post_only=True)
-                if order:
-                    await ex.set_sl_tp(sym, side, sl, tp)
-                    open_positions[sym] = await ex.get_position(sym)
-                    log.info(f"✅ {sym} order {order['id']}")
+                    last_trade_time[sym] = datetime.utcnow()
+                    await asyncio.sleep(0.5)
 
-                last_trade_time[sym] = datetime.utcnow()
-                await asyncio.sleep(0.5)
-
-            except Exception as e:
-                log.error(f"Bot sym {sym} error: {e}")
-                await asyncio.sleep(1)
+                except Exception as e:
+                    log.error(f"Bot sym {sym} error: {e}")
+                    await asyncio.sleep(1)
 
             await asyncio.sleep(2)          # next symbol
         await asyncio.sleep(1)              # next loop
