@@ -150,7 +150,7 @@ async def bot_loop():
                         await send_telegram(msg)
                         
                         # PAPER TRADING (set to False for live)
-                        PAPER_MODE = True
+                        PAPER_MODE = False
                         
                         if PAPER_MODE:
                             log.info(f"📝 PAPER MODE: Trade logged (not executed)")
