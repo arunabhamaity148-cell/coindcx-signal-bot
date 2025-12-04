@@ -1,14 +1,12 @@
 # bootstrap_train.py
-# -----------------
-# এই ফাইলটি Railway (বা অন্য কোনো container) এ চালালে:
-# 1) চেক করে যদি trained models (.pkl) না থাকে -> download_data.py চালাবে এবং train_ml.py চালাবে
-# 2) মডেল তৈরি হওয়ার পরে uvicorn দিয়ে main.py চালাবে (FastAPI app)
-#
-# তোমাকে কেবল এই ফাইলটা GitHub-এ যোগ করে Dockerfile-এর CMD লাইনে
-# `python bootstrap_train.py` বসাতে হবে।
-#
-# ব্যবহার: container startup এ এটি auto চলবে। প্রথমবার মডেল ট্রেন করতে
-# কিছু সময় লাগতে পারে। পরেরবার মডেল থাকলে training স্কিপ করবে।
+# ---------------------------------------------------
+# AUTO MODEL CHECKER + QUICK MODEL GENERATOR + SERVER STARTER
+# ---------------------------------------------------
+# Railway start হলে:
+# 1) দেখে নেবে model আছে কিনা
+# 2) না থাকলে create_quick_models.py চালিয়ে 3টা model তৈরি করবে
+# 3) সব ঠিক থাকলে uvicorn main.py চালু করবে
+# ---------------------------------------------------
 
 import os
 import sys
@@ -19,12 +17,11 @@ import subprocess
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("bootstrap")
 
-# মডেল ফাইল নামগুলো (helpers.load_ensemble এ যেগুলো লোড করে)
 MODEL_FILES = ["gb_model.pkl", "rf_model.pkl", "lr_model.pkl"]
 
-# কোন কমান্ডগুলো চালাতে হবে (project root ধরছি)
-DOWNLOAD_CMD = [sys.executable, "download_data.py"]
-TRAIN_CMD = [sys.executable, "train_ml.py"]
+# Commands
+TRAIN_CMD_QUICK = [sys.executable, "create_quick_models.py"]   # quick synthetic trainer
+TRAIN_CMD_FULL = [sys.executable, "train_ml.py"]               # optional full trainer
 UVICORN_CMD = [
     "uvicorn", "main:app",
     "--host", "0.0.0.0",
@@ -32,95 +29,112 @@ UVICORN_CMD = [
     "--log-level", "info"
 ]
 
+
+# ---------------------------------------------------
+# Utility: Check if models already exist
+# ---------------------------------------------------
 def models_exist():
-    """Check if all model files are present in project root."""
+    ok = True
     for f in MODEL_FILES:
         if not os.path.exists(f):
             log.info(f"Model missing: {f}")
-            return False
-    log.info("All model files present.")
-    return True
+            ok = False
+    if ok:
+        log.info("✓ All model files present.")
+    return ok
 
-def run_cmd(cmd, timeout=None, env=None):
-    """Run a shell command and stream output to logs. Raises on failure."""
+
+# ---------------------------------------------------
+# Utility: Run command with logs
+# ---------------------------------------------------
+def run_cmd(cmd, timeout=None):
     log.info(f"Running: {' '.join(cmd)}")
+
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
-        # stream stdout
-        if proc.stdout:
-            for line in iter(proc.stdout.readline, b''):
-                if not line:
-                    break
-                try:
-                    log.info(line.decode().rstrip())
-                except:
-                    log.info(line.rstrip())
+
+        for line in iter(proc.stdout.readline, b""):
+            if not line:
+                break
+            try:
+                log.info(line.decode().rstrip())
+            except:
+                log.info(str(line))
+
         proc.wait(timeout=timeout)
+
         if proc.returncode != 0:
             raise subprocess.CalledProcessError(proc.returncode, cmd)
-        log.info(f"Command finished: {' '.join(cmd)}")
+
+        log.info(f"Finished: {' '.join(cmd)}")
+
     except subprocess.TimeoutExpired:
         proc.kill()
-        log.error(f"Command timeout: {' '.join(cmd)}")
-        raise
-    except Exception as e:
-        log.error(f"Command failed: {' '.join(cmd)} -> {e}")
+        log.error(f"Timeout: {' '.join(cmd)}")
         raise
 
+    except Exception as e:
+        log.error(f"Command failed: {cmd} -> {e}")
+        raise
+
+
+# ---------------------------------------------------
+# MAIN LOGIC: ensure models exist
+# ---------------------------------------------------
 def ensure_models():
-    """Ensure models exist; if not, download data and train."""
+    # যদি আগেই থাকে → ok
     if models_exist():
         return True
 
-    # 1) Download data
+    # Quick model generator চালাও
     try:
-        log.info("Starting data download (download_data.py)...")
-        run_cmd(DOWNLOAD_CMD, timeout=60*20)  # up to 20 minutes (adjust if needed)
+        log.info("⚡ Running quick model generator (create_quick_models.py)...")
+        run_cmd(TRAIN_CMD_QUICK, timeout=600)
     except Exception as e:
-        log.error(f"Data download failed: {e}")
+        log.error(f"Quick model error: {e}")
         return False
 
-    # 2) Train models
-    try:
-        log.info("Starting ML training (train_ml.py)...")
-        run_cmd(TRAIN_CMD, timeout=60*60)  # up to 60 minutes (adjust if needed)
-    except Exception as e:
-        log.error(f"Model training failed: {e}")
-        return False
-
-    # 3) verify
+    # আবার check
     if models_exist():
-        log.info("Models successfully created.")
+        log.info("✓ Quick models created successfully.")
         return True
-    else:
-        log.error("Models still missing after training.")
+
+    # fallback to full training (optional)
+    try:
+        log.info("⚠ Quick model fail — Running full train_ml.py...")
+        run_cmd(TRAIN_CMD_FULL, timeout=3600)
+    except Exception as e:
+        log.error(f"Full model training failed: {e}")
         return False
 
+    return models_exist()
+
+
+# ---------------------------------------------------
+# MAIN ENTRY POINT
+# ---------------------------------------------------
 def main():
-    log.info("Bootstrap starting...")
+    log.info("🚀 Bootstrap starting...")
 
-    # Optional short delay so that dependent services (like Redis) can start
+    # Optional delay (Railway-এর Redis/Websocket setup-এর জন্য)
     delay = int(os.getenv("BOOTSTRAP_DELAY_SEC", "3"))
     if delay > 0:
-        log.info(f"Sleeping {delay}s to allow services to come up...")
         time.sleep(delay)
 
+    # Step 1: ensure models exist
     ok = ensure_models()
     if not ok:
-        log.error("Bootstrap failed (models missing). Exiting.")
-        # exit with non-zero so Railway shows failure in logs/health
+        log.error("❌ Bootstrap failed (models missing). Stopping container.")
         sys.exit(1)
 
-    # If models are present, start the FastAPI app via uvicorn (blocking call)
-    log.info("Starting uvicorn server (main:app)...")
-    # Use exec to replace the current process so container PID 1 is uvicorn
-    try:
-        os.execvp(UVICORN_CMD[0], UVICORN_CMD)
-    except Exception as e:
-        log.exception(f"Failed to exec uvicorn: {e}")
-        sys.exit(1)
+    # Step 2: Start uvicorn server
+    log.info("🚀 Starting uvicorn server...")
+    os.execvp(UVICORN_CMD[0], UVICORN_CMD)
+
 
 if __name__ == "__main__":
     main()
