@@ -1,5 +1,6 @@
 """
 helpers.py  –  FULL (Redis / WS / ML / risk / Telegram / exchange)
+DEBUG print inside calculate_advanced_score
 """
 import os, json, asyncio, logging, joblib, aiohttp, pandas as pd, numpy as np
 from datetime import datetime, timedelta
@@ -122,7 +123,7 @@ async def orderflow_analysis(sym):
         volumes = [float(t["q"]) for t in trades]; avg_vol, std_vol = np.mean(volumes), np.std(volumes)
         large_buys = sum(1 for t in trades[:20] if t["m"] == "false" and float(t["q"]) > avg_vol + 2 * std_vol)
         large_sells = sum(1 for t in trades[:20] if t["m"] == "true" and float(t["q"]) > avg_vol + 2 * std_vol)
-        depth_raw = await r.hgetall(f"d:{s}")
+        depth_raw = await r.hgetall(f"d:{sym}")
         if not depth_raw: return None
         bids, asks = json.loads(depth_raw.get("bids", "[]")), json.loads(depth_raw.get("asks", "[]"))
         if not bids or not asks: return None
@@ -228,8 +229,12 @@ async def calculate_advanced_score(sym):
         weights = {"rsi": 2.5, "momentum": 2.0, "orderflow": 3.0, "mtf": 2.5, "regime": 1.5, "volume": 1.5}
         total = sum(scores[k] * weights[k] for k in scores) / sum(weights.values())
         side = "long" if total >= 7.8 else "short" if total <= 2.2 else "none"
+
+        # >>> DEBUG PRINT <<<
+        print(f"DEBUG: {sym} score = {total:.2f}  side = {side}")
+
         return {"score": round(total, 2), "side": side, "components": scores, "last": last, "features": features}
-    except Exception as e: log.error(f"Scoring {sym}: {e}"); return None
+    except Exception as e: log.error(f"Scoring error {sym}: {e}"); return None
 
 # ---------- TP / SL ----------
 async def calc_smart_tp_sl(sym, side, entry):
