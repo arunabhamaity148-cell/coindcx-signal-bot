@@ -135,21 +135,17 @@ async def bot_loop():
                 last_trade_time[sym] = datetime.utcnow()
                 await asyncio.sleep(0.5)
 
-            except Exception as e:
-                log.error(f"Bot sym {sym} error: {e}")
-                await asyncio.sleep(1)
+                            await asyncio.sleep(2)          # next symbol
+            await asyncio.sleep(1)              # next loop
 
-            await asyncio.sleep(2)     # next symbol
+    except asyncio.CancelledError:
+        log.info("🛑 Bot loop cancelled")
+        await ex.close()
+        raise
+    except Exception as e:
+        log.exception(f"💥 Bot loop crashed: {e}")
+        raise
 
-        await asyncio.sleep(1)         # next loop
-
-except asyncio.CancelledError:
-    log.info("🛑 Bot loop cancelled")
-    await ex.close()
-    raise
-except Exception as e:
-    log.exception(f"💥 Bot loop crashed: {e}")
-    raise
 
 # ---------- lifespan ----------
 @asynccontextmanager
