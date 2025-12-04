@@ -429,7 +429,8 @@ def load_ensemble():
     
     if len(models) == 3:
         return models
-log.warning("⚠ Models not found, using fallback (low accuracy)")
+
+    log.warning("⚠ Models not found, using fallback (low accuracy)")
     return None
 
 async def ai_review_ensemble(sym, side, score):
