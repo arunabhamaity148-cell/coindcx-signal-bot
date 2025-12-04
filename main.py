@@ -1,6 +1,6 @@
 """
 main.py — Production FastAPI + Trading Bot  (FINAL)
-Single helpers.py version  →  import from helpers
+Auto Telegram alert on deploy + full trading loop
 """
 import os
 import asyncio
@@ -10,7 +10,7 @@ from datetime import datetime
 from fastapi import FastAPI
 import uvicorn
 import aiohttp
-from helpers import (   # ← single helpers.py
+from helpers import (   # single helpers.py
     WS, Exchange, calculate_advanced_score, ai_review_ensemble,
     calc_smart_tp_sl, position_size, send_telegram,
     check_risk_limits, update_daily_pnl, cleanup, CFG
@@ -164,13 +164,13 @@ async def lifespan(app: FastAPI):
 
     log.info("✓ All tasks started")
 
-        # >>> DEPLOY SUCCESS ALERT <<<
-        await send_telegram("🟢 <b>Bot Deployed & Online</b>\n"
-                            f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n"
-                            f"📊 Pairs: {', '.join(CFG['pairs'])}\n"
-                            f"💰 Equity: ${CFG['equity']}\n"
-                            f"⚙️ Min Score: {CFG['min_score']}\n"
-                            "✅ Ready to trade!")
+    # >>> DEPLOY SUCCESS ALERT <<<
+    await send_telegram("🟢 <b>Bot Deployed & Online</b>\n"
+                        f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n"
+                        f"📊 Pairs: {', '.join(CFG['pairs'])}\n"
+                        f"💰 Equity: ${CFG['equity']}\n"
+                        f"⚙️ Min Score: {CFG['min_score']}\n"
+                        "✅ Ready to trade!")
 
     try:
         yield
