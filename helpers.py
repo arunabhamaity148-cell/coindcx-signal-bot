@@ -1,6 +1,5 @@
 """
-helpers.py  –  COMBINED  (part-1 + part-2)
-Redis / WS / data / ML / score / TP-SL / risk / Telegram / exchange
+helpers.py  –  FULL (Redis / WS / ML / risk / Telegram / exchange)
 """
 import os, json, asyncio, logging, joblib, aiohttp, pandas as pd, numpy as np
 from datetime import datetime, timedelta
@@ -44,39 +43,54 @@ async def redis_close():
 class WS:
     def __init__(self): self.url = "wss://fstream.binance.com/stream?streams="; self.running = False
     def build(self):
-        self.url += "/".join([f"{p.lower()}@ticker", f"{p.lower()}@depth20@100ms", f"{p.lower()}@trade", f"{p.lower()}@kline_1m", f"{p.lower()}@kline_5m"] for p in CFG["pairs"])
+        streams = []
+        for p in CFG["pairs"]:
+            pl = p.lower()
+            streams += [f"{pl}@ticker", f"{pl}@depth20@100ms", f"{pl}@trade", f"{pl}@kline_1m", f"{pl}@kline_5m"]
+        self.url += "/".join(streams)
     async def run(self):
         self.build(); self.running = True; retry = 0
         while self.running and retry < 10:
             try:
-                log.info("🔌 WS connect"); async with aiohttp.ClientSession() as s, s.ws_connect(self.url, heartbeat=30) as ws:
-                    log.info("✓ WS connected"); retry = 0
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT: await self._handle(json.loads(msg.data))
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
-            except asyncio.CancelledError: self.running = False; break
-            except Exception as e: retry += 1; await asyncio.sleep(min(retry * 2, 30))
+                log.info("🔌 WS connect")
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(self.url, heartbeat=30) as ws:
+                        log.info("✓ WS connected"); retry = 0
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                await self._handle(json.loads(msg.data))
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+            except asyncio.CancelledError:
+                self.running = False; break
+            except Exception as e:
+                retry += 1; await asyncio.sleep(min(retry * 2, 30))
     async def _handle(self, data):
         try:
-            r, stream, d, s = await redis(), data.get("stream", ""), data.get("data", {}), d.get("s")
+            r = await redis(); stream = data.get("stream", ""); d = data.get("data", {}); s = d.get("s")
             if not s: return
-            if "@ticker" in stream: await r.hset(f"t:{s}", mapping={"last": d.get("c"), "vol": d.get("v")})
-            elif "@depth20" in stream: await r.hset(f"d:{s}", mapping={"bids": json.dumps(d.get("bids")), "asks": json.dumps(d.get("asks"))})
-            elif "@trade" in stream: trade = json.dumps({"p": d.get("p"), "q": d.get("q"), "m": d.get("m")}); await r.lpush(f"tr:{s}", trade); await r.ltrim(f"tr:{s}", 0, 499)
-            elif "@kline" in stream and d.get("k", {}).get("x"): k = d["k"]; kline = json.dumps({"t": k["t"], "o": k["o"], "h": k["h"], "l": k["l"], "c": k["c"], "v": k["v"]}); await r.lpush(f"kline_{k['i']}:{s}", kline); await r.ltrim(f"kline_{k['i']}:{s}", 0, 199)
+            if "@ticker" in stream:
+                await r.hset(f"t:{s}", mapping={"last": d.get("c"), "vol": d.get("v")})
+            elif "@depth20" in stream:
+                await r.hset(f"d:{s}", mapping={"bids": json.dumps(d.get("bids")), "asks": json.dumps(d.get("asks"))})
+            elif "@trade" in stream:
+                trade = json.dumps({"p": d.get("p"), "q": d.get("q"), "m": d.get("m")})
+                await r.lpush(f"tr:{s}", trade); await r.ltrim(f"tr:{s}", 0, 499)
+            elif "@kline" in stream and d.get("k", {}).get("x"):
+                k = d["k"]; kline = json.dumps({"t": k["t"], "o": k["o"], "h": k["h"], "l": k["l"], "c": k["c"], "v": k["v"]})
+                await r.lpush(f"kline_{k['i']}:{s}", kline); await r.ltrim(f"kline_{k['i']}:{s}", 0, 199)
         except Exception as e: log.error(f"WS handler: {e}")
 
-# ---------- OHLCV ----------
+# ---------- OHLCV / ATR / RSI / MTF / ORDERFLOW / REGIME / FEATURE ----------
 async def get_ohlcv(sym, tf="5m", limit=100):
     try:
-        r, klines_raw = await redis(), await r.lrange(f"kline_{tf}:{sym}", 0, limit - 1)
+        r = await redis(); klines_raw = await r.lrange(f"kline_{tf}:{sym}", 0, limit - 1)
         if not klines_raw: return None
         klines = [json.loads(k) for k in reversed(klines_raw)]
         df = pd.DataFrame(klines); df[["o", "h", "l", "c", "v"]] = df[["o", "h", "l", "c", "v"]].astype(float); df["t"] = pd.to_datetime(df["t"], unit="ms")
         return df
     except Exception as e: log.error(f"OHLCV {sym}: {e}"); return None
 
-# ---------- ATR / RSI / MTF / ORDERFLOW / REGIME ----------
 async def get_real_atr(sym, tf="5m", period=14):
     df = await get_ohlcv(sym, tf, limit=period + 20)
     if df is None or len(df) < period: return 0.005
@@ -108,7 +122,7 @@ async def orderflow_analysis(sym):
         volumes = [float(t["q"]) for t in trades]; avg_vol, std_vol = np.mean(volumes), np.std(volumes)
         large_buys = sum(1 for t in trades[:20] if t["m"] == "false" and float(t["q"]) > avg_vol + 2 * std_vol)
         large_sells = sum(1 for t in trades[:20] if t["m"] == "true" and float(t["q"]) > avg_vol + 2 * std_vol)
-        depth_raw = await r.hgetall(f"d:{sym}")
+        depth_raw = await r.hgetall(f"d:{s}")
         if not depth_raw: return None
         bids, asks = json.loads(depth_raw.get("bids", "[]")), json.loads(depth_raw.get("asks", "[]"))
         if not bids or not asks: return None
@@ -128,7 +142,6 @@ async def regime(sym):
     volatility = pd.Series(tr).rolling(14).mean().iloc[-1] / close[-1]
     return "TREND" if volatility > 0.015 else "CHOP" if volatility < 0.008 else "VOLATILE"
 
-# ---------- FEATURE EXTRACT ----------
 FEATURE_COLS = ["rsi_1m", "rsi_5m", "macd_hist", "mom_1m", "mom_5m", "vol_ratio", "atr_1m", "atr_5m", "delta_norm", "delta_momentum", "imbalance", "large_buys", "large_sells", "spread", "depth", "mtf_trend", "reg_trend", "reg_chop", "funding", "poc_dist"]
 async def extract_features(sym):
     try:
