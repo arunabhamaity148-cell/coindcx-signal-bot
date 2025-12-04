@@ -163,6 +163,15 @@ async def lifespan(app: FastAPI):
     ping_task = asyncio.create_task(keep_alive())
 
     log.info("✓ All tasks started")
+
+        # >>> DEPLOY SUCCESS ALERT <<<
+        await send_telegram("🟢 <b>Bot Deployed & Online</b>\n"
+                            f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n"
+                            f"📊 Pairs: {', '.join(CFG['pairs'])}\n"
+                            f"💰 Equity: ${CFG['equity']}\n"
+                            f"⚙️ Min Score: {CFG['min_score']}\n"
+                            "✅ Ready to trade!")
+
     try:
         yield
     finally:
