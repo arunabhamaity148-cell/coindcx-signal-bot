@@ -1,7 +1,6 @@
 """
-main.py — final crash-proof version
-Lifespan events + lightweight health
-Railway keeps pod alive
+main.py — crash-proof + 60-s health-ping
+Keeps Railway free-tier awake 24×7
 """
 import os
 import asyncio
@@ -10,20 +9,33 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI
 import uvicorn
+import aiohttp
 from helpers import run, WS, Exchange, features, calc_tp_sl, position_size, send_telegram, ai_review_ml, regime, CFG
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
 
+# ---------- 60-s keep-alive ----------
+async def keep_alive():
+    while True:
+        try:
+            await asyncio.sleep(60)
+            async with aiohttp.ClientSession() as s:
+                async with s.get("http://0.0.0.0:8080/health") as r:
+                    if r.status != 200: log.warning("Health ping failed")
+        except Exception as e:
+            log.exception("Keep-alive error: %s", e)
+
 # ---------- lifespan (crash-proof) ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting bot...")
+    log.info("Starting bot + keep-alive...")
     bot_task = asyncio.create_task(bot_loop())
+    ping_task = asyncio.create_task(keep_alive())
     yield
-    bot_task.cancel()
-    await bot_task
-    log.info("Bot stopped.")
+    bot_task.cancel(); ping_task.cancel()
+    await bot_task; await ping_task
+    log.info("All tasks stopped.")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -69,6 +81,3 @@ def run_fastapi():
 
 if __name__ == "__main__":
     run_fastapi()
-@app.get("/health")
-def health(): return {"status": "ok"}
-
