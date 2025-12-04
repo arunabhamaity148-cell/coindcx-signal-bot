@@ -69,3 +69,6 @@ def run_fastapi():
 
 if __name__ == "__main__":
     run_fastapi()
+@app.get("/health")
+def health(): return {"status": "ok"}
+
