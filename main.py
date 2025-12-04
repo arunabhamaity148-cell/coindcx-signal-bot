@@ -1,6 +1,6 @@
 """
-main.py — Production FastAPI + Trading Bot  (FINAL FIXED)
-Keeps Railway alive 24/7, runs ML-powered trading bot
+main.py — Production FastAPI + Trading Bot  (FINAL)
+Single helpers.py version  →  import from helpers
 """
 import os
 import asyncio
@@ -10,7 +10,7 @@ from datetime import datetime
 from fastapi import FastAPI
 import uvicorn
 import aiohttp
-from helpers_part2 import (   # helpers.py part-2
+from helpers import (   # ← single helpers.py
     WS, Exchange, calculate_advanced_score, ai_review_ensemble,
     calc_smart_tp_sl, position_size, send_telegram,
     check_risk_limits, update_daily_pnl, cleanup, CFG
@@ -192,7 +192,7 @@ def health():
 
 @app.get("/stats")
 async def stats():
-    from helpers_part1 import redis
+    from helpers import redis
     r = await redis()
     daily = float(await r.get("daily_pnl") or 0)
     return {"daily_pnl": daily, "equity": CFG["equity"], "pairs": CFG["pairs"],
