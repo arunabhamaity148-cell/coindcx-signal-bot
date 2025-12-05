@@ -87,19 +87,65 @@ class WS:
             try:
                 for sym in CFG["pairs"]:
                     try:
+                        # fetch market data (guard with try/except per symbol)
                         ticker = await self.ex.fetch_ticker(sym)
                         orderbook = await self.ex.fetch_order_book(sym, limit=20)
-                        trades = await self.ex.fetch_trades(sym, limit=100)
+                        trades = await self.ex.fetch_trades(sym, limit=200)
                         r = await redis()
-                        await r.hset(f"t:{sym}", mapping={"last": ticker.get('last', 0), "vol": ticker.get('baseVolume', 0), "E": int(datetime.utcnow().timestamp() * 1000)})
-                        await r.hset(f"d:{sym}", mapping={"bids": json.dumps(orderbook.get('bids', [])[:20]), "asks": json.dumps(orderbook.get('asks', [])[:20]), "E": int(datetime.utcnow().timestamp() * 1000)})
-                        for t in trades[-100:]:
-                            p = t.get('price') or t.get('p') or 0
-                            q = t.get('amount') or t.get('q') or 0
-                            side = t.get('side') or ('sell' if t.get('takerSide')=='sell' else 'buy')
-                            timestamp = t.get('timestamp') or int(datetime.utcnow().timestamp() * 1000)
-                            await r.lpush(f"tr:{sym}", json.dumps({"p": p, "q": q, "m": side == 'sell', "t": timestamp}))
-                        await r.ltrim(f"tr:{sym}", 0, 499)
+
+                        # safe writes for ticker & depth
+                        last_price = ticker.get('last') if isinstance(ticker, dict) else 0
+                        base_vol = ticker.get('baseVolume', 0) if isinstance(ticker, dict) else 0
+                        await r.hset(f"t:{sym}", mapping={"last": last_price, "vol": base_vol, "E": int(datetime.utcnow().timestamp() * 1000)})
+
+                        bids = orderbook.get('bids', []) if isinstance(orderbook, dict) else []
+                        asks = orderbook.get('asks', []) if isinstance(orderbook, dict) else []
+                        await r.hset(f"d:{sym}", mapping={"bids": json.dumps(bids[:20]), "asks": json.dumps(asks[:20]), "E": int(datetime.utcnow().timestamp() * 1000)})
+
+                        # normalize trades and push — ensure every trade has p,q,m,t keys
+                        if trades:
+                            for t in trades[-200:]:
+                                try:
+                                    # price
+                                    p = t.get("price") if isinstance(t, dict) else None
+                                    if p is None:
+                                        p = t.get("p") or t.get("rate") or t.get(" Price".strip()) or 0
+                                    # qty
+                                    q = t.get("amount") if isinstance(t, dict) else None
+                                    if q is None:
+                                        q = t.get("q") or t.get("quantity") or t.get("qty") or 0
+                                    # side / maker
+                                    maker_side = t.get("maker_side") or t.get("side") or t.get("maker") or t.get("takerSide") or ""
+                                    is_sell = True if str(maker_side).lower() in ["sell", "ask", "true", "maker"] else False
+                                    # timestamp candidates
+                                    ts = None
+                                    for k in ("timestamp", "time", "ts", "trade_time", "trade_timestamp", "t"):
+                                        if isinstance(t, dict) and t.get(k) is not None:
+                                            ts = t.get(k)
+                                            break
+                                    if ts is None:
+                                        # fallback to current ms
+                                        ts = int(datetime.utcnow().timestamp() * 1000)
+                                    # normalize numeric types
+                                    try:
+                                        p = float(p)
+                                    except Exception:
+                                        p = 0.0
+                                    try:
+                                        q = float(q)
+                                    except Exception:
+                                        q = 0.0
+                                    try:
+                                        ts = int(ts)
+                                    except Exception:
+                                        ts = int(datetime.utcnow().timestamp() * 1000)
+
+                                    await r.lpush(f"tr:{sym}", json.dumps({"p": p, "q": q, "m": is_sell, "t": ts}))
+                                except Exception as e:
+                                    log.debug(f"Trade normalise {sym}: {e}")
+                                    continue
+                            # keep recent 500 trades
+                            await r.ltrim(f"tr:{sym}", 0, 499)
                     except Exception as e:
                         log.debug(f"Poll {sym}: {e}")
                         continue
@@ -114,21 +160,52 @@ class WS:
 # ---------------- OHLCV builder ----------------
 async def build_ohlcv_from_trades(sym, timeframe='1m', bars=100):
     r = await redis()
-    trades_raw = await r.lrange(f"tr:{sym}", 0, bars * 70)
-    if not trades_raw or len(trades_raw) < 50:
+    trades_raw = await r.lrange(f"tr:{sym}", 0, bars * 100)
+    if not trades_raw or len(trades_raw) < 10:
         return None
-    trades = [json.loads(t) for t in trades_raw]
+    # parse JSON, ignore malformed entries
+    trades = []
+    for raw in trades_raw:
+        try:
+            t = json.loads(raw)
+            # require p and q keys; require t (timestamp) else skip
+            if ("p" not in t) or ("q" not in t):
+                continue
+            if "t" not in t:
+                continue
+            trades.append(t)
+        except Exception:
+            continue
+    if not trades or len(trades) < 10:
+        return None
+
     df_trades = pd.DataFrame(trades)
-    df_trades['p'] = df_trades['p'].astype(float)
-    df_trades['q'] = df_trades['q'].astype(float)
+    # ensure columns exist
+    if 'p' not in df_trades.columns or 'q' not in df_trades.columns or 't' not in df_trades.columns:
+        return None
+    # coerce types safely
+    df_trades['p'] = pd.to_numeric(df_trades['p'], errors='coerce').fillna(0.0)
+    df_trades['q'] = pd.to_numeric(df_trades['q'], errors='coerce').fillna(0.0)
+    # timestamps: ensure ms int
+    def to_ms(x):
+        try:
+            xi = int(x)
+            # if timestamp looks like seconds (10 digit), convert to ms
+            if xi < 1e11:
+                xi = xi * 1000
+            return xi
+        except Exception:
+            return int(datetime.utcnow().timestamp() * 1000)
+    df_trades['t'] = df_trades['t'].apply(to_ms)
     df_trades['t'] = pd.to_datetime(df_trades['t'], unit='ms', utc=True)
     df_trades = df_trades.set_index('t').sort_index()
+    # resample
     ohlc = df_trades['p'].resample(timeframe).ohlc()
     vol = df_trades['q'].resample(timeframe).sum()
     df = ohlc.join(vol.rename('v')).dropna()
     df.reset_index(inplace=True)
     df.rename(columns={'open': 'o', 'high': 'h', 'low': 'l', 'close': 'c', 'volume': 'v'}, inplace=True)
-    return df.tail(bars) if len(df) >= bars else None
+    return df.tail(bars) if len(df) >= bars else None 
 
 async def get_ohlcv(sym, tf="5m", limit=100):
     df = await build_ohlcv_from_trades(sym, timeframe=tf, bars=limit)
