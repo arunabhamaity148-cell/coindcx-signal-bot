@@ -9,7 +9,7 @@ from helpers import (
     send_telegram, get_exchange, log_block, suggest_leverage
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
 
 # ---------- COOLDOWN ----------
@@ -36,6 +36,7 @@ async def ws_polling():
             pairs = await filtered_pairs()
             for sym in pairs:
                 try:
+                    log.debug(f"polling {sym} ...")
                     ticker = await ex.fetch_ticker(sym)
                     last = float(ticker.get("last", 0))
                     vol24 = float(ticker.get("quoteVolume", 0))
@@ -55,7 +56,7 @@ async def ws_polling():
                             pushed += 1
                         if pushed: await r.ltrim(f"tr:{sym}", 0, 499)
                 except Exception as inner:
-                    log.debug(f"polling inner {sym}: {inner}")
+                    log.error(f"polling inner {sym}: {inner}")
                     continue
             await asyncio.sleep(1)
         except asyncio.CancelledError: break
@@ -192,7 +193,7 @@ def health():
         "time": datetime.utcnow().isoformat(),
         "ws_running": ws_task is not None and not ws_task.done(),
         "bot_running": bot_task is not None and not bot_task.done()
-    }
+   }
 
 # ---------- RUN ----------
 if __name__ == "__main__":
