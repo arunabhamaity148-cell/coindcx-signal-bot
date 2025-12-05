@@ -1,11 +1,12 @@
 # ================================================================
-# main.py — FULL BOT ENGINE (WebSocket + Scanner Combined)
+# main.py — FULL BOT ENGINE (WebSocket + Scanner + Debug)
 # ================================================================
 
 import os
 import json
 import asyncio
 import logging
+import traceback
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
@@ -14,7 +15,7 @@ import websockets
 from fastapi import FastAPI
 import uvicorn
 
-from helpers import redis, PAIRS, get_last_price
+from helpers import redis, PAIRS
 from scorer import compute_signal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -25,7 +26,7 @@ log = logging.getLogger("main")
 # -----------------------------------------------------------
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
 COOLDOWN_MIN = 30
 
 cooldown = {}
@@ -33,10 +34,13 @@ ACTIVE_ORDERS = {}
 
 # WebSocket config
 BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream"
-CHUNK_SIZE = 18
+CHUNK_SIZE = 15  # Reduced for stability
 TRADES_TTL_SEC = 1800
 OB_TTL_SEC = 120
 TK_TTL_SEC = 120
+
+ws_connected = False
+data_received = 0
 
 
 # -----------------------------------------------------------
@@ -57,33 +61,65 @@ async def send_telegram(msg):
 
 
 # -----------------------------------------------------------
-# WEBSOCKET DATA PUSHER
+# WEBSOCKET DATA PUSHER (WITH VALIDATION)
 # -----------------------------------------------------------
-async def push_trade(sym: str, price: float, qty: float, is_sell: bool, ts: int):
+async def push_trade(sym: str, data: dict):
     try:
-        await redis.lpush(f"tr:{sym}", json.dumps({"p": price, "q": qty, "m": is_sell, "t": ts}))
+        # Validate required fields
+        if not all(k in data for k in ["p", "q", "m", "t"]):
+            log.warning(f"Invalid trade data for {sym}: {data}")
+            return
+            
+        trade_json = json.dumps({
+            "p": float(data["p"]),
+            "q": float(data["q"]),
+            "m": bool(data["m"]),
+            "t": int(data["t"])
+        })
+        
+        await redis.lpush(f"tr:{sym}", trade_json)
         await redis.ltrim(f"tr:{sym}", 0, 499)
         await redis.expire(f"tr:{sym}", TRADES_TTL_SEC)
-    except Exception:
-        pass
+        
+        global data_received
+        data_received += 1
+        
+    except Exception as e:
+        log.error(f"Push trade error for {sym}: {e}")
 
 
 async def push_orderbook(sym: str, bid: float, ask: float):
     try:
-        await redis.setex(f"ob:{sym}", OB_TTL_SEC, json.dumps({"bid": bid, "ask": ask, "t": int(datetime.utcnow().timestamp() * 1000)}))
-    except Exception:
-        pass
+        await redis.setex(
+            f"ob:{sym}", 
+            OB_TTL_SEC, 
+            json.dumps({
+                "bid": float(bid), 
+                "ask": float(ask), 
+                "t": int(datetime.utcnow().timestamp() * 1000)
+            })
+        )
+    except Exception as e:
+        log.error(f"Push orderbook error: {e}")
 
 
 async def push_ticker(sym: str, last: float, vol: float, ts: int):
     try:
-        await redis.setex(f"tk:{sym}", TK_TTL_SEC, json.dumps({"last": last, "vol": vol, "t": ts}))
-    except Exception:
-        pass
+        await redis.setex(
+            f"tk:{sym}", 
+            TK_TTL_SEC, 
+            json.dumps({
+                "last": float(last), 
+                "vol": float(vol), 
+                "t": int(ts)
+            })
+        )
+    except Exception as e:
+        log.error(f"Push ticker error: {e}")
 
 
 # -----------------------------------------------------------
-# WEBSOCKET WORKER
+# WEBSOCKET WORKER (IMPROVED)
 # -----------------------------------------------------------
 def build_stream_url(pairs_chunk):
     streams = []
@@ -91,21 +127,32 @@ def build_stream_url(pairs_chunk):
         p_low = p.lower()
         streams.append(f"{p_low}@aggTrade")
         streams.append(f"{p_low}@bookTicker")
+    
     if "BTCUSDT" in pairs_chunk:
         streams.append("btcusdt@kline_1m")
+    
     stream_path = "/".join(streams)
     return f"{BINANCE_WS_BASE}?streams={stream_path}"
 
 
-async def ws_worker(pairs_chunk):
+async def ws_worker(pairs_chunk, worker_id):
+    global ws_connected
     url = build_stream_url(pairs_chunk)
     backoff = 1
     
+    log.info(f"🔌 WS Worker {worker_id} starting for {len(pairs_chunk)} pairs")
+    
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+            async with websockets.connect(
+                url, 
+                ping_interval=20, 
+                ping_timeout=10,
+                close_timeout=10
+            ) as ws:
                 backoff = 1
-                log.info(f"✅ WS connected for {len(pairs_chunk)} pairs")
+                ws_connected = True
+                log.info(f"✅ WS Worker {worker_id} connected")
                 
                 async for msg in ws:
                     try:
@@ -113,40 +160,55 @@ async def ws_worker(pairs_chunk):
                         stream = data.get("stream", "")
                         payload = data.get("data", {})
 
+                        # aggTrade
                         if stream.endswith("@aggTrade"):
                             sym = payload.get("s")
-                            if not sym:
-                                continue
-                            price = float(payload.get("p", 0))
-                            qty = float(payload.get("q", 0))
-                            is_sell = bool(payload.get("m", False))
-                            ts = int(payload.get("T", int(datetime.utcnow().timestamp() * 1000)))
-                            await push_trade(sym, price, qty, is_sell, ts)
+                            if sym and sym in PAIRS:
+                                trade_data = {
+                                    "p": payload.get("p"),
+                                    "q": payload.get("q"),
+                                    "m": payload.get("m"),
+                                    "t": payload.get("T")
+                                }
+                                await push_trade(sym, trade_data)
 
+                        # bookTicker
                         elif stream.endswith("@bookTicker"):
                             sym = payload.get("s")
-                            if not sym:
-                                continue
-                            bid = float(payload.get("b", 0))
-                            ask = float(payload.get("a", 0))
-                            await push_orderbook(sym, bid, ask)
+                            if sym and sym in PAIRS:
+                                bid = float(payload.get("b", 0))
+                                ask = float(payload.get("a", 0))
+                                if bid > 0 and ask > 0:
+                                    await push_orderbook(sym, bid, ask)
 
+                        # kline
                         elif "@kline" in stream:
                             k = payload.get("k", {})
-                            sym = payload.get("s", "BTCUSDT")
-                            close = float(k.get("c", 0))
-                            vol = float(k.get("q", 0))
-                            ts = int(k.get("T", int(datetime.utcnow().timestamp() * 1000)))
-                            await push_ticker(sym, close, vol, ts)
+                            if k.get("x"):  # only closed candles
+                                sym = payload.get("s", "BTCUSDT")
+                                close = float(k.get("c", 0))
+                                vol = float(k.get("q", 0))
+                                ts = int(k.get("T", 0))
+                                if close > 0:
+                                    await push_ticker(sym, close, vol, ts)
 
+                    except json.JSONDecodeError:
+                        continue
                     except Exception as e:
+                        log.error(f"WS message parse error: {e}")
                         continue
 
-        except (websockets.ConnectionClosedOK, websockets.ConnectionClosedError):
+        except asyncio.CancelledError:
+            log.info(f"WS Worker {worker_id} cancelled")
+            break
+        except (websockets.ConnectionClosedOK, websockets.ConnectionClosedError) as e:
+            ws_connected = False
+            log.warning(f"⚠️ WS Worker {worker_id} closed: {e}. Reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
         except Exception as e:
-            log.error(f"WS error: {e}")
+            ws_connected = False
+            log.error(f"❌ WS Worker {worker_id} error: {e}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
@@ -154,13 +216,22 @@ async def ws_worker(pairs_chunk):
 async def start_all_ws():
     pairs = list(PAIRS)
     chunks = [pairs[i:i + CHUNK_SIZE] for i in range(0, len(pairs), CHUNK_SIZE)]
-    tasks = [asyncio.create_task(ws_worker(chunk)) for chunk in chunks]
+    
+    tasks = []
+    for idx, chunk in enumerate(chunks):
+        tasks.append(asyncio.create_task(ws_worker(chunk, idx + 1)))
+    
     log.info(f"🔌 Started {len(tasks)} WS workers for {len(pairs)} pairs")
-    await asyncio.gather(*tasks)
+    
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
 
 
 # -----------------------------------------------------------
-# COOLDOWN CHECK
+# COOLDOWN
 # -----------------------------------------------------------
 def cooldown_ok(sym, strat):
     key = f"{sym}:{strat}"
@@ -183,38 +254,50 @@ def format_signal(sig):
     score = sig["score"]
     last = sig["last"]
     strat = sig["strategy"]
-    passed = " | ".join(sig["passed"][:5])  # top 5 only
+    passed = " | ".join(sig["passed"][:4])
 
     return (
-        f"🎯 <b>{sym} {side.upper()} — [{strat}]</b>\n"
-        f"💰 Price: <code>{last:.6f}</code>\n"
+        f"🎯 <b>{sym} {side.upper()}</b> [{strat}]\n"
+        f"💰 <code>{last:.6f}</code>\n"
         f"📊 Score: <b>{score:.1f}</b>\n"
-        f"🔍 Passed: {passed}\n"
-        f"⏳ Cooldown: {COOLDOWN_MIN}m\n"
+        f"🔍 {passed}\n"
     )
 
 
 # -----------------------------------------------------------
-# MAIN SCANNER LOOP
+# SCANNER
 # -----------------------------------------------------------
 async def scanner():
-    log.info("🔍 Scanner started")
+    log.info("🔍 Scanner waiting for data...")
     
     try:
         await redis.ping()
-        log.info("✅ Redis connected successfully")
+        log.info("✅ Redis connected")
     except Exception as e:
-        log.error(f"❌ Redis connection failed: {e}")
-        await send_telegram("⚠️ <b>Bot Started but Redis NOT connected!</b>")
+        log.error(f"❌ Redis failed: {e}")
+        await send_telegram("⚠️ <b>Redis connection failed!</b>")
         return
 
-    await send_telegram("🚀 <b>Binance Scanner LIVE</b>\n📡 Waiting for data stream...")
+    await send_telegram("🚀 <b>Scanner Starting...</b>\n⏳ Waiting for data stream")
 
-    # Wait 15 seconds for WebSocket to populate data
-    await asyncio.sleep(15)
+    # Wait for WebSocket data
+    for i in range(30):
+        await asyncio.sleep(2)
+        btc_count = await redis.llen("tr:BTCUSDT")
+        if btc_count >= 10:
+            log.info(f"✅ Data ready! BTC trades: {btc_count}")
+            await send_telegram(f"✅ <b>Data Stream Active!</b>\n📊 {btc_count} BTC trades loaded")
+            break
+        log.info(f"⏳ Waiting for data... ({i+1}/30) - BTC trades: {btc_count}")
+    else:
+        log.warning("⚠️ Data stream timeout!")
+        await send_telegram("⚠️ <b>Warning:</b> Data stream slow. Continuing anyway...")
 
+    scan_count = 0
+    
     while True:
         try:
+            scan_count += 1
             results = []
 
             for sym in PAIRS:
@@ -238,22 +321,23 @@ async def scanner():
                     ACTIVE_ORDERS[f"{sig['symbol']}:{sig['strategy']}"] = sig
                     set_cooldown(sig["symbol"], sig["strategy"])
 
-                    log.info(f"✔ SIGNAL: {sig['symbol']} {sig['strategy']} score={sig['score']:.1f}")
-
+                    log.info(f"✔️ SIGNAL: {sig['symbol']} {sig['strategy']} = {sig['score']:.1f}")
             else:
-                log.info("📊 No valid signals")
+                if scan_count % 10 == 0:  # Log every 10th scan
+                    log.info(f"📊 Scan #{scan_count}: No signals")
 
             await asyncio.sleep(SCAN_INTERVAL)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log.error(f"Scanner error: {e}", exc_info=True)
+            log.error(f"Scanner error: {e}")
+            log.error(traceback.format_exc())
             await asyncio.sleep(5)
 
 
 # -----------------------------------------------------------
-# FASTAPI + LIFESPAN
+# FASTAPI
 # -----------------------------------------------------------
 scan_task = None
 ws_task = None
@@ -262,18 +346,18 @@ ws_task = None
 async def lifespan(app: FastAPI):
     global scan_task, ws_task
     
-    log.info("🚀 App starting (Production Bot v2.0)")
-    log.info(f"✓ Loaded {len(PAIRS)} pairs")
+    log.info("🚀 Bot Starting (v2.1)")
+    log.info(f"✓ {len(PAIRS)} pairs loaded")
     
-    # Start WebSocket first
     ws_task = asyncio.create_task(start_all_ws())
+    await asyncio.sleep(2)  # Let WS start
     
-    # Then start scanner
     scan_task = asyncio.create_task(scanner())
     
     yield
     
-    # Cleanup
+    log.info("🛑 Shutting down...")
+    
     if scan_task:
         scan_task.cancel()
     if ws_task:
@@ -284,27 +368,28 @@ async def lifespan(app: FastAPI):
     except:
         pass
     
-    await redis.close()
-    log.info("🛑 App shutdown complete")
+    try:
+        await redis.aclose()  # Use aclose() instead of close()
+    except:
+        pass
+    
+    log.info("🔴 App shutdown complete")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-# -----------------------------------------------------------
-# API ROUTES
-# -----------------------------------------------------------
 @app.get("/")
 async def root():
-    # Check Redis data availability
-    sample_check = await redis.llen("tr:BTCUSDT")
+    btc_trades = await redis.llen("tr:BTCUSDT")
     
     return {
         "status": "running",
+        "ws_connected": ws_connected,
+        "data_received": data_received,
+        "btc_trades": btc_trades,
         "pairs": len(PAIRS),
-        "cooldown_active": len(cooldown),
         "active_signals": len(ACTIVE_ORDERS),
-        "redis_sample_data": sample_check,
         "time": datetime.utcnow().isoformat()
     }
 
@@ -313,31 +398,32 @@ async def root():
 async def health():
     try:
         await redis.ping()
-        redis_status = "connected"
+        redis_ok = True
     except:
-        redis_status = "disconnected"
+        redis_ok = False
     
-    # Check data availability
-    btc_trades = await redis.llen("tr:BTCUSDT")
+    btc_trades = await redis.llen("tr:BTCUSDT") if redis_ok else 0
     
     return {
-        "status": "ok",
-        "redis": redis_status,
-        "pairs": len(PAIRS),
-        "btc_trades_count": btc_trades
+        "status": "ok" if redis_ok and btc_trades > 0 else "degraded",
+        "redis": redis_ok,
+        "ws_connected": ws_connected,
+        "btc_trades": btc_trades,
+        "data_received": data_received
     }
 
 
-@app.get("/signals")
-async def get_signals():
-    return {
-        "active": ACTIVE_ORDERS,
-        "count": len(ACTIVE_ORDERS)
-    }
+@app.get("/debug")
+async def debug():
+    """Debug endpoint to check data"""
+    debug_info = {}
+    
+    for sym in PAIRS[:5]:  # Check first 5 pairs
+        count = await redis.llen(f"tr:{sym}")
+        debug_info[sym] = count
+    
+    return debug_info
 
 
-# -----------------------------------------------------------
-# RUN SERVER
-# -----------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
