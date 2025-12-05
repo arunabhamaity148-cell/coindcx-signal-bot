@@ -1,133 +1,219 @@
-# main.py — uses helpers.py, pure-logic signals, telegram notify
-import os, asyncio, logging
-from contextlib import asynccontextmanager
+import os, asyncio, logging, aiohttp
 from datetime import datetime
 from fastapi import FastAPI
 import uvicorn
 
-from helpers import WS, calc_score, calc_tp1_tp2_sl_liq, position_size_iceberg, send_signal_telegram, send_telegram, check_cooldown, set_cooldown, increment_signal_count, check_daily_signal_limit, cleanup, CFG
+from helpers import (
+    CFG, STRATEGY_CONFIG, Exchange,
+    calculate_advanced_score, calc_tp_sl,
+    iceberg_size, send_telegram, redis,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
 
-bot_task = None
-ws_task = None
-ping_task = None
-deploy_notify_task = None
 
+# ===================================================================
+# WS POLLING TASK – FETCH MARKET DATA FROM REDIS STREAM
+# ===================================================================
+async def ws_polling():
+    log.info("🔌 WS polling started...")
+    r = await redis()
+
+    import ccxt.async_support as ccxt
+    ex = ccxt.coindcx({"enableRateLimit": True})
+
+    while True:
+        try:
+            for sym in CFG["pairs"]:
+                try:
+                    # ticker
+                    ticker = await ex.fetch_ticker(sym)
+                    await r.hset(f"t:{sym}", mapping={
+                        "last": ticker["last"], 
+                        "E": int(datetime.utcnow().timestamp()*1000)
+                    })
+
+                    # orderbook
+                    ob = await ex.fetch_order_book(sym, limit=20)
+                    await r.hset(f"d:{sym}", mapping={
+                        "bids": json.dumps(ob["bids"]),
+                        "asks": json.dumps(ob["asks"]),
+                        "E": int(datetime.utcnow().timestamp()*1000),
+                    })
+
+                    # trades
+                    trades = await ex.fetch_trades(sym, limit=100)
+                    for t in trades:
+                        await r.lpush(f"tr:{sym}", json.dumps({
+                            "p": t["price"], 
+                            "q": t["amount"],
+                            "m": t["side"] == "sell",
+                            "t": t["timestamp"]
+                        }))
+                    await r.ltrim(f"tr:{sym}", 0, 400)
+
+                except Exception as e:
+                    log.warning(f"poll error {sym}: {e}")
+                    continue
+
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            log.error(f"WS loop crash: {e}")
+            await asyncio.sleep(5)
+
+
+# ===================================================================
+# SIGNAL BOT LOOP
+# ===================================================================
+cooldown_cache = {}
+
+def cooldown_ok(sym, strategy):
+    key = f"{sym}:{strategy}"
+    if key not in cooldown_cache: 
+        return True
+    t = (datetime.utcnow() - cooldown_cache[key]).total_seconds()/60
+    return t >= CFG["cooldown_min"]
+
+def set_cooldown(sym, strategy):
+    cooldown_cache[f"{sym}:{strategy}"] = datetime.utcnow()
+
+
+async def bot_loop():
+    log.info("🤖 Signal bot started...")
+
+    while True:
+        try:
+            for sym in CFG["pairs"]:
+                for strategy in STRATEGY_CONFIG.keys():
+
+                    if not cooldown_ok(sym, strategy):
+                        continue
+
+                    sig = await calculate_advanced_score(sym, strategy)
+                    if not sig or sig["side"] == "none":
+                        continue
+
+                    side = sig["side"]
+                    entry = sig["last"]
+                    score = sig["score"]
+
+                    tp1, tp2, sl, lev, liq, liq_dist = await calc_tp_sl(sym, side, entry, strategy)
+
+                    # dangerous SL ?
+                    if liq_dist < 0.7:
+                        await send_telegram(
+                            f"⚠️ <b>LIQ WARNING</b>\n{sym} {strategy} {side}\n"
+                            f"Entry: {entry}\nSL-LIQ Distance: {liq_dist:.2f}% (too close)"
+                        )
+                        continue
+
+                    # iceberg sizing
+                    ice = iceberg_size(CFG["equity"], entry, sl, lev)
+
+                    msg = (
+                        f"🎯 <b>[{strategy}] {sym} {side.upper()}</b>\n"
+                        f"Entry: <code>{entry:.6f}</code>\n"
+                        f"TP1: <code>{tp1:.6f}</code>\n"
+                        f"TP2: <code>{tp2:.6f}</code>\n"
+                        f"SL: <code>{sl:.6f}</code>\n"
+                        f"Leverage: <b>{lev}x</b>\n"
+                        f"Score: {score:.2f}\n"
+                        f"Liq Distance: {liq_dist:.2f}%\n\n"
+                        f"💰 <b>Iceberg:</b>\n"
+                        f"Total Qty: {ice['total']:.6f}\n"
+                        f"Split: {ice['orders']} × {ice['each']:.6f}\n\n"
+                        f"📝 Steps:\n"
+                        f"1️⃣ Set leverage {lev}x\n"
+                        f"2️⃣ Place {ice['orders']} limit orders at {entry:.6f}\n"
+                        f"3️⃣ SL → {sl:.6f}\n"
+                        f"4️⃣ TP1 → {tp1:.6f} ({STRATEGY_CONFIG[strategy]['tp1_exit']*100:.0f}% exit)\n"
+                        f"5️⃣ TP2 → {tp2:.6f}\n"
+                        f"⏳ Cooldown: {CFG['cooldown_min']} min"
+                    )
+
+                    await send_telegram(msg)
+                    log.info(f"✔ Sent signal {sym} {strategy} {side}")
+
+                    set_cooldown(sym, strategy)
+
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            log.error(f"BOT LOOP ERROR: {e}")
+            await asyncio.sleep(5)
+
+
+
+# ===================================================================
+# KEEP ALIVE PING
+# ===================================================================
 async def keep_alive():
-    port = int(os.getenv("PORT", 8080))
-    url = f"http://0.0.0.0:{port}/health"
-    import aiohttp
+    url = "http://0.0.0.0:8080/health"
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        log.debug("Health ping ok")
-        except Exception:
+                async with s.get(url) as r:
+                    if r.status == 200:
+                        log.info("✓ Keep-alive OK")
+        except:
             pass
         await asyncio.sleep(60)
 
-async def bot_loop():
-    log.info("🤖 Starting Signal Bot (Aggressive Mode)...")
-    await asyncio.sleep(5)
-    await send_telegram("🚀 <b>Bot Deployed — Aggressive Logic (No ML)</b>")
 
-    while True:
-        try:
-            limit_ok, reason = await check_daily_signal_limit()
-            if not limit_ok:
-                log.warning(f"Daily limit reached: {reason}")
-                await asyncio.sleep(3600)
-                continue
+# ===================================================================
+# FASTAPI + LIFESPAN
+# ===================================================================
+from contextlib import asynccontextmanager
 
-            for sym in CFG["top_pairs"]:
-                try:
-                    cd_ok, cd_reason = await check_cooldown(sym, "GLOBAL")
-                    if not cd_ok:
-                        log.debug(f"{sym} cooldown: {cd_reason}")
-                        continue
-
-                    sc = await calc_score(sym)
-                    if sc["side"] == "none":
-                        log.debug(f"{sym} blocked: {sc['reason']}")
-                        continue
-
-                    side = sc["side"]
-                    score = sc["score"]
-                    last = sc["last"]
-
-                    # TP/SL calculation & liq distance
-                    tp1, tp2, sl, lev, liq_price, liq_dist_pct = await calc_tp1_tp2_sl_liq(sym, side, last, confidence=60, strategy="QUICK")
-
-                    # iceberg sizing
-                    iceberg = position_size_iceberg(CFG["equity"], last, sl, lev)
-                    if iceberg["total_qty"] < 0.0005:
-                        log.info(f"{sym} BLOCKED: position too small ({iceberg['total_qty']})")
-                        continue
-
-                    # liq distance alarm: if too close, warn and skip sending normal signal
-                    if liq_dist_pct < float(os.getenv("LIQ_ALERT_PCT", CFG.get("liq_alert_pct", 0.7))):
-                        log.warning(f"LIQ CLOSE {sym}: {liq_dist_pct:.2f}% — skipping signal")
-                        await send_telegram(f"⚠️ LIQ CLOSE ALERT: {sym} | Entry={last} | LiqDist={liq_dist_pct:.2f}%")
-                        # you can choose to continue or still send with warning; we skip to be safe
-                        continue
-
-                    # final signal send
-                    await increment_signal_count()
-                    await send_signal_telegram(sym, "HYBRID", side, last, tp1, tp2, sl, lev, iceberg_info=iceberg, liq_dist_pct=liq_dist_pct, extra=f"Score:{score}")
-                    await set_cooldown(sym, "GLOBAL")
-                    log.info(f"✅ SIGNAL {sym} {side} Score={score} Lev={lev} LiqDist={liq_dist_pct:.2f}%")
-                    # aggressive mode cadence: small sleep between symbols
-                    await asyncio.sleep(0.6)
-
-                except Exception as e:
-                    log.error(f"Symbol loop error {sym}: {e}")
-                    continue
-
-            await asyncio.sleep(1)
-
-        except Exception as e:
-            log.error(f"Bot loop error: {e}")
-            await asyncio.sleep(5)
-
-async def send_deploy_notify():
-    await asyncio.sleep(3)
-    try:
-        await send_telegram(f"🚀 Bot active — pairs: {len(CFG['top_pairs'])} — Mode: Aggressive (No ML) — Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    except Exception as e:
-        log.error(f"Deploy notify error: {e}")
+bot_task = None
+ws_task = None
+ping_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global ws_task, bot_task, ping_task, deploy_notify_task
-    log.info("Starting services...")
-    ws = WS()
-    ws_task = asyncio.create_task(ws.run())
+    global bot_task, ws_task, ping_task
+    log.info("🚀 Bot Booting...")
+
+    ws_task = asyncio.create_task(ws_polling())
     bot_task = asyncio.create_task(bot_loop())
     ping_task = asyncio.create_task(keep_alive())
-    deploy_notify_task = asyncio.create_task(send_deploy_notify())
-    try:
-        yield
-    finally:
-        log.info("Shutting down...")
-        for t in [ws_task, bot_task, ping_task, deploy_notify_task]:
-            if t:
-                t.cancel()
-        await asyncio.gather(*[t for t in [ws_task, bot_task, ping_task, deploy_notify_task] if t], return_exceptions=True)
-        await cleanup()
-        log.info("Shutdown complete")
+
+    yield
+
+    for t in [ws_task, bot_task, ping_task]:
+        if t: t.cancel()
+
+    await asyncio.gather(*[t for t in [ws_task, bot_task, ping_task] if t], return_exceptions=True)
+    log.info("Shutdown complete.")
+
 
 app = FastAPI(lifespan=lifespan)
 
+
 @app.get("/")
 def root():
-    return {"status":"running","pairs":len(CFG["top_pairs"])}
+    return {
+        "status": "running",
+        "pairs": len(CFG["pairs"]),
+        "strategies": list(STRATEGY_CONFIG.keys()),
+        "time": datetime.utcnow().isoformat()
+    }
+
 
 @app.get("/health")
 def health():
-    return {"status":"ok"}
+    return {
+        "status": "ok",
+        "ws": ws_task is not None and not ws_task.done(),
+        "bot": bot_task is not None and not bot_task.done(),
+        "time": datetime.utcnow().isoformat()
+    }
 
+
+# ===================================================================
+# UVICORN START
+# ===================================================================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
