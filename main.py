@@ -1,5 +1,5 @@
 # ================================================================
-# main.py — OPTIMIZED (Redis Usage 95% Reduced)  -- UPDATED (DB integration)
+# main.py — OPTIMIZED (Redis Usage 95% Reduced)  -- FINAL
 # ================================================================
 
 import os
@@ -59,6 +59,10 @@ TICKER_CACHE = {}
 WRITE_BATCH_SIZE = int(os.getenv("WRITE_BATCH_SIZE", 50))  # Write to Redis every N trades
 write_counters = {sym: 0 for sym in PAIRS}
 
+# PERIODIC SYNC / REDIS-SYNC CONTROLS
+PERIODIC_SYNC_INTERVAL = int(os.getenv("PERIODIC_SYNC_INTERVAL", 15))
+ENABLE_REDIS_SYNC = os.getenv("ENABLE_REDIS_SYNC", "true").lower() == "true"
+
 # NEW: Formatter & PositionTracker instances
 formatter = TelegramFormatter()
 position_tracker = PositionTracker(storage_file=os.getenv("POSITION_FILE", "positions.json"))
@@ -73,7 +77,7 @@ LOCAL_FALLBACK_DIR = os.getenv("FALLBACK_DIR", "/tmp/trade_fallback")
 os.makedirs(LOCAL_FALLBACK_DIR, exist_ok=True)
 
 _redis_rate_limited_until = 0.0
-_redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 30))  # exponential backoff start
+_redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 60))  # exponential backoff start
 
 
 # -----------------------------------------------------------
@@ -144,7 +148,7 @@ async def push_trade(sym: str, data: dict):
                 await redis.ltrim(f"tr:{sym}", 0, 499)
                 await redis.expire(f"tr:{sym}", TRADES_TTL_SEC)
                 # success — reset backoff
-                _redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 30))
+                _redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 60))
             except Exception as e:
                 err_str = str(e).lower()
                 log.error(f"Push trade error for {sym}: {e}")
@@ -193,13 +197,24 @@ async def push_ticker(sym: str, last: float, vol: float, ts: int):
 
 
 # -----------------------------------------------------------
-# ⭐ PERIODIC REDIS SYNC (Every 5 seconds)
+# ⭐ PERIODIC REDIS SYNC (Every N seconds) - rate-limit aware
 # -----------------------------------------------------------
 async def periodic_redis_sync():
-    """Write orderbook & ticker cache to Redis periodically"""
+    """Write orderbook & ticker cache to Redis periodically (rate-limit aware)"""
+    global _redis_rate_limited_until, _redis_backoff_seconds
+
     while True:
         try:
-            await asyncio.sleep(5)
+            await asyncio.sleep(PERIODIC_SYNC_INTERVAL)
+
+            if not ENABLE_REDIS_SYNC:
+                # If disabled, skip sync (we have local fallback)
+                continue
+
+            # If currently rate-limited, skip sync
+            if time.time() < _redis_rate_limited_until:
+                log.debug("Skipping periodic_redis_sync due to Redis rate-limit (backoff active).")
+                continue
 
             # Sync orderbooks (batch write)
             if OB_CACHE:
@@ -209,7 +224,14 @@ async def periodic_redis_sync():
                         pipe.setex(f"ob:{sym}", 60, json.dumps(data))
                     await pipe.execute()
                 except Exception as e:
+                    err = str(e).lower()
                     log.error(f"OB sync redis error: {e}")
+                    if "max requests limit" in err or "rate limit" in err or "too many requests" in err:
+                        # enter backoff window
+                        _redis_rate_limited_until = time.time() + _redis_backoff_seconds
+                        _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)
+                        log.warning(f"Redis rate limit detected. Backing off for {_redis_backoff_seconds} seconds.")
+                    # keep going; next loop will skip if backoff set
 
             # Sync tickers (batch write)
             if TICKER_CACHE:
@@ -219,12 +241,17 @@ async def periodic_redis_sync():
                         pipe.setex(f"tk:{sym}", 60, json.dumps(data))
                     await pipe.execute()
                 except Exception as e:
+                    err = str(e).lower()
                     log.error(f"Ticker sync redis error: {e}")
+                    if "max requests limit" in err or "rate limit" in err or "too many requests" in err:
+                        _redis_rate_limited_until = time.time() + _redis_backoff_seconds
+                        _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)
+                        log.warning(f"Redis rate limit detected. Backing off for {_redis_backoff_seconds} seconds.")
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log.error(f"Sync error: {e}")
+            log.error(f"Sync loop unexpected error: {e}")
 
 
 # -----------------------------------------------------------
@@ -545,4 +572,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080))) 
