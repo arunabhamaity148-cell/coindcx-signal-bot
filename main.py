@@ -1,5 +1,5 @@
 # ================================================================
-# main.py — OPTIMIZED (Redis Usage 95% Reduced)  -- UPDATED
+# main.py — OPTIMIZED (Redis Usage 95% Reduced)  -- UPDATED (rate-limit safe)
 # ================================================================
 
 import os
@@ -7,6 +7,7 @@ import json
 import asyncio
 import logging
 import traceback
+import time
 from datetime import datetime
 from contextlib import asynccontextmanager
 from collections import deque
@@ -15,6 +16,9 @@ import aiohttp
 import websockets
 from fastapi import FastAPI
 import uvicorn
+
+# async file IO (ensure aiofiles in requirements.txt)
+import aiofiles
 
 from helpers import redis, PAIRS
 from scorer import compute_signal
@@ -32,15 +36,15 @@ log = logging.getLogger("main")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 20))
-COOLDOWN_MIN = 30
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", 30))
 
 cooldown = {}
 ACTIVE_ORDERS = {}
 
 # WebSocket config
 BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream"
-CHUNK_SIZE = 15
-TRADES_TTL_SEC = 1800
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 15))
+TRADES_TTL_SEC = int(os.getenv("TRADES_TTL_SEC", 1800))
 
 ws_connected = False
 data_received = 0
@@ -49,12 +53,22 @@ data_received = 0
 TRADE_BUFFER = {sym: deque(maxlen=500) for sym in PAIRS}
 OB_CACHE = {}
 TICKER_CACHE = {}
-WRITE_BATCH_SIZE = 50  # Write to Redis every 50 trades
+WRITE_BATCH_SIZE = int(os.getenv("WRITE_BATCH_SIZE", 50))  # Write to Redis every N trades
 write_counters = {sym: 0 for sym in PAIRS}
 
 # NEW: Formatter & PositionTracker instances
 formatter = TelegramFormatter()
 position_tracker = PositionTracker(storage_file=os.getenv("POSITION_FILE", "positions.json"))
+
+# -----------------------------------------------------------
+# Fallback & Rate-limit state (Upstash protection)
+# -----------------------------------------------------------
+LOCAL_FALLBACK_DIR = os.getenv("FALLBACK_DIR", "/tmp/trade_fallback")
+os.makedirs(LOCAL_FALLBACK_DIR, exist_ok=True)
+
+_redis_rate_limited_until = 0.0
+_redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 30))  # exponential backoff start
+
 
 # -----------------------------------------------------------
 # TELEGRAM SENDER
@@ -74,10 +88,25 @@ async def send_telegram(msg):
 
 
 # -----------------------------------------------------------
-# ⭐ OPTIMIZED DATA PUSHER (Batched Redis Writes)
+# ⭐ OPTIMIZED DATA PUSHER (Batched Redis Writes) — rate-limit safe
 # -----------------------------------------------------------
+async def _persist_fallback(sym: str, items: list):
+    """Persist a list of trades to local fallback file (jsonl)"""
+    if not items:
+        return
+    filename = os.path.join(LOCAL_FALLBACK_DIR, f"{sym}_fallback.jsonl")
+    try:
+        async with aiofiles.open(filename, "a") as f:
+            for t in items:
+                await f.write(json.dumps(t) + "\n")
+    except Exception as e:
+        log.error(f"Fallback persist error for {sym}: {e}")
+
+
 async def push_trade(sym: str, data: dict):
-    """Store in memory first, batch write to Redis"""
+    """Store in memory first, batch write to Redis with rate-limit/backoff handling"""
+    global _redis_rate_limited_until, _redis_backoff_seconds, data_received
+
     try:
         if not all(k in data for k in ["p", "q", "m", "t"]):
             return
@@ -93,18 +122,40 @@ async def push_trade(sym: str, data: dict):
         TRADE_BUFFER[sym].append(trade)
         write_counters[sym] += 1
 
-        # Only write to Redis every 50 trades
+        # If currently rate-limited, persist this trade to fallback and skip Redis
+        if time.time() < _redis_rate_limited_until:
+            await _persist_fallback(sym, [trade])
+            data_received += 1
+            return
+
+        # Only write to Redis every WRITE_BATCH_SIZE trades
         if write_counters[sym] >= WRITE_BATCH_SIZE:
             batch = list(TRADE_BUFFER[sym])[-WRITE_BATCH_SIZE:]
             batch_json = [json.dumps(t) for t in batch]
 
-            await redis.lpush(f"tr:{sym}", *batch_json)
-            await redis.ltrim(f"tr:{sym}", 0, 499)
-            await redis.expire(f"tr:{sym}", TRADES_TTL_SEC)
+            try:
+                await redis.lpush(f"tr:{sym}", *batch_json)
+                await redis.ltrim(f"tr:{sym}", 0, 499)
+                await redis.expire(f"tr:{sym}", TRADES_TTL_SEC)
+                # success — reset backoff
+                _redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 30))
+            except Exception as e:
+                err_str = str(e).lower()
+                log.error(f"Push trade error for {sym}: {e}")
 
-            write_counters[sym] = 0
+                # Detect Upstash max-requests/rate-limit textual hints
+                if "max requests limit" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+                    # Set rate-limited window and backoff
+                    _redis_rate_limited_until = time.time() + _redis_backoff_seconds
+                    _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)  # cap 1 hour
+                    # persist batch to fallback for later ingestion
+                    await _persist_fallback(sym, batch)
+                else:
+                    # For other Redis errors, also persist batch to be safe
+                    await _persist_fallback(sym, batch)
+            finally:
+                write_counters[sym] = 0
 
-        global data_received
         data_received += 1
 
     except Exception as e:
@@ -112,7 +163,7 @@ async def push_trade(sym: str, data: dict):
 
 
 async def push_orderbook(sym: str, bid: float, ask: float):
-    """Store in memory, write to Redis every 5 seconds"""
+    """Store in memory, write to Redis every periodic sync"""
     try:
         OB_CACHE[sym] = {
             "bid": float(bid),
@@ -146,17 +197,23 @@ async def periodic_redis_sync():
 
             # Sync orderbooks (batch write)
             if OB_CACHE:
-                pipe = redis.pipeline()
-                for sym, data in OB_CACHE.items():
-                    pipe.setex(f"ob:{sym}", 60, json.dumps(data))
-                await pipe.execute()
+                try:
+                    pipe = redis.pipeline()
+                    for sym, data in OB_CACHE.items():
+                        pipe.setex(f"ob:{sym}", 60, json.dumps(data))
+                    await pipe.execute()
+                except Exception as e:
+                    log.error(f"OB sync redis error: {e}")
 
             # Sync tickers (batch write)
             if TICKER_CACHE:
-                pipe = redis.pipeline()
-                for sym, data in TICKER_CACHE.items():
-                    pipe.setex(f"tk:{sym}", 60, json.dumps(data))
-                await pipe.execute()
+                try:
+                    pipe = redis.pipeline()
+                    for sym, data in TICKER_CACHE.items():
+                        pipe.setex(f"tk:{sym}", 60, json.dumps(data))
+                    await pipe.execute()
+                except Exception as e:
+                    log.error(f"Ticker sync redis error: {e}")
 
         except asyncio.CancelledError:
             break
@@ -191,8 +248,8 @@ async def ws_worker(pairs_chunk, worker_id):
     while True:
         try:
             async with websockets.connect(
-                url, 
-                ping_interval=20, 
+                url,
+                ping_interval=20,
                 ping_timeout=10,
                 close_timeout=10
             ) as ws:
