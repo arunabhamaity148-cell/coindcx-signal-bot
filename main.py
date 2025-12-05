@@ -1,5 +1,5 @@
 # ================================================================
-# main.py — FULL BOT ENGINE (Scanner + Telegram + Cooldown)
+# main.py — FULL BOT ENGINE (Railway Production Ready)
 # ================================================================
 
 import os
@@ -7,6 +7,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 
 import aiohttp
 from fastapi import FastAPI
@@ -23,11 +24,11 @@ log = logging.getLogger("main")
 # -----------------------------------------------------------
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))   # default 10 sec
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 COOLDOWN_MIN = 30
 
-cooldown = {}      # "BTCUSDT:QUICK": datetime
-ACTIVE_ORDERS = {} # store active signal positions
+cooldown = {}
+ACTIVE_ORDERS = {}
 
 
 # -----------------------------------------------------------
@@ -87,6 +88,15 @@ def format_signal(sig):
 # -----------------------------------------------------------
 async def scanner():
     log.info("🔍 Scanner started")
+    
+    # Test Redis connection
+    try:
+        await redis.ping()
+        log.info("✅ Redis connected successfully")
+    except Exception as e:
+        log.error(f"❌ Redis connection failed: {e}")
+        await send_telegram("⚠️ <b>Bot Started but Redis NOT connected!</b>\nPlease check Railway Redis service.")
+        return
 
     await send_telegram("🚀 <b>Binance Scanner LIVE (v1.0)</b>\n📡 Waiting for real-time trades...")
 
@@ -95,7 +105,6 @@ async def scanner():
             results = []
 
             for sym in PAIRS:
-                # evaluate 3 strategies
                 for strat in ["QUICK", "MID", "TREND"]:
                     if not cooldown_ok(sym, strat):
                         continue
@@ -104,11 +113,10 @@ async def scanner():
                     if sig:
                         results.append(sig)
 
-            # sort by score
             results.sort(key=lambda x: x["score"], reverse=True)
 
             if results:
-                best = results[:3]  # send top 3
+                best = results[:3]
 
                 for sig in best:
                     msg = format_signal(sig)
@@ -132,23 +140,32 @@ async def scanner():
 
 
 # -----------------------------------------------------------
-# FASTAPI + LIFESPAN
+# FASTAPI + LIFESPAN (Railway Compatible)
 # -----------------------------------------------------------
-app = FastAPI()
 scan_task = None
 
-@app.on_event("startup")
-async def start_bot():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global scan_task
     log.info("🚀 App starting (Production Bot v1.0)")
     log.info(f"✓ Loaded {len(PAIRS)} pairs")
-
+    
     scan_task = asyncio.create_task(scanner())
-
-@app.on_event("shutdown")
-async def close_bot():
+    
+    yield
+    
     if scan_task:
         scan_task.cancel()
+        try:
+            await scan_task
+        except asyncio.CancelledError:
+            pass
+    
+    await redis.close()
+    log.info("🛑 App shutdown complete")
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 # -----------------------------------------------------------
@@ -162,6 +179,21 @@ async def root():
         "cooldown": {k: str(v) for k, v in cooldown.items()},
         "active_orders": ACTIVE_ORDERS,
         "time": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/health")
+async def health():
+    try:
+        await redis.ping()
+        redis_status = "connected"
+    except:
+        redis_status = "disconnected"
+    
+    return {
+        "status": "ok",
+        "redis": redis_status,
+        "pairs": len(PAIRS)
     }
 
 
