@@ -46,7 +46,7 @@ async def redis_close():
 class WS:
     def __init__(self):
         self.running = False
-        self.ex = ccxt.coindcx({"enableRateLimit": True})
+        self.ex = ccxt.coincdcx({"enableRateLimit": True})
     async def run(self):
         self.running = True
         log.info("🔌 Starting CoinDCX data polling...")
@@ -350,7 +350,7 @@ async def send_telegram(txt):
 
 class Exchange:
     def __init__(self):
-        self.ex = ccxt.coindcx({"apiKey": CFG["key"], "secret": CFG["secret"], "options": {"defaultType": "swap"}, "enableRateLimit": True, "timeout": 30000})
+        self.ex = ccxt.coincdcx({"apiKey": CFG["key"], "secret": CFG["secret"], "options": {"defaultType": "swap"}, "enableRateLimit": True, "timeout": 30000})
         log.info("✓ CoinDCX initialized (manual trading mode)")
     async def close(self):
         await self.ex.close()
