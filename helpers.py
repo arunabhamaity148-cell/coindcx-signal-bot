@@ -42,6 +42,7 @@ STRATEGY_CONFIG = {
 }
 
 redis_client: Redis = None
+
 async def redis():
     global redis_client
     if redis_client is None:
@@ -49,6 +50,7 @@ async def redis():
         await redis_client.ping()
         log.info("✓ Redis connected")
     return redis_client
+
 async def redis_close():
     global redis_client
     if redis_client:
@@ -57,46 +59,63 @@ async def redis_close():
 
 def get_exchange(**kwargs):
     cls = getattr(ccxt, "coindcx", None)
-    if cls: return cls({"enableRateLimit": True, **kwargs})
+    if cls: 
+        return cls({"enableRateLimit": True, **kwargs})
     return ccxt.Exchange({"id": "coindcx", "name": "CoinDCX", "enableRateLimit": True, "timeout": 30000, **kwargs})
 
 class Exchange:
     def __init__(self):
         self.ex = get_exchange(apiKey=CFG["key"], secret=CFG["secret"])
         log.info("✓ CoinDCX Exchange Auth Initialized")
+    
     async def fetch_balance(self):
-        try: return await self.ex.fetch_balance()
-        except Exception as e: log.error(f"balance error: {e}"); return None
+        try: 
+            return await self.ex.fetch_balance()
+        except Exception as e: 
+            log.error(f"balance error: {e}")
+            return None
 
 def log_block(sym, strategy, reason):
-    log.info(f"🚫 BLOCK {sym}:{strategy} → {reason}")
+    log.debug(f"🚫 BLOCK {sym}:{strategy} → {reason}")
 
 # ---------- OHLC / RSI / ATR ----------
 async def build_ohlcv(sym, tf="1m", bars=100):
     r = await redis()
     raw = await r.lrange(f"tr:{sym}", 0, 600)
-    if not raw: return None
+    if not raw: 
+        return None
     trades = [json.loads(x) for x in raw]
     df = pd.DataFrame(trades)
-    df["p"] = df["p"].astype(float); df["q"] = df["q"].astype(float)
+    df["p"] = df["p"].astype(float)
+    df["q"] = df["q"].astype(float)
     df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
     df = df.set_index("t").sort_index()
-    ohlc = df["p"].resample(tf).ohlc(); vol = df["q"].resample(tf).sum()
+    ohlc = df["p"].resample(tf).ohlc()
+    vol = df["q"].resample(tf).sum()
     o = ohlc.join(vol.rename("v")).dropna()
     return o.tail(bars)
+
 async def get_ohlcv(sym, tf="1m", limit=100):
     df = await build_ohlcv(sym, tf, limit)
-    if df is None or len(df) < 20: return None
-    df = df.reset_index(); df.rename(columns={"open":"o","high":"h","low":"l","close":"c"}, inplace=True)
+    if df is None or len(df) < 20: 
+        return None
+    df = df.reset_index()
+    df.rename(columns={"open":"o","high":"h","low":"l","close":"c"}, inplace=True)
     return df
+
 def calc_rsi(series, period=14):
-    delta = series.diff(); gain = delta.clip(lower=0).rolling(period).mean()
-    loss = -delta.clip(upper=0).rolling(period).mean(); rs = gain / (loss + 1e-9)
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
+
 async def get_atr(sym, tf="5m", period=14):
     df = await get_ohlcv(sym, tf, 100)
-    if df is None: return 0.002
-    h, l, c = df["h"], df["l"], df["c"]; prev_c = c.shift(1)
+    if df is None: 
+        return 0.002
+    h, l, c = df["h"], df["l"], df["c"]
+    prev_c = c.shift(1)
     tr = np.maximum(h - l, np.maximum(abs(h - prev_c), abs(l - prev_c)))
     return tr.rolling(period).mean().iloc[-1]
 
@@ -104,87 +123,144 @@ async def get_atr(sym, tf="5m", period=14):
 async def cvd_vwap(sym):
     r = await redis()
     raw = await r.lrange(f"tr:{sym}", 0, 200)
-    if not raw: return None
+    if not raw: 
+        return None
     trades = [json.loads(x) for x in raw]
     df = pd.DataFrame(trades)
-    df["p"] = df["p"].astype(float); df["q"] = df["q"].astype(float)
-    df["side"] = np.where(df["m"], -1, 1); df["vol"] = df["q"] * df["p"]; df["pv"] = df["p"] * df["vol"]
-    vwap = df["pv"].sum() / (df["vol"].sum() + 1e-9); cvd = (df["q"] * df["side"]).sum()
+    df["p"] = df["p"].astype(float)
+    df["q"] = df["q"].astype(float)
+    df["side"] = np.where(df["m"], -1, 1)
+    df["vol"] = df["q"] * df["p"]
+    df["pv"] = df["p"] * df["vol"]
+    vwap = df["pv"].sum() / (df["vol"].sum() + 1e-9)
+    cvd = (df["q"] * df["side"]).sum()
     return {"cvd": cvd, "vwap": vwap, "price": df["p"].iloc[-1]}
 
 # ---------- ORDERFLOW ----------
 async def orderflow(sym):
     r = await redis()
     raw = await r.lrange(f"tr:{sym}", 0, 200)
-    if not raw: return None
-    t = [json.loads(x) for x in raw]; volumes = [float(x["q"]) for x in t]; avg, std = np.mean(volumes), np.std(volumes)
+    if not raw: 
+        return None
+    t = [json.loads(x) for x in raw]
+    volumes = [float(x["q"]) for x in t]
+    avg, std = np.mean(volumes), np.std(volumes)
     delta = sum(float(x["q"]) if not x["m"] else -float(x["q"]) for x in t)
     recent = sum(float(x["q"]) if not x["m"] else -float(x["q"]) for x in t[:40])
+    
     imbalance, spread, depth_usd = 0, 0, 0
     depth_raw = await r.hgetall(f"d:{sym}")
     if depth_raw:
-        bids = json.loads(depth_raw.get("bids", "[]")); asks = json.loads(depth_raw.get("asks", "[]"))
+        bids = json.loads(depth_raw.get("bids", "[]"))
+        asks = json.loads(depth_raw.get("asks", "[]"))
         if bids and asks:
-            bid_vol = sum(float(b[1]) for b in bids[:5]); ask_vol = sum(float(a[1]) for a in asks[:5])
+            bid_vol = sum(float(b[1]) for b in bids[:5])
+            ask_vol = sum(float(a[1]) for a in asks[:5])
             imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-9)
             spread = (float(asks[0][0]) - float(bids[0][0])) / float(bids[0][0]) * 100
             depth_usd = sum(float(b[0])*float(b[1]) for b in bids[:10]) + sum(float(a[0])*float(a[1]) for a in asks[:10])
-    return {"delta": delta, "recent_delta": recent, "imbalance": imbalance, "spread": spread,
-            "depth_usd": depth_usd, "momentum": recent/(abs(delta)+1e-6)}
+    
+    return {
+        "delta": delta, 
+        "recent_delta": recent, 
+        "imbalance": imbalance, 
+        "spread": spread,
+        "depth_usd": depth_usd, 
+        "momentum": recent/(abs(delta)+1e-6)
+    }
 
 # ---------- MTF ----------
 async def mtf(sym):
     t = []
     for tf in ["1m", "5m"]:
         df = await get_ohlcv(sym, tf, 60)
-        if df is None: continue
-        ema20 = df["c"].ewm(span=20).mean().iloc[-1]; ema50 = df["c"].ewm(span=50).mean().iloc[-1]
+        if df is None: 
+            continue
+        ema20 = df["c"].ewm(span=20).mean().iloc[-1]
+        ema50 = df["c"].ewm(span=50).mean().iloc[-1]
         t.append(1 if ema20 > ema50 else -1)
-    if not t: return 0
-    x = sum(t)/len(t); return 1 if x>0.4 else -1 if x<-0.4 else 0
+    if not t: 
+        return 0
+    x = sum(t)/len(t)
+    return 1 if x>0.4 else -1 if x<-0.4 else 0
 
 # ---------- NEWS/SENTIMENT ----------
 async def news_guard(sym):
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get("https://api.alternative.me/fng/?limit=1") as r:
+            async with s.get("https://api.alternative.me/fng/?limit=1", timeout=aiohttp.ClientTimeout(total=5)) as r:
                 fg_val = int((await r.json())["data"][0]["value"])
+        
         fg_score = 0
-        if fg_val <= 20: fg_score = +1
-        elif fg_val >= 80: fg_score = -1
+        if fg_val <= 20: 
+            fg_score = +1
+        elif fg_val >= 80: 
+            fg_score = -1
+        
         lc_key = os.getenv("LUNARCRUSH_KEY", "")
         lc_score = 0
         if lc_key and sym.replace("USDT", "") in {"BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "MATIC", "DOT", "AVAX"}:
             url = f"https://lunarcrush.com/api4/coin/{sym.replace('USDT', '')}/metrics"
             headers = {"Authorization": f"Bearer {lc_key}"}
             async with aiohttp.ClientSession() as s:
-                async with s.get(url, headers=headers) as resp:
+                async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         sent = (await resp.json()).get("data", {}).get("sentiment", 0)
-                        if sent > 0.6: lc_score = +1
-                        elif sent < -0.6: lc_score = -1
+                        if sent > 0.6: 
+                            lc_score = +1
+                        elif sent < -0.6: 
+                            lc_score = -1
+        
         total = fg_score + lc_score
         return {"score": np.clip(total, -2, 2)}
     except Exception as e:
-        log.debug(f"news-guard err {e}"); return {"score": 0}
+        log.debug(f"news-guard err {e}")
+        return {"score": 0}
 
 # ---------- DYNAMIC PAIR FILTER (80 coin) ----------
 async def filtered_pairs():
-    r = await redis(); good = []
+    r = await redis()
+    good = []
+    
     for sym in TOP_PAIRS:
         try:
             ticker = await r.hgetall(f"t:{sym}")
-            if not ticker: continue
+            # প্রথম run-এ data না থাকলে সব pair allow করো
+            if not ticker:
+                good.append(sym)
+                continue
+            
             last = float(ticker.get("last", 0))
             vol24 = float(ticker.get("quoteVolume", 0))
+            
+            # যদি data incomplete থাকে, তাও allow করো
+            if last == 0 or vol24 == 0:
+                good.append(sym)
+                continue
+            
             depth = await r.hgetall(f"d:{sym}")
-            if not depth: continue
-            bids = json.loads(depth.get("bids", "[]")); asks = json.loads(depth.get("asks", "[]"))
-            if not bids or not asks: continue
+            if not depth:
+                good.append(sym)
+                continue
+                
+            bids = json.loads(depth.get("bids", "[]"))
+            asks = json.loads(depth.get("asks", "[]"))
+            
+            if not bids or not asks:
+                good.append(sym)
+                continue
+                
             spread = (float(asks[0][0]) - float(bids[0][0])) / last * 100
-            # নরম শর্ত – 80 কয়েনই পাস করতে চাই
-            if vol24 >= 500000 and spread <= 1.5: good.append(sym)
-        except: continue
+            
+            # নরম শর্ত – 80 কয়েনই পাস করতে চাই
+            if vol24 >= 500000 and spread <= 1.5:
+                good.append(sym)
+        except Exception as e:
+            log.debug(f"filter error {sym}: {e}")
+            good.append(sym)  # error হলেও include করো
+            continue
+    
+    log.info(f"✓ Filtered pairs: {len(good)}/{len(TOP_PAIRS)}")
     return good
 
 # ---------- SCORE + DONE-LIST + LEVERAGE ----------
@@ -192,32 +268,49 @@ async def calculate_advanced_score(sym, strategy):
     try:
         df = await get_ohlcv(sym, "1m", 120)
         if df is None:
-            log_block(sym, strategy, "no-ohlcv"); return None
-        last = df["c"].iloc[-1]; rsi = calc_rsi(df["c"]).iloc[-1]
+            log_block(sym, strategy, "no-ohlcv")
+            return None
+        
+        last = df["c"].iloc[-1]
+        rsi = calc_rsi(df["c"]).iloc[-1]
         mom = (last - df["c"].iloc[-6]) / df["c"].iloc[-6]
+        
         flow = await orderflow(sym)
         if not flow:
-            log_block(sym, strategy, "no-flow"); return None
+            log_block(sym, strategy, "no-flow")
+            return None
+        
         cv = await cvd_vwap(sym)
         if not cv:
-            log_block(sym, strategy, "no-vwap"); return None
-        trend = await mtf(sym); ng = await news_guard(sym)
+            log_block(sym, strategy, "no-vwap")
+            return None
+        
+        trend = await mtf(sym)
+        ng = await news_guard(sym)
 
         # --- Done list ---
         done = []
-        if trend != 0: done.append("EMA-MTF ✅")
-        if abs(rsi - 50) < 25: done.append("RSI ✅")
-        if abs(mom) > 0.15: done.append("MOM ✅")
-        if flow["imbalance"] > 0.05: done.append("Imbalance ✅")
-        if flow["momentum"] > 0.1: done.append("CVD-MOM ✅")
-        if ng["score"] >= 0: done.append("News ✅")
-        if cv["price"] > cv["vwap"] * 0.999: done.append("VWAP ✅")
-        if cv["cvd"] > 0: done.append("CVD ✅")
+        if trend != 0: 
+            done.append("EMA-MTF ✅")
+        if abs(rsi - 50) < 25: 
+            done.append("RSI ✅")
+        if abs(mom) > 0.0015: 
+            done.append("MOM ✅")
+        if abs(flow["imbalance"]) > 0.05: 
+            done.append("Imbalance ✅")
+        if abs(flow["momentum"]) > 0.1: 
+            done.append("CVD-MOM ✅")
+        if ng["score"] >= 0: 
+            done.append("News ✅")
+        if abs(cv["price"] - cv["vwap"]) / cv["vwap"] < 0.002: 
+            done.append("VWAP ✅")
+        if cv["cvd"] != 0: 
+            done.append("CVD ✅")
 
         # --- Score ---
         score = 0
         score += (50 - abs(rsi - 50)) / 25 * 2
-        score += mom * 4
+        score += mom * 400
         score += flow["imbalance"] * 5
         score += flow["momentum"] * 3
         score += trend * 4
@@ -226,21 +319,34 @@ async def calculate_advanced_score(sym, strategy):
         score += (1 if cv["cvd"] > 0 else -1) * 2
 
         if flow["spread"] > 0.3:
-            log_block(sym, strategy, "wide-spread"); return None
+            log_block(sym, strategy, "wide-spread")
+            return None
+        
         if flow["depth_usd"] < 50000:
-            log_block(sym, strategy, "low-depth"); return None
+            log_block(sym, strategy, "low-depth")
+            return None
 
         side = "long" if score >= STRATEGY_CONFIG[strategy]["min_score"] else "none"
-        return {"side": side, "score": score, "last": float(last), "done": " | ".join(done)}
+        return {
+            "side": side, 
+            "score": score, 
+            "last": float(last), 
+            "done": " | ".join(done) if done else "No filters passed"
+        }
     except Exception as e:
-        log.error(f"score error {sym}: {e}"); return None
+        log.error(f"score error {sym}: {e}")
+        return None
 
 # ---------- LEVERAGE SUGGEST ----------
 def suggest_leverage(liq_dist, side):
-    if liq_dist >= 10: return 30
-    if liq_dist >= 7: return 25
-    if liq_dist >= 5: return 20
-    if liq_dist >= 3.5: return 18
+    if liq_dist >= 10: 
+        return 30
+    if liq_dist >= 7: 
+        return 25
+    if liq_dist >= 5: 
+        return 20
+    if liq_dist >= 3.5: 
+        return 18
     return 15
 
 # ---------- TP/SL ----------
@@ -250,15 +356,23 @@ async def calc_tp_sl(sym, side, entry, strategy):
     lev = 15  # default
     sl_dist = atr * entry * cfg["sl_mult"]
     liq = entry * (1 - 1 / lev) if side == "long" else entry * (1 + 1 / lev)
+    
     if side == "long":
-        sl = entry - sl_dist; tp1 = entry + sl_dist * cfg["tp1_mult"]; tp2 = entry + sl_dist * cfg["tp2_mult"]
+        sl = entry - sl_dist
+        tp1 = entry + sl_dist * cfg["tp1_mult"]
+        tp2 = entry + sl_dist * cfg["tp2_mult"]
     else:
-        sl = entry + sl_dist; tp1 = entry - sl_dist * cfg["tp1_mult"]; tp2 = entry - sl_dist * cfg["tp2_mult"]
+        sl = entry + sl_dist
+        tp1 = entry - sl_dist * cfg["tp1_mult"]
+        tp2 = entry - sl_dist * cfg["tp2_mult"]
+    
     liq_dist = abs(sl - liq) / liq * 100
     lev = suggest_leverage(liq_dist, side)
+    
     # re-calc liq with new lev
     liq = entry * (1 - 1 / lev) if side == "long" else entry * (1 + 1 / lev)
     liq_dist = abs(sl - liq) / liq * 100
+    
     return tp1, tp2, sl, lev, liq, liq_dist
 
 # ---------- ICEBERG ----------
@@ -271,9 +385,13 @@ def iceberg_size(equity, entry, sl, lev):
 
 # ---------- TELEGRAM ----------
 async def send_telegram(text):
-    if not CFG["tg_token"] or not CFG["tg_chat"]: return
+    if not CFG["tg_token"] or not CFG["tg_chat"]: 
+        return
     url = f"https://api.telegram.org/bot{CFG['tg_token']}/sendMessage"
-    async with aiohttp.ClientSession() as s:
-        await s.post(url, json={"chat_id": CFG["tg_chat"], "text": text, "parse_mode": "HTML"})
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(url, json={"chat_id": CFG["tg_chat"], "text": text, "parse_mode": "HTML"}, timeout=aiohttp.ClientTimeout(total=10))
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
 
-log.info("✓ helpers loaded (FINAL-RAILWAY)")
+log.info("✓ helpers loaded (FINAL-FIXED)")
