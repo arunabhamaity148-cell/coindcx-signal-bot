@@ -365,3 +365,8 @@ class Exchange:
 async def cleanup():
     await redis_close()
     log.info("✓ Cleanup complete")
+
+# ---------- alias for main.py ----------
+async def calculate_advanced_score(sym, strategy):
+    return await calculate_advanced_score(sym, strategy)
+
