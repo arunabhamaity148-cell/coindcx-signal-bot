@@ -45,11 +45,48 @@ async def redis_close():
 
 # ---------- dynamic exchange loader ----------
 def get_exchange(**kwargs):
-    """Return ccxt.coincdcx instance (dynamic)."""
+    """Return ccxt.coincdcx instance if exists, else manual REST fallback."""
     exchange_class = getattr(ccxt, 'coincdcx', None)
-    if not exchange_class:
-        raise RuntimeError("ccxt has no 'coincdcx' exchange")
-    return exchange_class({**kwargs, "enableRateLimit": True, "timeout": 30000})
+    if exchange_class:
+        return exchange_class({**kwargs, "enableRateLimit": True, "timeout": 30000})
+    # Fallback: generic Exchange with CoinDCX endpoints
+    return ccxt.Exchange({
+        "id": "coincdcx",
+        "name": "CoinCDCX",
+        "countries": ["IN"],
+        "urls": {
+            "api": {
+                "public": "https://api.coindcx.com/exchange/v1",
+                "private": "https://api.coindcx.com/exchange/v1",
+            },
+            "www": "https://coindcx.com",
+            "doc": "https://docs.coindcx.com",
+        },
+        "api": {
+            "public": {
+                "get": [
+                    "markets",
+                    "tickers",
+                    "orderbook",
+                    "trades",
+                ],
+            },
+            "private": {
+                "get": [
+                    "orders",
+                    "balances",
+                ],
+                "post": [
+                    "order/new",
+                    "order/cancel",
+                ],
+            },
+        },
+        "markets": None,  # will be loaded on first call
+        **kwargs,
+        "enableRateLimit": True,
+        "timeout": 30000,
+    })
 
 class WS:
     def __init__(self):
