@@ -119,7 +119,7 @@ async def bot_loop():
                                     f"3️⃣ Set SL @ <code>{sl:,.2f}</code>\n"
                                     f"4️⃣ Exit <b>{tp1_exit_pct:.0f}%</b> @ TP1: <code>{tp1:,.2f}</code>\n"
                                     f"5️⃣ Exit remaining @ TP2: <code>{tp2:,.2f}</code>\n\n"
-                                    f"⏰ <b>Strategy:</b> {strategy} scalp\n"
+                                    f"⏰ <b>Strategy:</b> {strategy} scalp<b>Strategy:</b> {strategy} scalp\n"
                                     f"🕐 <b>Signal time:</b> {datetime.utcnow().strftime('%H:%M UTC')}\n"
                                     f"🔄 <b>Cooldown:</b> {CFG['cooldown_min']} min"
                                 )
