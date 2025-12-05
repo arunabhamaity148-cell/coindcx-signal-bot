@@ -6,15 +6,16 @@ from fastapi import FastAPI
 from helpers import (
     CFG, STRATEGY_CONFIG, redis, filtered_pairs,
     calculate_advanced_score, calc_tp_sl, iceberg_size,
-    send_telegram, get_exchange
+    send_telegram, get_exchange, log_block, suggest_leverage
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
 
-# --------------------  COOLDOWN  --------------------
+# ---------- COOLDOWN ----------
 cooldown_map = {}
-ACTIVE_ORDERS = {}
+ACTIVE_ORDERS = {}; OPEN_CNT = {"QUICK": 0, "MID": 0, "TREND": 0}
+MAX_CON = 3
 
 def cooldown_ok(sym: str, strategy: str) -> bool:
     key = f"{sym}:{strategy}"
@@ -26,7 +27,7 @@ def cooldown_ok(sym: str, strategy: str) -> bool:
 def set_cooldown(sym: str, strategy: str):
     cooldown_map[f"{sym}:{strategy}"] = datetime.utcnow()
 
-# --------------------  WS POLLING  --------------------
+# ---------- WS POLLING ----------
 async def ws_polling():
     log.info("🔌 WS polling started (CoinDCX REST 1s)")
     ex = get_exchange({"enableRateLimit": True})
@@ -62,39 +63,64 @@ async def ws_polling():
             log.error(f"WS loop crash: {e}")
             await asyncio.sleep(3)
 
-# --------------------  BOT LOOP  --------------------
+# ---------- BOT LOOP ----------
 async def bot_loop():
-    await send_telegram("🚀 <b>Bot LIVE</b> – CoinDCX real data – News-Guard ON – max 30 pair")
+    await send_telegram("🚀 <b>Premium Signal Bot LIVE</b>\n✅ Scanning 80 coins | Manual trade mode")
     await asyncio.sleep(3)
     while True:
         try:
             pairs = await filtered_pairs()
             for sym in pairs:
                 for strat in STRATEGY_CONFIG.keys():
-                    if not cooldown_ok(sym, strat): continue
-                    sig = await calculate_advanced_score(sym, strat)
-                    if not sig or sig["side"] == "none": continue
-                    side, last, score = sig["side"], sig["last"], sig["score"]
-                    tp1, tp2, sl, lev, liq, liq_dist = await calc_tp_sl(sym, side, last, strat)
-                    if liq_dist < 0.7:
-                        await send_telegram(f"⚠️ <b>LiqClose</b> {sym} {strat} {side} dist={liq_dist:.2f}%")
+                    if not cooldown_ok(sym, strat):
+                        log_block(sym, strat, "cooldown-active")
                         continue
-                    ice = iceberg_size(CFG["equity"], last, sl, lev)
-                    if ice["total"] <= 0: continue
+                    sig = await calculate_advanced_score(sym, strat)
+                    if not sig:
+                        log_block(sym, strat, "no-signal")
+                        continue
+                    if sig.get("side") == "none":
+                        log_block(sym, strat, "below-thresh")
+                        continue
+                    side, last, score, done = sig["side"], sig["last"], sig["score"], sig.get("done", "")
+                    tp1, tp2, sl, lev, liq, liq_dist = await calc_tp_sl(sym, side, last, strat)
+
+                    # concurrent limit
+                    if OPEN_CNT[strat] >= MAX_CON:
+                        log_block(sym, strat, "max-concurrent")
+                        continue
+
+                    # win chance est.
+                    win_chance = min(65 + int(score * 3), 85)
+
+                    iceberg = iceberg_size(CFG["equity"], last, sl, lev)
+                    if iceberg["total"] <= 0:
+                        log_block(sym, strat, "tiny-position")
+                        continue
+
+                    OPEN_CNT[strat] += 1
                     ACTIVE_ORDERS[f"{sym}:{strat}"] = {"entry": last, "sl": sl, "side": side, "tp1_hit": False}
-                    msg = (f"🎯 <b>[{strat}] {sym} {side.upper()}</b>\n"
-                           f"Entry: <code>{last:.8f}</code>\n"
-                           f"TP1: <code>{tp1:.8f}</code>\n"
-                           f"TP2: <code>{tp2:.8f}</code>\n"
-                           f"SL: <code>{sl:.8f}</code>\n"
-                           f"Leverage: <b>{lev}x</b>\n"
-                           f"Score: {score:.2f}\n"
-                           f"LiqPrice: <code>{liq:.8f}</code>\n"
-                           f"LiqDist: {liq_dist:.2f}%\n"
-                           f"💰 Iceberg: {ice['orders']}×{ice['each']:.6f}\n\n"
-                           f"📌 Steps:\n1) Set Lev {lev}x\n2) Place {ice['orders']} limit @ {last:.8f}\n3) SL {sl:.8f}\n4) Exit {STRATEGY_CONFIG[strat]['tp1_exit']}× at TP1\n5) Full exit TP2")
+
+                    msg = (
+                        f"🎯 <b>[{strat}] {sym} {side.upper()}</b>\n"
+                        f"💠 Entry: <code>{last:.8f}</code>\n"
+                        f"🔸 TP1: <code>{tp1:.8f}</code> (60 %)\n"
+                        f"🔸 TP2: <code>{tp2:.8f}</code> (40 %)\n"
+                        f"🛑 SL: <code>{sl:.8f}</code>\n"
+                        f"⚡ Leverage: <b>{lev}x</b> (Liq-dist {liq_dist:.1f} %)\n"
+                        f"📊 Score: {score:.1f} | Win-chance: ~{win_chance} %\n"
+                        f"✅ Done: {done}\n"
+                        f"💰 Iceberg: {iceberg['orders']}×{iceberg['each']:.6f} (total {iceberg['total']:.6f})\n\n"
+                        f"📌 Manual Steps:\n"
+                        f"1) Set Leverage {lev}x\n"
+                        f"2) Place {iceberg['orders']} limit @ {last:.8f}\n"
+                        f"3) Set SL {sl:.8f}\n"
+                        f"4) 60 % exit @ TP1\n"
+                        f"5) 40 % exit @ TP2\n\n"
+                        f"🧮 <i>Risk ≈ {CFG['risk_perc']} % of equity</i>"
+                    )
                     await send_telegram(msg)
-                    log.info(f"✔ SIGNAL SENT {sym} {strat} {side} score={score:.2f}")
+                    log.info(f"✔ SIGNAL SENT {sym} {strat} {side} score={score:.1f}")
                     set_cooldown(sym, strat)
                     await asyncio.sleep(0.6)
             await asyncio.sleep(1)
@@ -103,7 +129,7 @@ async def bot_loop():
             log.error(f"bot-loop crash: {e}")
             await asyncio.sleep(5)
 
-# --------------------  TRAILING SL  --------------------
+# ---------- TRAILING SL ----------
 async def trailing_task():
     while True:
         try:
@@ -118,12 +144,13 @@ async def trailing_task():
                         ACTIVE_ORDERS[key]["tp1_hit"] = True; new_sl = entry * (1 - 0.001) if side == "long" else entry * (1 + 0.001)
                         ACTIVE_ORDERS[key]["sl"] = new_sl
                         await send_telegram(f"✅ TP1 hit {sym} {strat} → SL trailed to entry")
+                        OPEN_CNT[strat] -= 1
             await asyncio.sleep(60)
         except: await asyncio.sleep(60)
 
-# --------------------  KEEP-ALIVE  --------------------
+# ---------- KEEP-ALIVE ----------
 async def keep_alive():
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", "8080"))
     url = f"http://0.0.0.0:{port}/health"
     while True:
         try:
@@ -133,13 +160,13 @@ async def keep_alive():
         except: pass
         await asyncio.sleep(60)
 
-# --------------------  FASTAPI  --------------------
+# ---------- FASTAPI ----------
 ws_task = bot_task = trail_task = ping_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task, bot_task, trail_task, ping_task
-    log.info("🚀 App starting – launching WS & Bot")
+    log.info("🚀 App starting – Premium mode")
     ws_task   = asyncio.create_task(ws_polling())
     await asyncio.sleep(2)
     bot_task  = asyncio.create_task(bot_loop())
@@ -151,7 +178,6 @@ async def lifespan(app: FastAPI):
         for t in [ws_task, bot_task, trail_task, ping_task]:
             if t: t.cancel()
         await asyncio.gather(*[t for t in [ws_task, bot_task, trail_task, ping_task] if t], return_exceptions=True)
-        log.info("Shutdown done")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -168,6 +194,6 @@ def health():
         "bot_running": bot_task is not None and not bot_task.done()
     }
 
-# --------------------  RUN  --------------------
+# ---------- RUN ----------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
