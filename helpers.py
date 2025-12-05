@@ -366,9 +366,9 @@ async def cleanup():
     await redis_close()
     log.info("✓ Cleanup complete")
 
-# ---------- alias for main.py ----------
-from . import calculate_advanced_score as calc_advanced_score   # top-level import
+# ---------- alias (no relative import) ----------
 async def calculate_advanced_score(sym, strategy):
-    return await calc_advanced_score(sym, strategy)            # ✅ no recursion
+    # call the real function (already defined above)
+    return await calc_advanced_score(sym, strategy)
 
 
