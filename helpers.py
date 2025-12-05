@@ -1,5 +1,5 @@
 # ============================================================
-# helpers.py — Binance Data + Redis Engine (Error Safe)
+# helpers.py — Optimized (Uses in-memory buffer)
 # ============================================================
 
 import os
@@ -39,31 +39,44 @@ PAIRS = [
 ]
 
 
-async def fetch_trades(sym: str) -> list:
+async def fetch_trades(sym: str, buffer_dict: dict = None) -> list:
+    """
+    Fetch trades from in-memory buffer first, fallback to Redis
+    
+    Args:
+        sym: Symbol name
+        buffer_dict: Reference to main.TRADE_BUFFER
+    """
     try:
+        # Use in-memory buffer if available
+        if buffer_dict and sym in buffer_dict:
+            trades = list(buffer_dict[sym])
+            if len(trades) >= 20:
+                return trades
+        
+        # Fallback to Redis
         data = await redis.lrange(f"tr:{sym}", 0, 500)
         if not data:
             return []
-        
+
         trades = []
         for item in data:
             try:
                 trade = json.loads(item)
-                # Validate structure
                 if all(k in trade for k in ["p", "q", "m", "t"]):
                     trades.append(trade)
             except:
                 continue
-        
+
         return trades
     except Exception as e:
         log.error(f"Fetch trades error for {sym}: {e}")
         return []
 
 
-async def build_ohlcv_from_trades(sym: str, interval: str, limit: int = 200):
+async def build_ohlcv_from_trades(sym: str, interval: str, limit: int = 200, buffer_dict: dict = None):
     try:
-        trades = await fetch_trades(sym)
+        trades = await fetch_trades(sym, buffer_dict)
         if len(trades) < 20:
             return None
 
@@ -110,9 +123,9 @@ def calc_atr(df: pd.DataFrame, period: int = 14):
     return tr.rolling(period).mean().iloc[-1]
 
 
-async def calc_vwap_from_trades(sym: str):
+async def calc_vwap_from_trades(sym: str, buffer_dict: dict = None):
     try:
-        trades = await fetch_trades(sym)
+        trades = await fetch_trades(sym, buffer_dict)
         if not trades:
             return None
 
@@ -129,9 +142,9 @@ async def calc_vwap_from_trades(sym: str):
         return None
 
 
-async def orderflow_metrics(sym: str):
+async def orderflow_metrics(sym: str, buffer_dict: dict = None, ob_cache: dict = None):
     try:
-        trades = await fetch_trades(sym)
+        trades = await fetch_trades(sym, buffer_dict)
         if not trades:
             return None
 
@@ -144,20 +157,29 @@ async def orderflow_metrics(sym: str):
         total_delta = df["delta"].sum()
         recent_delta = df["delta"].tail(40).sum()
 
-        try:
-            ob_raw = await redis.get(f"ob:{sym}")
-            if ob_raw:
-                ob = json.loads(ob_raw)
-                bid = float(ob["bid"])
-                ask = float(ob["ask"])
-                spread_pct = (ask - bid) / bid * 100
-                depth_usd = (bid + ask) * 50
-            else:
+        # Try in-memory cache first
+        if ob_cache and sym in ob_cache:
+            ob = ob_cache[sym]
+            bid = float(ob["bid"])
+            ask = float(ob["ask"])
+            spread_pct = (ask - bid) / bid * 100
+            depth_usd = (bid + ask) * 50
+        else:
+            # Fallback to Redis
+            try:
+                ob_raw = await redis.get(f"ob:{sym}")
+                if ob_raw:
+                    ob = json.loads(ob_raw)
+                    bid = float(ob["bid"])
+                    ask = float(ob["ask"])
+                    spread_pct = (ask - bid) / bid * 100
+                    depth_usd = (bid + ask) * 50
+                else:
+                    spread_pct = 0.15
+                    depth_usd = 20000
+            except:
                 spread_pct = 0.15
                 depth_usd = 20000
-        except:
-            spread_pct = 0.15
-            depth_usd = 20000
 
         return {
             "delta": float(total_delta),
@@ -171,9 +193,9 @@ async def orderflow_metrics(sym: str):
         return None
 
 
-async def btc_calm_check(threshold=0.35):
+async def btc_calm_check(threshold=0.35, buffer_dict: dict = None):
     try:
-        trades = await fetch_trades("BTCUSDT")
+        trades = await fetch_trades("BTCUSDT", buffer_dict)
         if len(trades) < 20:
             return True
 
@@ -187,8 +209,13 @@ async def btc_calm_check(threshold=0.35):
         return True
 
 
-async def get_last_price(sym: str):
+async def get_last_price(sym: str, ticker_cache: dict = None):
     try:
+        # Try in-memory cache first
+        if ticker_cache and sym in ticker_cache:
+            return float(ticker_cache[sym]["last"])
+        
+        # Fallback to Redis
         tk = await redis.get(f"tk:{sym}")
         if not tk:
             return None
