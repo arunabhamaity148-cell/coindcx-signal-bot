@@ -1,5 +1,5 @@
 # ================================================================
-# main.py — OPTIMIZED (Redis Usage 95% Reduced)
+# main.py — OPTIMIZED (Redis Usage 95% Reduced)  -- UPDATED
 # ================================================================
 
 import os
@@ -18,6 +18,10 @@ import uvicorn
 
 from helpers import redis, PAIRS
 from scorer import compute_signal
+
+# NEW imports (non-destructive)
+from telegram_formatter import TelegramFormatter
+from position_tracker import PositionTracker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
@@ -48,6 +52,9 @@ TICKER_CACHE = {}
 WRITE_BATCH_SIZE = 50  # Write to Redis every 50 trades
 write_counters = {sym: 0 for sym in PAIRS}
 
+# NEW: Formatter & PositionTracker instances
+formatter = TelegramFormatter()
+position_tracker = PositionTracker(storage_file=os.getenv("POSITION_FILE", "positions.json"))
 
 # -----------------------------------------------------------
 # TELEGRAM SENDER
@@ -90,11 +97,11 @@ async def push_trade(sym: str, data: dict):
         if write_counters[sym] >= WRITE_BATCH_SIZE:
             batch = list(TRADE_BUFFER[sym])[-WRITE_BATCH_SIZE:]
             batch_json = [json.dumps(t) for t in batch]
-            
+
             await redis.lpush(f"tr:{sym}", *batch_json)
             await redis.ltrim(f"tr:{sym}", 0, 499)
             await redis.expire(f"tr:{sym}", TRADES_TTL_SEC)
-            
+
             write_counters[sym] = 0
 
         global data_received
@@ -136,14 +143,14 @@ async def periodic_redis_sync():
     while True:
         try:
             await asyncio.sleep(5)
-            
+
             # Sync orderbooks (batch write)
             if OB_CACHE:
                 pipe = redis.pipeline()
                 for sym, data in OB_CACHE.items():
                     pipe.setex(f"ob:{sym}", 60, json.dumps(data))
                 await pipe.execute()
-            
+
             # Sync tickers (batch write)
             if TICKER_CACHE:
                 pipe = redis.pipeline()
@@ -277,7 +284,7 @@ def set_cooldown(sym, strat):
 
 
 # -----------------------------------------------------------
-# SIGNAL FORMATTER
+# SIGNAL FORMATTER (legacy quick format kept)
 # -----------------------------------------------------------
 def format_signal(sig):
     sym = sig["symbol"]
@@ -335,8 +342,23 @@ async def scanner():
             if results:
                 best = results[:3]
                 for sig in best:
-                    msg = format_signal(sig)
-                    await send_telegram(msg)
+                    # Use enhanced validation flag if present (enhance_signal sets "validated")
+                    validated = sig.get("validated", True)
+                    reason = sig.get("validation_reason", "")
+
+                    if not validated:
+                        log.info(f"✖ Signal filtered: {sig['symbol']} {sig['strategy']} -> {reason}")
+                        continue
+
+                    # Prefer full-feature Telegram message using formatter (levels, volume included)
+                    try:
+                        msg = formatter.format_signal_alert(sig, sig.get("levels"), sig.get("volume"))
+                        await send_telegram(msg)
+                    except Exception as e:
+                        log.error(f"Formatter error: {e}. Falling back to quick format.")
+                        await send_telegram(format_signal(sig))
+
+                    # Mark active order + set cooldown
                     ACTIVE_ORDERS[f"{sig['symbol']}:{sig['strategy']}"] = sig
                     set_cooldown(sig["symbol"], sig["strategy"])
                     log.info(f"✔️ SIGNAL: {sig['symbol']} {sig['strategy']} = {sig['score']:.1f}")
@@ -363,8 +385,16 @@ async def lifespan(app: FastAPI):
     log.info("🚀 Bot Starting (v2.2 - Optimized)")
     log.info(f"✓ {len(PAIRS)} pairs loaded")
 
+    # Start WS + sync
     ws_task = asyncio.create_task(start_all_ws())
     await asyncio.sleep(3)
+
+    # Load positions (if any)
+    try:
+        await position_tracker.load()
+        log.info("✅ Position tracker loaded")
+    except Exception as e:
+        log.warning(f"Position tracker load failed: {e}")
 
     scan_task = asyncio.create_task(scanner())
 
@@ -381,6 +411,13 @@ async def lifespan(app: FastAPI):
     except:
         pass
 
+    # Save positions on shutdown
+    try:
+        await position_tracker.save()
+        log.info("✅ Position tracker saved")
+    except Exception as e:
+        log.warning(f"Position tracker save failed: {e}")
+
     try:
         await redis.aclose()
     except:
@@ -395,7 +432,7 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 async def root():
     btc_trades = len(TRADE_BUFFER.get("BTCUSDT", []))
-    
+
     return {
         "status": "running",
         "ws_connected": ws_connected,
