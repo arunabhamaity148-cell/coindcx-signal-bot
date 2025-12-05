@@ -25,14 +25,6 @@ CFG = {
 
 STRATEGY_CONFIG = {
     "QUICK": {"min_score": 7.0, "max_score": 8.5, "tp1_mult": 1.2, "tp2_mult": 1.8, "sl_mult": 0.8, "min_conf": 60, "tp1_exit": 0.5},
-    "MID": {"min_score": 7.2, "max_score)),
-    "liq_buffer": float(os.getenv("LIQ_BUFFER", 0.15)),
-    "cooldown_min": int(os.getenv("COOLDOWN_MIN", 45)),
-    "pairs": json.loads(os.getenv("TOP_PAIRS", '["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]')),
-}
-
-STRATEGY_CONFIG = {
-    "QUICK": {"min_score": 7.0, "max_score": 8.5, "tp1_mult": 1.2, "tp2_mult": 1.8, "sl_mult": 0.8, "min_conf": 60, "tp1_exit": 0.5},
     "MID": {"min_score": 7.2, "max_score": 8.8, "tp1_mult": 1.5, "tp2_mult": 2.5, "sl_mult": 1.0, "min_conf": 65, "tp1_exit": 0.4},
     "TREND": {"min_score": 7.5, "max_score": 10.0, "tp1_mult": 2.0, "tp2_mult": 3.5, "sl_mult": 1.2, "min_conf": 70, "tp1_exit": 0.3}
 }
@@ -51,12 +43,10 @@ async def redis_close():
         await redis_client.close()
         redis_client = None
 
-# ---------- CoinDCX-only exchange ----------
 def get_exchange(**kwargs):
     cls = getattr(ccxt, 'coincdcx', None)
     if cls:
         return cls({**kwargs, "enableRateLimit": True, "timeout": 30000})
-    # fallback REST
     return ccxt.Exchange({
         "id": "coincdcx", "name": "CoinCDCX",
         "urls": {"api": {"public": "https://api.coindcx.com/exchange/v1", "private": "https://api.coindcx.com/exchange/v1"}},
@@ -95,7 +85,6 @@ class WS:
                 log.error(f"WS polling: {e}")
                 await asyncio.sleep(5)
 
-# ---------- OHLCV from CoinDCX trades ----------
 async def build_ohlcv_from_trades(sym, timeframe='1m', bars=100):
     r = await redis()
     trades_raw = await r.lrange(f"tr:{sym}", 0, bars * 70)
@@ -139,7 +128,7 @@ async def mtf_trend(sym):
         df = await get_ohlcv(sym, tf, 50)
         if df is None or len(df) < 50:
             continue
-               ema20 = df["c"].ewm(span=20).mean().iloc[-1]
+        ema20 = df["c"].ewm(span=20).mean().iloc[-1]
         ema50 = df["c"].ewm(span=50).mean().iloc[-1]
         trends.append(1 if ema20 > ema50 else -1)
     if not trends:
