@@ -1,5 +1,5 @@
 # ================================================================
-# main.py — OPTIMIZED (Redis Usage 95% Reduced)  -- FINAL
+# main.py — PART A (imports, config, safe redis helpers, pushers)
 # ================================================================
 
 import os
@@ -20,6 +20,7 @@ import uvicorn
 # async file IO (ensure aiofiles in requirements.txt)
 import aiofiles
 
+# local helpers
 from helpers import redis, PAIRS
 from scorer import compute_signal
 
@@ -79,6 +80,10 @@ os.makedirs(LOCAL_FALLBACK_DIR, exist_ok=True)
 _redis_rate_limited_until = 0.0
 _redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 60))  # exponential backoff start
 
+# Silent-failover state (short-circuit common redis-errors)
+_last_redis_error = 0.0
+_REDIS_ERROR_SKIP_SEC = int(os.getenv("REDIS_ERROR_SKIP_SEC", 60))
+
 
 # -----------------------------------------------------------
 # TELEGRAM SENDER
@@ -98,7 +103,7 @@ async def send_telegram(msg):
 
 
 # -----------------------------------------------------------
-# ⭐ OPTIMIZED DATA PUSHER (Batched Redis Writes) — rate-limit safe
+# ⭐ OPTIMIZED DATA PUSHER HELPERS (Silent failover wrappers)
 # -----------------------------------------------------------
 async def _persist_fallback(sym: str, items: list):
     """Persist a list of trades to local fallback file (jsonl)"""
@@ -113,8 +118,92 @@ async def _persist_fallback(sym: str, items: list):
         log.error(f"Fallback persist error for {sym}: {e}")
 
 
+async def safe_redis_lpush(key: str, items: list):
+    """
+    Safe LPUSH wrapper — silent failover for rate-limit.
+    items: list of python objects (will json.dumps each)
+    """
+    global _last_redis_error, _redis_rate_limited_until, _redis_backoff_seconds
+
+    # Short-circuit if we've recently seen a redis error (silent skip)
+    if time.time() - _last_redis_error < _REDIS_ERROR_SKIP_SEC:
+        return
+
+    # Also respect explicit rate-limited window
+    if time.time() < _redis_rate_limited_until:
+        return
+
+    try:
+        # Build pipeline and execute
+        pipe = redis.pipeline()
+        for it in items:
+            pipe.lpush(key, json.dumps(it))
+        await pipe.execute()
+    except Exception as e:
+        err = str(e).lower()
+        # Detect Upstash / rate-limit style messages
+        if "max requests limit" in err or "rate limit" in err or "too many requests" in err:
+            _last_redis_error = time.time()
+            _redis_rate_limited_until = time.time() + _redis_backoff_seconds
+            _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)
+            # persist locally but remain silent (no noisy logs)
+            await _persist_fallback(key.replace("tr:", "").replace("tr_", ""), items)
+            return
+        # For other errors, log once and persist fallback
+        log.warning(f"[REDIS] LPUSH failed: {e}")
+        _last_redis_error = time.time()
+        await _persist_fallback(key.replace("tr:", "").replace("tr_", ""), items)
+
+
+async def safe_redis_setex_batch(kv_map: dict, expire_sec: int = 60):
+    """
+    Safe setex pipeline for many keys.
+    kv_map: { key: json_serializable_value, ... }
+    """
+    global _last_redis_error, _redis_rate_limited_until, _redis_backoff_seconds
+
+    # Short-circuit if we've recently seen a redis error (silent skip)
+    if time.time() - _last_redis_error < _REDIS_ERROR_SKIP_SEC:
+        return
+
+    # Respect explicit rate-limited window
+    if time.time() < _redis_rate_limited_until:
+        return
+
+    try:
+        pipe = redis.pipeline()
+        for k, v in kv_map.items():
+            pipe.setex(k, expire_sec, json.dumps(v))
+        await pipe.execute()
+    except Exception as e:
+        err = str(e).lower()
+        if "max requests limit" in err or "rate limit" in err or "too many requests" in err:
+            _last_redis_error = time.time()
+            _redis_rate_limited_until = time.time() + _redis_backoff_seconds
+            _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)
+            # persist caches locally as fallback (best-effort)
+            try:
+                for k, v in kv_map.items():
+                    sym = k.split(":", 1)[-1]
+                    await _persist_fallback(sym, [v])
+            except Exception:
+                pass
+            return
+        log.warning(f"[REDIS] setex batch failed: {e}")
+        _last_redis_error = time.time()
+        try:
+            for k, v in kv_map.items():
+                sym = k.split(":", 1)[-1]
+                await _persist_fallback(sym, [v])
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------
+# ⭐ OPTIMIZED DATA PUSHER (Batched Redis Writes) — rate-limit safe
+# -----------------------------------------------------------
 async def push_trade(sym: str, data: dict):
-    """Store in memory first, batch write to Redis with rate-limit/backoff handling"""
+    """Store in memory first, batch write to Redis with silent failover"""
     global _redis_rate_limited_until, _redis_backoff_seconds, data_received
 
     try:
@@ -132,39 +221,26 @@ async def push_trade(sym: str, data: dict):
         TRADE_BUFFER[sym].append(trade)
         write_counters[sym] += 1
 
-        # If currently rate-limited, persist this trade to fallback and skip Redis
+        # If Redis sync globally disabled, persist locally and skip any Redis calls
+        if not ENABLE_REDIS_SYNC:
+            await _persist_fallback(sym, [trade])
+            write_counters[sym] = 0
+            data_received += 1
+            return
+
+        # If currently rate-limited (Upstash), persist and skip Redis
         if time.time() < _redis_rate_limited_until:
             await _persist_fallback(sym, [trade])
+            write_counters[sym] = 0
             data_received += 1
             return
 
         # Only write to Redis every WRITE_BATCH_SIZE trades
         if write_counters[sym] >= WRITE_BATCH_SIZE:
             batch = list(TRADE_BUFFER[sym])[-WRITE_BATCH_SIZE:]
-            batch_json = [json.dumps(t) for t in batch]
-
-            try:
-                await redis.lpush(f"tr:{sym}", *batch_json)
-                await redis.ltrim(f"tr:{sym}", 0, 499)
-                await redis.expire(f"tr:{sym}", TRADES_TTL_SEC)
-                # success — reset backoff
-                _redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 60))
-            except Exception as e:
-                err_str = str(e).lower()
-                log.error(f"Push trade error for {sym}: {e}")
-
-                # Detect Upstash max-requests/rate-limit textual hints
-                if "max requests limit" in err_str or "rate limit" in err_str or "too many requests" in err_str:
-                    # Set rate-limited window and backoff
-                    _redis_rate_limited_until = time.time() + _redis_backoff_seconds
-                    _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)  # cap 1 hour
-                    # persist batch to fallback for later ingestion
-                    await _persist_fallback(sym, batch)
-                else:
-                    # For other Redis errors, also persist batch to be safe
-                    await _persist_fallback(sym, batch)
-            finally:
-                write_counters[sym] = 0
+            # Use safe wrapper (silent on rate-limit)
+            await safe_redis_lpush(f"tr:{sym}", batch)
+            write_counters[sym] = 0
 
         data_received += 1
 
@@ -197,7 +273,7 @@ async def push_ticker(sym: str, last: float, vol: float, ts: int):
 
 
 # -----------------------------------------------------------
-# ⭐ PERIODIC REDIS SYNC (Every N seconds) - rate-limit aware
+# ⭐ PERIODIC REDIS SYNC (Every N seconds) - rate-limit aware & silent
 # -----------------------------------------------------------
 async def periodic_redis_sync():
     """Write orderbook & ticker cache to Redis periodically (rate-limit aware)"""
@@ -216,43 +292,29 @@ async def periodic_redis_sync():
                 log.debug("Skipping periodic_redis_sync due to Redis rate-limit (backoff active).")
                 continue
 
-            # Sync orderbooks (batch write)
+            # Sync orderbooks (batch write) using safe wrapper
             if OB_CACHE:
                 try:
-                    pipe = redis.pipeline()
-                    for sym, data in OB_CACHE.items():
-                        pipe.setex(f"ob:{sym}", 60, json.dumps(data))
-                    await pipe.execute()
+                    kv = {f"ob:{sym}": data for sym, data in OB_CACHE.items()}
+                    await safe_redis_setex_batch(kv, expire_sec=60)
                 except Exception as e:
-                    err = str(e).lower()
-                    log.error(f"OB sync redis error: {e}")
-                    if "max requests limit" in err or "rate limit" in err or "too many requests" in err:
-                        # enter backoff window
-                        _redis_rate_limited_until = time.time() + _redis_backoff_seconds
-                        _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)
-                        log.warning(f"Redis rate limit detected. Backing off for {_redis_backoff_seconds} seconds.")
-                    # keep going; next loop will skip if backoff set
+                    log.error(f"OB cache safe sync failed: {e}")
 
-            # Sync tickers (batch write)
+            # Sync tickers (batch write) using safe wrapper
             if TICKER_CACHE:
                 try:
-                    pipe = redis.pipeline()
-                    for sym, data in TICKER_CACHE.items():
-                        pipe.setex(f"tk:{sym}", 60, json.dumps(data))
-                    await pipe.execute()
+                    kv = {f"tk:{sym}": data for sym, data in TICKER_CACHE.items()}
+                    await safe_redis_setex_batch(kv, expire_sec=60)
                 except Exception as e:
-                    err = str(e).lower()
-                    log.error(f"Ticker sync redis error: {e}")
-                    if "max requests limit" in err or "rate limit" in err or "too many requests" in err:
-                        _redis_rate_limited_until = time.time() + _redis_backoff_seconds
-                        _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)
-                        log.warning(f"Redis rate limit detected. Backing off for {_redis_backoff_seconds} seconds.")
+                    log.error(f"Ticker cache safe sync failed: {e}")
 
         except asyncio.CancelledError:
             break
         except Exception as e:
             log.error(f"Sync loop unexpected error: {e}")
-
+# ================================================================
+# main.py — PART B (WS worker, scanner, FastAPI app & lifecycle)
+# ================================================================
 
 # -----------------------------------------------------------
 # WEBSOCKET WORKER
@@ -572,4 +634,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080))) 
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
