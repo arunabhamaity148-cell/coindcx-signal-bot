@@ -1,5 +1,5 @@
 # ================================================================
-# main.py — OPTIMIZED (Redis Usage 95% Reduced)  -- UPDATED (rate-limit safe)
+# main.py — OPTIMIZED (Redis Usage 95% Reduced)  -- UPDATED (DB integration)
 # ================================================================
 
 import os
@@ -26,6 +26,9 @@ from scorer import compute_signal
 # NEW imports (non-destructive)
 from telegram_formatter import TelegramFormatter
 from position_tracker import PositionTracker
+
+# DB imports (new)
+from db import init_db, save_signal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
@@ -59,6 +62,9 @@ write_counters = {sym: 0 for sym in PAIRS}
 # NEW: Formatter & PositionTracker instances
 formatter = TelegramFormatter()
 position_tracker = PositionTracker(storage_file=os.getenv("POSITION_FILE", "positions.json"))
+
+# DB connection placeholder
+db = None
 
 # -----------------------------------------------------------
 # Fallback & Rate-limit state (Upstash protection)
@@ -363,6 +369,7 @@ def format_signal(sig):
 # SCANNER
 # -----------------------------------------------------------
 async def scanner():
+    global db
     log.info("🔍 Scanner waiting for data...")
 
     await send_telegram("🚀 <b>Scanner Starting...</b>\n⏳ Waiting for data stream")
@@ -415,6 +422,13 @@ async def scanner():
                         log.error(f"Formatter error: {e}. Falling back to quick format.")
                         await send_telegram(format_signal(sig))
 
+                    # Save signal to DB (if available)
+                    try:
+                        if db:
+                            await save_signal(db, sig)
+                    except Exception as e:
+                        log.warning(f"DB save failed: {e}")
+
                     # Mark active order + set cooldown
                     ACTIVE_ORDERS[f"{sig['symbol']}:{sig['strategy']}"] = sig
                     set_cooldown(sig["symbol"], sig["strategy"])
@@ -437,7 +451,7 @@ ws_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scan_task, ws_task
+    global scan_task, ws_task, db
 
     log.info("🚀 Bot Starting (v2.2 - Optimized)")
     log.info(f"✓ {len(PAIRS)} pairs loaded")
@@ -452,6 +466,14 @@ async def lifespan(app: FastAPI):
         log.info("✅ Position tracker loaded")
     except Exception as e:
         log.warning(f"Position tracker load failed: {e}")
+
+    # Init DB connection
+    try:
+        db = await init_db()
+        log.info("✅ DB connected")
+    except Exception as e:
+        db = None
+        log.warning(f"DB connection failed: {e}")
 
     scan_task = asyncio.create_task(scanner())
 
@@ -474,6 +496,14 @@ async def lifespan(app: FastAPI):
         log.info("✅ Position tracker saved")
     except Exception as e:
         log.warning(f"Position tracker save failed: {e}")
+
+    # Close DB connection
+    try:
+        if db:
+            await db.close()
+            log.info("✅ DB closed")
+    except Exception as e:
+        log.warning(f"DB close failed: {e}")
 
     try:
         await redis.aclose()
