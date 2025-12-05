@@ -1,5 +1,5 @@
-# scorer.py – final clean
-import numpy as np, logging, asyncio
+# scorer.py – final clean (uses helpers with buffer and ob_cache)
+import numpy as np, logging
 from datetime import datetime
 from typing import Optional, Dict, Any, Deque
 from helpers import build_ohlcv_from_trades, calc_rsi, calc_atr, calc_vwap_from_trades, orderflow_metrics, btc_calm_check
@@ -63,10 +63,12 @@ async def compute_signal(
     trade_buffer: Dict[str, Deque[Dict[str, Any]]],
     ob_cache: Dict[str, Dict[str, float]]
 ) -> Optional[Dict[str, Any]]:
+    # BTC calm-check (uses buffer-first fetch inside helpers)
     if sym != "BTCUSDT":
-        if not await btc_calm_check(trade_buffer):
+        if not await btc_calm_check(buffer_dict=trade_buffer):
             return None
 
+    # Build MTF candles (buffer-aware)
     o1 = await build_ohlcv_from_trades(sym, "1min", 200, buffer_dict=trade_buffer)
     if o1 is None or len(o1) < 60:
         return None
@@ -76,8 +78,8 @@ async def compute_signal(
 
     mtf = _mtf(o1, o5, o15, o60)
     last = float(o1["close"].iloc[-1])
-    mom1 = (last - float(o1["close"].iloc[-2])) / last
-    mom5 = (last - float(o5["close"].iloc[-2])) / last if o5 is not None and len(o5) > 2 else 0.0
+    mom1 = (last - float(o1["close"].iloc[-2])) / (last + 1e-12)
+    mom5 = (last - float(o5["close"].iloc[-2])) / (last + 1e-12) if o5 is not None and len(o5) > 2 else 0.0
     rsi = float(calc_rsi(o1["close"]).iloc[-1])
     atr = float(calc_atr(o1))
     vwap = await calc_vwap_from_trades(sym, buffer_dict=trade_buffer)
