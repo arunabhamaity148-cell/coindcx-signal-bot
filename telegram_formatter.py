@@ -122,6 +122,10 @@ class TelegramFormatter:
                     target = sr["nearest_support"] * 1.002
                     msg += f"└ Target: <code>{target:.6f}</code>\n"
 
+        # If a chart/url is attached, display it
+        if signal.get("chart"):
+            msg += f"\n🖼 Chart: {signal['chart']}\n"
+
         msg += f"\n╚══════════════════════════════\n"
         msg += f"⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
         return msg
