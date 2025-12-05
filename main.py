@@ -1,5 +1,5 @@
-# main.py – v2.2-clean (silent + rate-limit safe)
-import os, json, asyncio, logging, time, traceback
+# main.py – v2.2-final (silent + rate-limit safe)
+import os, json, asyncio, logging, time
 from datetime import datetime
 from collections import deque
 from contextlib import asynccontextmanager
@@ -173,7 +173,7 @@ async def scanner():
             for sym in PAIRS:
                 for strat in ["QUICK", "MID", "TREND"]:
                     if not cooldown_ok(sym, strat): continue
-                    sig = await compute_signal(sym, strat)
+                    sig = await compute_signal(sym, strat, TRADE_BUF, OB_CACHE)   # ✅ FIXED
                     if sig and sig.get("validated", True):
                         msg = formatter.format_signal_alert(sig, sig.get("levels"), sig.get("volume"))
                         await tg_send(msg)
@@ -192,7 +192,7 @@ scan_task, ws_task = None, None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scan_task, ws_task, db
-    log.info("🚀 v2.2-clean starting")
+    log.info("🚀 v2.2-final starting")
     ws_task = asyncio.create_task(start_ws())
     await asyncio.sleep(3)
     await pos_track.load()
