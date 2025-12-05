@@ -367,6 +367,8 @@ async def cleanup():
     log.info("✓ Cleanup complete")
 
 # ---------- alias for main.py ----------
+from . import calculate_advanced_score as calc_advanced_score   # top-level import
 async def calculate_advanced_score(sym, strategy):
-    return await calculate_advanced_score(sym, strategy)
+    return await calc_advanced_score(sym, strategy)            # ✅ no recursion
+
 
