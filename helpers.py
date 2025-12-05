@@ -1,7 +1,8 @@
 # ============================================================
-# helpers.py — Binance Data + Redis Engine (FINAL v1.0)
+# helpers.py — Binance Data + Redis Engine (Railway Fixed)
 # ============================================================
 
+import os
 import json
 import numpy as np
 import pandas as pd
@@ -9,11 +10,16 @@ from redis.asyncio import Redis
 from datetime import datetime
 
 # ------------------------------
-# Redis Connection
+# Redis Connection (Railway Compatible)
 # ------------------------------
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
 redis = Redis.from_url(
-    "redis://default:redispw@localhost:6379",
-    decode_responses=True
+    REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=5,
+    socket_keepalive=True,
+    health_check_interval=30
 )
 
 # ------------------------------
@@ -33,10 +39,13 @@ PAIRS = [
 # Fetch trades from Redis
 # ------------------------------
 async def fetch_trades(sym: str) -> list:
-    data = await redis.lrange(f"tr:{sym}", 0, 500)
-    if not data:
+    try:
+        data = await redis.lrange(f"tr:{sym}", 0, 500)
+        if not data:
+            return []
+        return [json.loads(x) for x in data]
+    except Exception as e:
         return []
-    return [json.loads(x) for x in data]
 
 
 # -----------------------------------------------------------
@@ -104,7 +113,7 @@ async def calc_vwap_from_trades(sym: str):
     df = pd.DataFrame(trades)
     df["p"] = df["p"].astype(float)
     df["q"] = df["q"].astype(float)
-    
+
     total_pv = (df["p"] * df["q"]).sum()
     total_vol = df["q"].sum() + 1e-9
 
@@ -124,20 +133,22 @@ async def orderflow_metrics(sym: str):
     df["q"] = df["q"].astype(float)
     df["side"] = np.where(df["m"], -1, 1)
 
-    # delta & imbalance
     df["delta"] = df["q"] * df["side"]
     total_delta = df["delta"].sum()
     recent_delta = df["delta"].tail(40).sum()
 
-    # depth (from orderbook)
-    ob_raw = await redis.get(f"ob:{sym}")
-    if ob_raw:
-        ob = json.loads(ob_raw)
-        bid = float(ob["bid"])
-        ask = float(ob["ask"])
-        spread_pct = (ask - bid) / bid * 100
-        depth_usd = (bid + ask) * 50  # approximate
-    else:
+    try:
+        ob_raw = await redis.get(f"ob:{sym}")
+        if ob_raw:
+            ob = json.loads(ob_raw)
+            bid = float(ob["bid"])
+            ask = float(ob["ask"])
+            spread_pct = (ask - bid) / bid * 100
+            depth_usd = (bid + ask) * 50
+        else:
+            spread_pct = 0.15
+            depth_usd = 20000
+    except:
         spread_pct = 0.15
         depth_usd = 20000
 
@@ -170,8 +181,11 @@ async def btc_calm_check(threshold=0.35):
 # TICKER FETCH (LTP)
 # -----------------------------------------------------------
 async def get_last_price(sym: str):
-    tk = await redis.get(f"tk:{sym}")
-    if not tk:
+    try:
+        tk = await redis.get(f"tk:{sym}")
+        if not tk:
+            return None
+        data = json.loads(tk)
+        return float(data["last"])
+    except:
         return None
-    data = json.loads(tk)
-    return float(data["last"])
