@@ -20,7 +20,7 @@ CFG = {
     "max_lev": int(os.getenv("MAX_LEV", 30)),
     "liq_buffer": float(os.getenv("LIQ_BUFFER", 0.15)),
     "cooldown_min": int(os.getenv("COOLDOWN_MIN", 45)),
-    "pairs": json.loads(os.getenv("TOP_PAIRS", '''["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","MATICUSDT","DOTUSDT","AVAXUSDT","LINKUSDT","ATOMUSDT","LTCUSDT","UNIUSDT","ETCUSDT","FILUSDT","TRXUSDT","NEARUSDT","ARBUSDT","APTUSDT","INJUSDT","STXUSDT","TIAUSDT","SEIUSDT","OPUSDT","SUIUSDT","FETUSDT","RENDERUSDT","IMXUSDT","RUNEUSDT","XLMUSDT","ALGOUSDT","SANDUSDT","ICPUSDT","GRTUSDT","AAVEUSDT","LDOUSDT","HBARUSDT","FTMUSDT","VETUSDT","MANAUSDT","AXSUSDT","THETAUSDT","FLOWUSDT","SNXUSDT","CHZUSDT","ENJUSDT","MKRUSDT","COMPUSDT","KSMUSDT","XTZUSDT","ZECUSDT","DASHUSDT","BATUSDT","ZILUSDT","ONTUSDT","IOSTUSDT","IOTAUSDT","QTUMUSDT","WAVESUSDT","ZRXUSDT","OMGUSDT","CRVUSDT","YFIUSDT","BALUSDT","1INCHUSDT","RLCUSDT","KAVAUSDT","SUSHIUSDT","OCEANUSDT","RSRUSDT","CELOUSDT","BANDUSDT","STORJUSDT","CELRUSDT","SKLUSDT","ANKRUSDT","BLZUSDT","ARPAUSDT","NMRUSDT"]'''))
+    "pairs": json.loads(os.getenv("TOP_PAIRS", '["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","MATICUSDT","DOTUSDT","AVAXUSDT","LINKUSDT","ATOMUSDT","LTCUSDT","UNIUSDT","ETCUSDT","FILUSDT","TRXUSDT","NEARUSDT","ARBUSDT","APTUSDT","INJUSDT","STXUSDT","TIAUSDT","SEIUSDT","OPUSDT","SUIUSDT","FETUSDT","RENDERUSDT","IMXUSDT","RUNEUSDT","XLMUSDT","ALGOUSDT","SANDUSDT","ICPUSDT","GRTUSDT","AAVEUSDT","LDOUSDT","HBARUSDT","FTMUSDT","VETUSDT","MANAUSDT","AXSUSDT","THETAUSDT","FLOWUSDT","SNXUSDT","CHZUSDT","ENJUSDT","MKRUSDT","COMPUSDT","KSMUSDT","XTZUSDT","ZECUSDT","DASHUSDT","BATUSDT","ZILUSDT","ONTUSDT","IOSTUSDT","IOTAUSDT","QTUMUSDT","WAVESUSDT","ZRXUSDT","OMGUSDT","CRVUSDT","YFIUSDT","BALUSDT","1INCHUSDT","RLCUSDT","KAVAUSDT","SUSHIUSDT","OCEANUSDT","RSRUSDT","CELOUSDT","BANDUSDT","STORJUSDT","CELRUSDT","SKLUSDT","ANKRUSDT","BLZUSDT","ARPAUSDT","NMRUSDT"]')),
 }
 
 STRATEGY_CONFIG = {
@@ -148,12 +148,6 @@ async def regime(sym):
         return "NORMAL"
 
 FEATURE_COLS = ["rsi_1m", "rsi_5m", "macd_hist", "mom_1m", "mom_5m", "vol_ratio", "atr_1m", "atr_5m", "delta_norm", "delta_momentum", "imbalance", "large_buys", "large_sells", "spread", "depth", "mtf_trend", "reg_trend", "reg_chop", "funding", "poc_dist"]
-
-async def extract_features(sym):
-    try:
-        df_1m = await get_ohlcv(sym, "1m", 100)
-        df_5m = await get_ohlcv(sym, "5m", 100)
-        if df_1m is None or len(df_1m) < 50: "large_sells", "spread", "depth", "mtf_trend", "reg_trend", "reg_chop", "funding", "poc_dist"]
 
 async def extract_features(sym):
     try:
