@@ -43,10 +43,18 @@ async def redis_close():
         await redis_client.close()
         redis_client = None
 
+# ---------- dynamic exchange loader ----------
+def get_exchange(**kwargs):
+    """Return ccxt.coincdcx instance (dynamic)."""
+    exchange_class = getattr(ccxt, 'coincdcx', None)
+    if not exchange_class:
+        raise RuntimeError("ccxt has no 'coincdcx' exchange")
+    return exchange_class({**kwargs, "enableRateLimit": True, "timeout": 30000})
+
 class WS:
     def __init__(self):
         self.running = False
-        self.ex = ccxt.coincdcx({"enableRateLimit": True})
+        self.ex = get_exchange()
     async def run(self):
         self.running = True
         log.info("🔌 Starting CoinDCX data polling...")
@@ -76,7 +84,7 @@ class WS:
 
 async def get_ohlcv(sym, tf="5m", limit=100):
     try:
-        ex = ccxt.coincdcx({"enableRateLimit": True})
+        ex = get_exchange()
         ohlcv = await ex.fetch_ohlcv(sym, tf, limit=limit)
         await ex.close()
         df = pd.DataFrame(ohlcv, columns=["t", "o", "h", "l", "c", "v"])
@@ -350,7 +358,7 @@ async def send_telegram(txt):
 
 class Exchange:
     def __init__(self):
-        self.ex = ccxt.coincdcx({"apiKey": CFG["key"], "secret": CFG["secret"], "options": {"defaultType": "swap"}, "enableRateLimit": True, "timeout": 30000})
+        self.ex = get_exchange(apiKey=CFG["key"], secret=CFG["secret"], options={"defaultType": "swap"})
         log.info("✓ CoinDCX initialized (manual trading mode)")
     async def close(self):
         await self.ex.close()
