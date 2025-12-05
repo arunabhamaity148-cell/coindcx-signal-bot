@@ -1,5 +1,5 @@
 # ================================================================
-# scorer.py — Hybrid Scorer v10 (BTC Calm + MTF + 47 Logic System)
+# scorer.py — Optimized (Uses in-memory buffers)
 # ================================================================
 
 import numpy as np
@@ -24,9 +24,6 @@ STRAT_MIN = {
 }
 
 
-# --------------------------------------------------------------
-# Compute MTF EMA structure (1m/5m/15m/60m)
-# --------------------------------------------------------------
 def compute_mtf(df1, df5, df15, df60):
     def ema_state(df):
         if df is None or len(df) < 60:
@@ -42,9 +39,6 @@ def compute_mtf(df1, df5, df15, df60):
     return {"bull": bull, "bear": bear}
 
 
-# --------------------------------------------------------------
-# 47 LOGIC EVALUATOR
-# --------------------------------------------------------------
 def evaluate_logic(params):
     L = {}
 
@@ -59,41 +53,38 @@ def evaluate_logic(params):
     mom5 = params["mom5"]
     mtf = params["mtf"]
 
-    # ========== Trend & MTF Logic ==========
+    # Trend & MTF Logic
     L["mtf_bull"] = 1 if mtf["bull"] >= 3 else 0
     L["mtf_bear"] = 1 if mtf["bear"] >= 3 else 0
     L["atr_stable"] = 1 if atr < (last * 0.002) else 0
     L["vwap_close"] = 1 if abs(last - vwap) / vwap < 0.002 else 0
 
-    # ========== Momentum Logic ==========
+    # Momentum Logic
     L["mom1"] = 1 if abs(mom1) > 0.0008 else 0
     L["mom5"] = 1 if abs(mom5) > 0.0015 else 0
     L["imbalance"] = 1 if abs(imb) > 0.05 else 0
     L["spread_ok"] = 1 if spread < 0.32 else 0
     L["depth_ok"] = 1 if depth > 30000 else 0
 
-    # ========== RSI Logic ==========
+    # RSI Logic
     L["rsi_mid"] = 1 if 45 <= rsi <= 55 else 0
     L["rsi_flip"] = 1 if (rsi > 50 and mom1 > 0) else 0
     L["rsi_div"] = 1 if (mom1 > 0 and rsi < 50) or (mom1 < 0 and rsi > 50) else 0
 
-    # ========== VWAP Logic ==========
+    # VWAP Logic
     L["vwap_small_dev"] = 1 if abs(last - vwap) / vwap < 0.0025 else 0
     L["vwap_momentum"] = 1 if (last > vwap and mom1 > 0) else 0
 
-    # ========== Orderflow Logic ==========
+    # Orderflow Logic
     L["imb_buy"] = 1 if imb > 0.05 else 0
     L["imb_sell"] = 1 if imb < -0.05 else 0
 
-    # ========== Volatility Logic ==========
+    # Volatility Logic
     L["low_atr"] = 1 if atr < last * 0.0018 else 0
 
     return L
 
 
-# --------------------------------------------------------------
-# Hybrid score aggregator
-# --------------------------------------------------------------
 def aggregate_score(logic_dict):
     score = 0
     for k, v in logic_dict.items():
@@ -101,34 +92,35 @@ def aggregate_score(logic_dict):
     return float(score)
 
 
-# --------------------------------------------------------------
-# Compute final signal for a symbol
-# --------------------------------------------------------------
 async def compute_signal(sym: str, strat: str):
-    # -------------------------
-    # BTC Calm mandatory
-    # -------------------------
+    """
+    Compute signal using in-memory buffers
+    
+    NOTE: This function needs to be called with buffers from main.py
+    Import TRADE_BUFFER, OB_CACHE from main when calling
+    """
+    
+    # Import buffers from main (will be set when main imports this)
+    from main import TRADE_BUFFER, OB_CACHE
+    
+    # BTC Calm check
     if sym != "BTCUSDT":
-        ok = await btc_calm_check()
+        ok = await btc_calm_check(buffer_dict=TRADE_BUFFER)
         if not ok:
             return None
 
-    # -------------------------
     # Build MTF OHLC
-    # -------------------------
-    o1 = await build_ohlcv_from_trades(sym, "1min", 200)
+    o1 = await build_ohlcv_from_trades(sym, "1min", 200, buffer_dict=TRADE_BUFFER)
     if o1 is None or len(o1) < 60:
         return None
 
-    o5 = await build_ohlcv_from_trades(sym, "5min", 200)
-    o15 = await build_ohlcv_from_trades(sym, "15min", 200)
-    o60 = await build_ohlcv_from_trades(sym, "60min", 200)
+    o5 = await build_ohlcv_from_trades(sym, "5min", 200, buffer_dict=TRADE_BUFFER)
+    o15 = await build_ohlcv_from_trades(sym, "15min", 200, buffer_dict=TRADE_BUFFER)
+    o60 = await build_ohlcv_from_trades(sym, "60min", 200, buffer_dict=TRADE_BUFFER)
 
     mtf = compute_mtf(o1, o5, o15, o60)
 
-    # -------------------------
     # Indicators
-    # -------------------------
     last = float(o1["close"].iloc[-1])
     mom1 = (last - float(o1["close"].iloc[-2])) / last
     mom5 = 0
@@ -138,11 +130,11 @@ async def compute_signal(sym: str, strat: str):
     rsi = float(calc_rsi(o1["close"]).iloc[-1])
     atr = float(calc_atr(o1))
 
-    vwap = await calc_vwap_from_trades(sym)
+    vwap = await calc_vwap_from_trades(sym, buffer_dict=TRADE_BUFFER)
     if vwap is None:
         return None
 
-    flow = await orderflow_metrics(sym)
+    flow = await orderflow_metrics(sym, buffer_dict=TRADE_BUFFER, ob_cache=OB_CACHE)
     if not flow:
         return None
 
@@ -159,9 +151,7 @@ async def compute_signal(sym: str, strat: str):
         "mtf": mtf,
     }
 
-    # -------------------------
     # 47 Logic Evaluation
-    # -------------------------
     L = evaluate_logic(params)
     score = aggregate_score(L)
 
