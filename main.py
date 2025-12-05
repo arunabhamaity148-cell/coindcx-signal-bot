@@ -1,637 +1,223 @@
-# ================================================================
-# main.py — PART A (imports, config, safe redis helpers, pushers)
-# ================================================================
-
-import os
-import json
-import asyncio
-import logging
-import traceback
-import time
+# main.py – v2.2-clean (silent + rate-limit safe)
+import os, json, asyncio, logging, time, traceback
 from datetime import datetime
-from contextlib import asynccontextmanager
 from collections import deque
-
-import aiohttp
-import websockets
+from contextlib import asynccontextmanager
+import aiohttp, websockets, uvicorn
 from fastapi import FastAPI
-import uvicorn
-
-# async file IO (ensure aiofiles in requirements.txt)
 import aiofiles
-
-# local helpers
 from helpers import redis, PAIRS
 from scorer import compute_signal
-
-# NEW imports (non-destructive)
 from telegram_formatter import TelegramFormatter
 from position_tracker import PositionTracker
-
-# DB imports (new)
 from db import init_db, save_signal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
 
-# -----------------------------------------------------------
-# ENV
-# -----------------------------------------------------------
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 20))
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", 30))
+# ---------- ENV ----------
+TG_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TG_CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
+SCAN_INT   = int(os.getenv("SCAN_INTERVAL", 20))
+COOLDOWN_M = int(os.getenv("COOLDOWN_MIN", 30))
+BATCH      = int(os.getenv("WRITE_BATCH_SIZE", 50))
+REDIS_SKIP = int(os.getenv("REDIS_ERROR_SKIP_SEC", 60))
+SYNC_INT   = int(os.getenv("PERIODIC_SYNC_INTERVAL", 15))
+ENABLE_SYNC= os.getenv("ENABLE_REDIS_SYNC", "true").lower() == "true"
 
-cooldown = {}
-ACTIVE_ORDERS = {}
+# ---------- STATE ----------
+cooldown, ACTIVE_ORDERS = {}, {}
+TRADE_BUF = {s: deque(maxlen=500) for s in PAIRS}
+OB_CACHE, TK_CACHE = {}, {}
+cntr, data_rx = {s: 0 for s in PAIRS}, 0
+_last_err = 0
 
-# WebSocket config
-BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream"
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 15))
-TRADES_TTL_SEC = int(os.getenv("TRADES_TTL_SEC", 1800))
-
-ws_connected = False
-data_received = 0
-
-# ⭐ IN-MEMORY BUFFERS (Reduces Redis writes by 95%)
-TRADE_BUFFER = {sym: deque(maxlen=500) for sym in PAIRS}
-OB_CACHE = {}
-TICKER_CACHE = {}
-WRITE_BATCH_SIZE = int(os.getenv("WRITE_BATCH_SIZE", 50))  # Write to Redis every N trades
-write_counters = {sym: 0 for sym in PAIRS}
-
-# PERIODIC SYNC / REDIS-SYNC CONTROLS
-PERIODIC_SYNC_INTERVAL = int(os.getenv("PERIODIC_SYNC_INTERVAL", 15))
-ENABLE_REDIS_SYNC = os.getenv("ENABLE_REDIS_SYNC", "true").lower() == "true"
-
-# NEW: Formatter & PositionTracker instances
+# ---------- HELPERS ----------
 formatter = TelegramFormatter()
-position_tracker = PositionTracker(storage_file=os.getenv("POSITION_FILE", "positions.json"))
-
-# DB connection placeholder
+pos_track = PositionTracker(storage_file=os.getenv("POSITION_FILE", "positions.json"))
 db = None
 
-# -----------------------------------------------------------
-# Fallback & Rate-limit state (Upstash protection)
-# -----------------------------------------------------------
-LOCAL_FALLBACK_DIR = os.getenv("FALLBACK_DIR", "/tmp/trade_fallback")
-os.makedirs(LOCAL_FALLBACK_DIR, exist_ok=True)
-
-_redis_rate_limited_until = 0.0
-_redis_backoff_seconds = int(os.getenv("REDIS_BACKOFF_START", 60))  # exponential backoff start
-
-# Silent-failover state (short-circuit common redis-errors)
-_last_redis_error = 0.0
-_REDIS_ERROR_SKIP_SEC = int(os.getenv("REDIS_ERROR_SKIP_SEC", 60))
-
-
-# -----------------------------------------------------------
-# TELEGRAM SENDER
-# -----------------------------------------------------------
-async def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-
+async def tg_send(text):
+    if not (TG_TOKEN and TG_CHAT): return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}
-
     try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(url, json=payload, timeout=10)
+        async with aiohttp.ClientSession() as s:
+            await s.post(url, json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
-        log.error(f"Telegram error: {e}")
+        log.error(f"TG: {e}")
 
-
-# -----------------------------------------------------------
-# ⭐ OPTIMIZED DATA PUSHER HELPERS (Silent failover wrappers)
-# -----------------------------------------------------------
-async def _persist_fallback(sym: str, items: list):
-    """Persist a list of trades to local fallback file (jsonl)"""
-    if not items:
-        return
-    filename = os.path.join(LOCAL_FALLBACK_DIR, f"{sym}_fallback.jsonl")
+# ---------- SILENT REDIS ----------
+async def _persist(sym, items):
+    fn = f"/tmp/trades/{sym}.jsonl"
+    os.makedirs("/tmp/trades", exist_ok=True)
     try:
-        async with aiofiles.open(filename, "a") as f:
-            for t in items:
-                await f.write(json.dumps(t) + "\n")
+        async with aiofiles.open(fn, "a") as f:
+            for i in items: await f.write(json.dumps(i) + "\n")
     except Exception as e:
-        log.error(f"Fallback persist error for {sym}: {e}")
+        log.error(f"fallback: {e}")
 
-
-async def safe_redis_lpush(key: str, items: list):
-    """
-    Safe LPUSH wrapper — silent failover for rate-limit.
-    items: list of python objects (will json.dumps each)
-    """
-    global _last_redis_error, _redis_rate_limited_until, _redis_backoff_seconds
-
-    # Short-circuit if we've recently seen a redis error (silent skip)
-    if time.time() - _last_redis_error < _REDIS_ERROR_SKIP_SEC:
-        return
-
-    # Also respect explicit rate-limited window
-    if time.time() < _redis_rate_limited_until:
-        return
-
-    try:
-        # Build pipeline and execute
-        pipe = redis.pipeline()
-        for it in items:
-            pipe.lpush(key, json.dumps(it))
-        await pipe.execute()
-    except Exception as e:
-        err = str(e).lower()
-        # Detect Upstash / rate-limit style messages
-        if "max requests limit" in err or "rate limit" in err or "too many requests" in err:
-            _last_redis_error = time.time()
-            _redis_rate_limited_until = time.time() + _redis_backoff_seconds
-            _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)
-            # persist locally but remain silent (no noisy logs)
-            await _persist_fallback(key.replace("tr:", "").replace("tr_", ""), items)
-            return
-        # For other errors, log once and persist fallback
-        log.warning(f"[REDIS] LPUSH failed: {e}")
-        _last_redis_error = time.time()
-        await _persist_fallback(key.replace("tr:", "").replace("tr_", ""), items)
-
-
-async def safe_redis_setex_batch(kv_map: dict, expire_sec: int = 60):
-    """
-    Safe setex pipeline for many keys.
-    kv_map: { key: json_serializable_value, ... }
-    """
-    global _last_redis_error, _redis_rate_limited_until, _redis_backoff_seconds
-
-    # Short-circuit if we've recently seen a redis error (silent skip)
-    if time.time() - _last_redis_error < _REDIS_ERROR_SKIP_SEC:
-        return
-
-    # Respect explicit rate-limited window
-    if time.time() < _redis_rate_limited_until:
-        return
-
+async def safe_lpush(key, items):
+    global _last_err
+    if time.time() - _last_err < REDIS_SKIP: return
     try:
         pipe = redis.pipeline()
-        for k, v in kv_map.items():
-            pipe.setex(k, expire_sec, json.dumps(v))
+        for i in items: pipe.lpush(key, json.dumps(i))
         await pipe.execute()
     except Exception as e:
-        err = str(e).lower()
-        if "max requests limit" in err or "rate limit" in err or "too many requests" in err:
-            _last_redis_error = time.time()
-            _redis_rate_limited_until = time.time() + _redis_backoff_seconds
-            _redis_backoff_seconds = min(_redis_backoff_seconds * 2, 3600)
-            # persist caches locally as fallback (best-effort)
-            try:
-                for k, v in kv_map.items():
-                    sym = k.split(":", 1)[-1]
-                    await _persist_fallback(sym, [v])
-            except Exception:
-                pass
-            return
-        log.warning(f"[REDIS] setex batch failed: {e}")
-        _last_redis_error = time.time()
-        try:
-            for k, v in kv_map.items():
-                sym = k.split(":", 1)[-1]
-                await _persist_fallback(sym, [v])
-        except Exception:
-            pass
+        if any(x in str(e).lower() for x in ["max requests", "rate limit"]):
+            _last_err = time.time()
+        await _persist(key.split(":")[-1], items)
 
-
-# -----------------------------------------------------------
-# ⭐ OPTIMIZED DATA PUSHER (Batched Redis Writes) — rate-limit safe
-# -----------------------------------------------------------
-async def push_trade(sym: str, data: dict):
-    """Store in memory first, batch write to Redis with silent failover"""
-    global _redis_rate_limited_until, _redis_backoff_seconds, data_received
-
+async def safe_setex(mapping, ttl=60):
+    global _last_err
+    if time.time() - _last_err < REDIS_SKIP: return
     try:
-        if not all(k in data for k in ["p", "q", "m", "t"]):
-            return
-
-        trade = {
-            "p": float(data["p"]),
-            "q": float(data["q"]),
-            "m": bool(data["m"]),
-            "t": int(data["t"])
-        }
-
-        # Store in memory
-        TRADE_BUFFER[sym].append(trade)
-        write_counters[sym] += 1
-
-        # If Redis sync globally disabled, persist locally and skip any Redis calls
-        if not ENABLE_REDIS_SYNC:
-            await _persist_fallback(sym, [trade])
-            write_counters[sym] = 0
-            data_received += 1
-            return
-
-        # If currently rate-limited (Upstash), persist and skip Redis
-        if time.time() < _redis_rate_limited_until:
-            await _persist_fallback(sym, [trade])
-            write_counters[sym] = 0
-            data_received += 1
-            return
-
-        # Only write to Redis every WRITE_BATCH_SIZE trades
-        if write_counters[sym] >= WRITE_BATCH_SIZE:
-            batch = list(TRADE_BUFFER[sym])[-WRITE_BATCH_SIZE:]
-            # Use safe wrapper (silent on rate-limit)
-            await safe_redis_lpush(f"tr:{sym}", batch)
-            write_counters[sym] = 0
-
-        data_received += 1
-
+        pipe = redis.pipeline()
+        for k, v in mapping.items(): pipe.setex(k, ttl, json.dumps(v))
+        await pipe.execute()
     except Exception as e:
-        log.error(f"Push trade error for {sym}: {e}")
+        if any(x in str(e).lower() for x in ["max requests", "rate limit"]):
+            _last_err = time.time()
 
+# ---------- DATA PUSH ----------
+async def push_trade(sym, data):
+    global data_rx
+    if not all(k in data for k in ["p", "q", "m", "t"]): return
+    TRADE_BUF[sym].append({"p": float(data["p"]), "q": float(data["q"]),
+                           "m": bool(data["m"]), "t": int(data["t"])})
+    cntr[sym] += 1
+    data_rx += 1
+    if cntr[sym] >= BATCH and ENABLE_SYNC:
+        batch = list(TRADE_BUF[sym])[-BATCH:]
+        await safe_lpush(f"tr:{sym}", batch)
+        cntr[sym] = 0
 
-async def push_orderbook(sym: str, bid: float, ask: float):
-    """Store in memory, write to Redis every periodic sync"""
-    try:
-        OB_CACHE[sym] = {
-            "bid": float(bid),
-            "ask": float(ask),
-            "t": int(datetime.utcnow().timestamp() * 1000)
-        }
-    except Exception as e:
-        log.error(f"OB cache error: {e}")
+async def push_ob(sym, bid, ask):
+    OB_CACHE[sym] = {"bid": float(bid), "ask": float(ask), "t": int(time.time()*1000)}
 
+async def push_tk(sym, last, vol, ts):
+    TK_CACHE[sym] = {"last": float(last), "vol": float(vol), "t": int(ts)}
 
-async def push_ticker(sym: str, last: float, vol: float, ts: int):
-    """Store in memory only"""
-    try:
-        TICKER_CACHE[sym] = {
-            "last": float(last),
-            "vol": float(vol),
-            "t": int(ts)
-        }
-    except Exception as e:
-        log.error(f"Ticker cache error: {e}")
+# ---------- PERIODIC SYNC ----------
+async def periodic_sync():
+    while True:
+        await asyncio.sleep(SYNC_INT)
+        if not ENABLE_SYNC: continue
+        if OB_CACHE: await safe_setex({f"ob:{k}": v for k, v in OB_CACHE.items()})
+        if TK_CACHE: await safe_setex({f"tk:{k}": v for k, v in TK_CACHE.items()})
 
+# ---------- WS ----------
+WS_URL = "wss://stream.binance.com:9443/stream"
+CHUNK  = int(os.getenv("CHUNK_SIZE", 15))
+ws_ok  = False
 
-# -----------------------------------------------------------
-# ⭐ PERIODIC REDIS SYNC (Every N seconds) - rate-limit aware & silent
-# -----------------------------------------------------------
-async def periodic_redis_sync():
-    """Write orderbook & ticker cache to Redis periodically (rate-limit aware)"""
-    global _redis_rate_limited_until, _redis_backoff_seconds
+def build_url(chunk):
+    s = "/".join([f"{p.lower()}@aggTrade" for p in chunk] +
+                 [f"{p.lower()}@bookTicker" for p in chunk])
+    if "BTCUSDT" in chunk: s += "/btcusdt@kline_1m"
+    return f"{WS_URL}?streams={s}"
 
+async def ws_worker(chunk, wid):
+    global ws_ok
+    url, backoff = build_url(chunk), 1
+    log.info(f"WS-{wid} start ({len(chunk)} pairs)")
     while True:
         try:
-            await asyncio.sleep(PERIODIC_SYNC_INTERVAL)
-
-            if not ENABLE_REDIS_SYNC:
-                # If disabled, skip sync (we have local fallback)
-                continue
-
-            # If currently rate-limited, skip sync
-            if time.time() < _redis_rate_limited_until:
-                log.debug("Skipping periodic_redis_sync due to Redis rate-limit (backoff active).")
-                continue
-
-            # Sync orderbooks (batch write) using safe wrapper
-            if OB_CACHE:
-                try:
-                    kv = {f"ob:{sym}": data for sym, data in OB_CACHE.items()}
-                    await safe_redis_setex_batch(kv, expire_sec=60)
-                except Exception as e:
-                    log.error(f"OB cache safe sync failed: {e}")
-
-            # Sync tickers (batch write) using safe wrapper
-            if TICKER_CACHE:
-                try:
-                    kv = {f"tk:{sym}": data for sym, data in TICKER_CACHE.items()}
-                    await safe_redis_setex_batch(kv, expire_sec=60)
-                except Exception as e:
-                    log.error(f"Ticker cache safe sync failed: {e}")
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            log.error(f"Sync loop unexpected error: {e}")
-# ================================================================
-# main.py — PART B (WS worker, scanner, FastAPI app & lifecycle)
-# ================================================================
-
-# -----------------------------------------------------------
-# WEBSOCKET WORKER
-# -----------------------------------------------------------
-def build_stream_url(pairs_chunk):
-    streams = []
-    for p in pairs_chunk:
-        p_low = p.lower()
-        streams.append(f"{p_low}@aggTrade")
-        streams.append(f"{p_low}@bookTicker")
-
-    if "BTCUSDT" in pairs_chunk:
-        streams.append("btcusdt@kline_1m")
-
-    stream_path = "/".join(streams)
-    return f"{BINANCE_WS_BASE}?streams={stream_path}"
-
-
-async def ws_worker(pairs_chunk, worker_id):
-    global ws_connected
-    url = build_stream_url(pairs_chunk)
-    backoff = 1
-
-    log.info(f"🔌 WS Worker {worker_id} starting for {len(pairs_chunk)} pairs")
-
-    while True:
-        try:
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=10
-            ) as ws:
-                backoff = 1
-                ws_connected = True
-                log.info(f"✅ WS Worker {worker_id} connected")
-
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                backoff, ws_ok = 1, True
                 async for msg in ws:
                     try:
-                        data = json.loads(msg)
-                        stream = data.get("stream", "")
-                        payload = data.get("data", {})
-
-                        # aggTrade
-                        if stream.endswith("@aggTrade"):
-                            sym = payload.get("s")
-                            if sym and sym in PAIRS:
-                                await push_trade(sym, {
-                                    "p": payload.get("p"),
-                                    "q": payload.get("q"),
-                                    "m": payload.get("m"),
-                                    "t": payload.get("T")
-                                })
-
-                        # bookTicker
-                        elif stream.endswith("@bookTicker"):
-                            sym = payload.get("s")
-                            if sym and sym in PAIRS:
-                                bid = float(payload.get("b", 0))
-                                ask = float(payload.get("a", 0))
-                                if bid > 0 and ask > 0:
-                                    await push_orderbook(sym, bid, ask)
-
-                        # kline
-                        elif "@kline" in stream:
-                            k = payload.get("k", {})
-                            if k.get("x"):
-                                sym = payload.get("s", "BTCUSDT")
-                                close = float(k.get("c", 0))
-                                vol = float(k.get("q", 0))
-                                ts = int(k.get("T", 0))
-                                if close > 0:
-                                    await push_ticker(sym, close, vol, ts)
-
-                    except json.JSONDecodeError:
-                        continue
-                    except Exception as e:
-                        log.error(f"WS parse error: {e}")
-                        continue
-
-        except asyncio.CancelledError:
-            break
+                        d = json.loads(msg)
+                        st, pay = d.get("stream", ""), d.get("data", {})
+                        sym = pay.get("s")
+                        if not sym: continue
+                        if st.endswith("@aggTrade"):
+                            await push_trade(sym, {"p": pay["p"], "q": pay["q"],
+                                                   "m": pay["m"], "t": pay["T"]})
+                        elif st.endswith("@bookTicker") and float(pay.get("b",0))>0:
+                            await push_ob(sym, pay["b"], pay["a"])
+                        elif "@kline" in st and pay.get("k",{}).get("x"):
+                            k = pay["k"]
+                            await push_tk(sym, k["c"], k["q"], k["T"])
+                    except: pass
+        except asyncio.CancelledError: break
         except Exception as e:
-            ws_connected = False
-            log.warning(f"⚠️ WS Worker {worker_id} error: {e}. Reconnecting in {backoff}s")
+            ws_ok = False
+            log.warning(f"WS-{wid} {e} → retry {backoff}s")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            backoff = min(backoff*2, 30)
 
+async def start_ws():
+    tasks = [asyncio.create_task(ws_worker(chunk, i+1))
+             for i, chunk in enumerate([PAIRS[i:i+CHUNK] for i in range(0, len(PAIRS), CHUNK)])]
+    tasks.append(asyncio.create_task(periodic_sync()))
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-async def start_all_ws():
-    pairs = list(PAIRS)
-    chunks = [pairs[i:i + CHUNK_SIZE] for i in range(0, len(pairs), CHUNK_SIZE)]
-
-    tasks = [asyncio.create_task(ws_worker(chunk, idx + 1)) for idx, chunk in enumerate(chunks)]
-    tasks.append(asyncio.create_task(periodic_redis_sync()))
-
-    log.info(f"🔌 Started {len(tasks)-1} WS workers + sync task")
-
-    try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-
-
-# -----------------------------------------------------------
-# COOLDOWN
-# -----------------------------------------------------------
+# ---------- SCANNER ----------
 def cooldown_ok(sym, strat):
     key = f"{sym}:{strat}"
-    if key not in cooldown:
-        return True
-    diff = (datetime.utcnow() - cooldown[key]).total_seconds() / 60
-    return diff >= COOLDOWN_MIN
-
+    return (datetime.utcnow() - cooldown.get(key, datetime.min)).total_seconds()/60 >= COOLDOWN_M
 
 def set_cooldown(sym, strat):
     cooldown[f"{sym}:{strat}"] = datetime.utcnow()
 
-
-# -----------------------------------------------------------
-# SIGNAL FORMATTER (legacy quick format kept)
-# -----------------------------------------------------------
-def format_signal(sig):
-    sym = sig["symbol"]
-    side = sig["side"]
-    score = sig["score"]
-    last = sig["last"]
-    strat = sig["strategy"]
-    passed = " | ".join(sig["passed"][:4])
-
-    return (
-        f"🎯 <b>{sym} {side.upper()}</b> [{strat}]\n"
-        f"💰 <code>{last:.6f}</code>\n"
-        f"📊 Score: <b>{score:.1f}</b>\n"
-        f"🔍 {passed}\n"
-    )
-
-
-# -----------------------------------------------------------
-# SCANNER
-# -----------------------------------------------------------
 async def scanner():
-    global db
-    log.info("🔍 Scanner waiting for data...")
-
-    await send_telegram("🚀 <b>Scanner Starting...</b>\n⏳ Waiting for data stream")
-
-    # Wait for in-memory buffer
-    for i in range(20):
+    await tg_send("🚀 Scanner starting…")
+    for _ in range(20):
         await asyncio.sleep(2)
-        btc_count = len(TRADE_BUFFER.get("BTCUSDT", []))
-        if btc_count >= 20:
-            log.info(f"✅ Data ready! BTC trades: {btc_count}")
-            await send_telegram(f"✅ <b>Data Stream Active!</b>\n📊 {btc_count} BTC trades loaded")
-            break
-    else:
-        log.warning("⚠️ Data stream slow")
-
-    scan_count = 0
+        if len(TRADE_BUF["BTCUSDT"]) > 20: break
+    else: log.warning("data stream slow")
 
     while True:
         try:
-            scan_count += 1
-            results = []
-
             for sym in PAIRS:
                 for strat in ["QUICK", "MID", "TREND"]:
-                    if not cooldown_ok(sym, strat):
-                        continue
-
+                    if not cooldown_ok(sym, strat): continue
                     sig = await compute_signal(sym, strat)
-                    if sig:
-                        results.append(sig)
-
-            results.sort(key=lambda x: x["score"], reverse=True)
-
-            if results:
-                best = results[:3]
-                for sig in best:
-                    # Use enhanced validation flag if present (enhance_signal sets "validated")
-                    validated = sig.get("validated", True)
-                    reason = sig.get("validation_reason", "")
-
-                    if not validated:
-                        log.info(f"✖ Signal filtered: {sig['symbol']} {sig['strategy']} -> {reason}")
-                        continue
-
-                    # Prefer full-feature Telegram message using formatter (levels, volume included)
-                    try:
+                    if sig and sig.get("validated", True):
                         msg = formatter.format_signal_alert(sig, sig.get("levels"), sig.get("volume"))
-                        await send_telegram(msg)
-                    except Exception as e:
-                        log.error(f"Formatter error: {e}. Falling back to quick format.")
-                        await send_telegram(format_signal(sig))
-
-                    # Save signal to DB (if available)
-                    try:
-                        if db:
-                            await save_signal(db, sig)
-                    except Exception as e:
-                        log.warning(f"DB save failed: {e}")
-
-                    # Mark active order + set cooldown
-                    ACTIVE_ORDERS[f"{sig['symbol']}:{sig['strategy']}"] = sig
-                    set_cooldown(sig["symbol"], sig["strategy"])
-                    log.info(f"✔️ SIGNAL: {sig['symbol']} {sig['strategy']} = {sig['score']:.1f}")
-
-            await asyncio.sleep(SCAN_INTERVAL)
-
-        except asyncio.CancelledError:
-            break
+                        await tg_send(msg)
+                        if db: await save_signal(db, sig)
+                        set_cooldown(sym, strat)
+                        log.info(f"SIGNAL {sym} {strat} {sig['score']:.1f}")
+            await asyncio.sleep(SCAN_INT)
+        except asyncio.CancelledError: break
         except Exception as e:
-            log.error(f"Scanner error: {e}")
+            log.error(f"scanner: {e}")
             await asyncio.sleep(5)
 
-
-# -----------------------------------------------------------
-# FASTAPI
-# -----------------------------------------------------------
-scan_task = None
-ws_task = None
+# ---------- FASTAPI ----------
+scan_task, ws_task = None, None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scan_task, ws_task, db
-
-    log.info("🚀 Bot Starting (v2.2 - Optimized)")
-    log.info(f"✓ {len(PAIRS)} pairs loaded")
-
-    # Start WS + sync
-    ws_task = asyncio.create_task(start_all_ws())
+    log.info("🚀 v2.2-clean starting")
+    ws_task = asyncio.create_task(start_ws())
     await asyncio.sleep(3)
-
-    # Load positions (if any)
-    try:
-        await position_tracker.load()
-        log.info("✅ Position tracker loaded")
-    except Exception as e:
-        log.warning(f"Position tracker load failed: {e}")
-
-    # Init DB connection
-    try:
-        db = await init_db()
-        log.info("✅ DB connected")
-    except Exception as e:
-        db = None
-        log.warning(f"DB connection failed: {e}")
-
+    await pos_track.load()
+    try: db = await init_db(); log.info("DB ok")
+    except: db = None; log.warning("DB skip")
     scan_task = asyncio.create_task(scanner())
-
     yield
-
-    log.info("🛑 Shutting down...")
-    if scan_task:
-        scan_task.cancel()
-    if ws_task:
-        ws_task.cancel()
-
-    try:
-        await asyncio.gather(scan_task, ws_task, return_exceptions=True)
-    except:
-        pass
-
-    # Save positions on shutdown
-    try:
-        await position_tracker.save()
-        log.info("✅ Position tracker saved")
-    except Exception as e:
-        log.warning(f"Position tracker save failed: {e}")
-
-    # Close DB connection
-    try:
-        if db:
-            await db.close()
-            log.info("✅ DB closed")
-    except Exception as e:
-        log.warning(f"DB close failed: {e}")
-
-    try:
-        await redis.aclose()
-    except:
-        pass
-
-    log.info("🔴 Shutdown complete")
-
+    log.info("🛑 shutting down")
+    for t in [scan_task, ws_task]: t.cancel()
+    await asyncio.gather(scan_task, ws_task, return_exceptions=True)
+    await pos_track.save()
+    if db: await db.close()
+    try: await redis.aclose()
+    except: pass
 
 app = FastAPI(lifespan=lifespan)
 
-
 @app.get("/")
-async def root():
-    btc_trades = len(TRADE_BUFFER.get("BTCUSDT", []))
-
-    return {
-        "status": "running",
-        "ws_connected": ws_connected,
-        "data_received": data_received,
-        "btc_trades_memory": btc_trades,
-        "pairs": len(PAIRS),
-        "active_signals": len(ACTIVE_ORDERS),
-        "time": datetime.utcnow().isoformat()
-    }
-
+def root():
+    return {"status": "running", "ws": ws_ok, "btc_trades": len(TRADE_BUF.get("BTCUSDT", [])),
+            "pairs": len(PAIRS), "signals": len(ACTIVE_ORDERS), "time": datetime.utcnow().isoformat()}
 
 @app.get("/health")
-async def health():
-    btc_trades = len(TRADE_BUFFER.get("BTCUSDT", []))
-
-    return {
-        "status": "ok" if btc_trades > 0 else "starting",
-        "ws_connected": ws_connected,
-        "btc_trades": btc_trades,
-        "data_received": data_received,
-        "redis_usage": "optimized"
-    }
-
+def health():
+    return {"status": "ok" if ws_ok else "starting", "ws": ws_ok, "redis": "optimized"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
