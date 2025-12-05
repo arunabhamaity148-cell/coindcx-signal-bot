@@ -1,4 +1,4 @@
-helpers.py — CoinDCX Manual Trading System (FINAL)
+helpers.py  CoinDCX Manual Trading System (FINAL)
 Features:
 - 3 Strategies: QUICK/MID/TREND
 - Telegram signals: Entry, TP1, TP2, SL
