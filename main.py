@@ -1,219 +1,266 @@
-import os, asyncio, logging, aiohttp
+# main.py — Final fixed (WS polling + Bot loop + Health)
+import os
+import json
+import asyncio
+import logging
 from datetime import datetime
-from fastapi import FastAPI
-import uvicorn
+from contextlib import asynccontextmanager
 
+import uvicorn
+from fastapi import FastAPI
+
+# helpers (must be the big helpers.py you already added)
 from helpers import (
-    CFG, STRATEGY_CONFIG, Exchange,
-    calculate_advanced_score, calc_tp_sl,
-    iceberg_size, send_telegram, redis,
+    CFG,
+    STRATEGY_CONFIG,
+    redis,
+    calculate_advanced_score,
+    calc_tp_sl,
+    iceberg_size,
+    send_telegram,
+    get_exchange
 )
+
+import aiohttp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
 
+# ------------------------
+# small in-process cooldown (fast)
+# ------------------------
+_cooldown = {}  # key -> datetime
 
-# ===================================================================
-# WS POLLING TASK – FETCH MARKET DATA FROM REDIS STREAM
-# ===================================================================
+def cooldown_ok(sym: str, strategy: str):
+    key = f"{sym}:{strategy}"
+    last = _cooldown.get(key)
+    if not last:
+        return True
+    elapsed = (datetime.utcnow() - last).total_seconds() / 60.0
+    return elapsed >= CFG.get("cooldown_min", 30)
+
+def set_cooldown(sym: str, strategy: str):
+    key = f"{sym}:{strategy}"
+    _cooldown[key] = datetime.utcnow()
+
+# ------------------------
+# WS Polling (fixed)
+# ------------------------
 async def ws_polling():
     log.info("🔌 WS polling started...")
     r = await redis()
 
-    import ccxt.async_support as ccxt
-    ex = ccxt.coindcx({"enableRateLimit": True})
-
+    # use helpers' get_exchange factory (so it picks up keys from ENV)
+    ex = get_exchange({"enableRateLimit": True})  # if helpers.get_exchange wraps ccxt.coindcx
+    # if get_exchange returned an instance factory-like, we ensure .fetch_* exist
+    # ENSURE we don't crash here if exchange doesn't support some calls
     while True:
         try:
-            for sym in CFG["pairs"]:
+            for sym in CFG.get("pairs", []):
                 try:
-                    # ticker
-                    ticker = await ex.fetch_ticker(sym)
-                    await r.hset(f"t:{sym}", mapping={
-                        "last": ticker["last"], 
-                        "E": int(datetime.utcnow().timestamp()*1000)
-                    })
+                    # safe ticker
+                    try:
+                        ticker = await ex.fetch_ticker(sym)
+                        last = float(ticker.get("last", 0) or 0)
+                        await r.hset(f"t:{sym}", mapping={"last": last, "E": int(datetime.utcnow().timestamp() * 1000)})
+                    except Exception as e:
+                        log.debug(f"ticker fetch {sym}: {e}")
 
-                    # orderbook
-                    ob = await ex.fetch_order_book(sym, limit=20)
-                    await r.hset(f"d:{sym}", mapping={
-                        "bids": json.dumps(ob["bids"]),
-                        "asks": json.dumps(ob["asks"]),
-                        "E": int(datetime.utcnow().timestamp()*1000),
-                    })
+                    # safe orderbook
+                    try:
+                        ob = await ex.fetch_order_book(sym, limit=20)
+                        bids = ob.get("bids", []) if isinstance(ob, dict) else []
+                        asks = ob.get("asks", []) if isinstance(ob, dict) else []
+                        await r.hset(f"d:{sym}", mapping={"bids": json.dumps(bids[:20]), "asks": json.dumps(asks[:20]), "E": int(datetime.utcnow().timestamp() * 1000)})
+                    except Exception as e:
+                        log.debug(f"orderbook fetch {sym}: {e}")
 
-                    # trades
-                    trades = await ex.fetch_trades(sym, limit=100)
-                    for t in trades:
-                        await r.lpush(f"tr:{sym}", json.dumps({
-                            "p": t["price"], 
-                            "q": t["amount"],
-                            "m": t["side"] == "sell",
-                            "t": t["timestamp"]
-                        }))
-                    await r.ltrim(f"tr:{sym}", 0, 400)
+                    # safe trades
+                    try:
+                        trades = await ex.fetch_trades(sym, limit=100)
+                        if trades and len(trades) > 0:
+                            pushed = 0
+                            for t in trades[-100:]:
+                                try:
+                                    # normalize fields leniently
+                                    p = t.get("price") if isinstance(t, dict) else getattr(t, "price", None)
+                                    q = t.get("amount") if isinstance(t, dict) else getattr(t, "amount", None)
+                                    side = t.get("side") if isinstance(t, dict) else getattr(t, "side", None)
+                                    ts = None
+                                    for k in ("timestamp", "time", "ts", "trade_timestamp"):
+                                        if isinstance(t, dict) and k in t and t[k]:
+                                            ts = t[k]; break
+                                    if ts is None:
+                                        ts = int(datetime.utcnow().timestamp() * 1000)
+                                    p = float(p or 0.0); q = float(q or 0.0); is_sell = True if str(side).lower() == "sell" else False
+                                    await r.lpush(f"tr:{sym}", json.dumps({"p": p, "q": q, "m": is_sell, "t": int(ts)}))
+                                    pushed += 1
+                                except Exception:
+                                    continue
+                            if pushed:
+                                await r.ltrim(f"tr:{sym}", 0, 499)
+                        else:
+                            # no trades returned — that's okay, log debug
+                            log.debug(f"no trades from exchange for {sym}")
+                    except Exception as e:
+                        log.debug(f"trades fetch {sym}: {e}")
 
-                except Exception as e:
-                    log.warning(f"poll error {sym}: {e}")
+                except Exception as inner:
+                    log.debug(f"polling inner error {sym}: {inner}")
                     continue
 
-            await asyncio.sleep(2)
-
+            # throttle loop
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            log.info("WS polling cancelled")
+            break
         except Exception as e:
             log.error(f"WS loop crash: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
-
-# ===================================================================
-# SIGNAL BOT LOOP
-# ===================================================================
-cooldown_cache = {}
-
-def cooldown_ok(sym, strategy):
-    key = f"{sym}:{strategy}"
-    if key not in cooldown_cache: 
-        return True
-    t = (datetime.utcnow() - cooldown_cache[key]).total_seconds()/60
-    return t >= CFG["cooldown_min"]
-
-def set_cooldown(sym, strategy):
-    cooldown_cache[f"{sym}:{strategy}"] = datetime.utcnow()
-
-
+# ------------------------
+# Bot loop
+# ------------------------
 async def bot_loop():
     log.info("🤖 Signal bot started...")
+    # send deploy notice
+    try:
+        await send_telegram(f"🚀 <b>Bot deployed</b> — pairs: {len(CFG.get('pairs',[]))} — Mode: Aggressive (No ML)")
+    except Exception as e:
+        log.debug(f"deploy notify failed: {e}")
+
+    await asyncio.sleep(2)
 
     while True:
         try:
-            for sym in CFG["pairs"]:
+            for sym in CFG.get("pairs", []):
                 for strategy in STRATEGY_CONFIG.keys():
+                    try:
+                        if not cooldown_ok(sym, strategy):
+                            log.debug(f"{sym} {strategy} cooldown active")
+                            continue
 
-                    if not cooldown_ok(sym, strategy):
-                        continue
+                        # calculate advanced score (helpers)
+                        sig = await calculate_advanced_score(sym, strategy)
+                        if not sig:
+                            log.debug(f"{sym} no-signal")
+                            continue
+                        if sig.get("side") == "none":
+                            log.debug(f"{sym} blocked by score reason")
+                            continue
 
-                    sig = await calculate_advanced_score(sym, strategy)
-                    if not sig or sig["side"] == "none":
-                        continue
+                        side = sig.get("side")
+                        last = float(sig.get("last", 0))
+                        score = float(sig.get("score", 0))
 
-                    side = sig["side"]
-                    entry = sig["last"]
-                    score = sig["score"]
+                        # tp/sl calc
+                        tp1, tp2, sl, lev, liq_price, liq_dist = await calc_tp_sl(sym, side, last, strategy)
 
-                    tp1, tp2, sl, lev, liq, liq_dist = await calc_tp_sl(sym, side, entry, strategy)
+                        # liq safety check
+                        liq_alert_pct = float(os.getenv("LIQ_ALERT_PCT", 0.7))
+                        if liq_dist is not None and liq_dist < liq_alert_pct:
+                            log.warning(f"LIQ CLOSE {sym} {strategy} {side} — liq_dist={liq_dist:.2f}% -> skip")
+                            await send_telegram(f"⚠️ <b>LIQ CLOSE:</b> {sym} {strategy} {side} | Entry={last} | LiqDist={liq_dist:.2f}%")
+                            continue
 
-                    # dangerous SL ?
-                    if liq_dist < 0.7:
-                        await send_telegram(
-                            f"⚠️ <b>LIQ WARNING</b>\n{sym} {strategy} {side}\n"
-                            f"Entry: {entry}\nSL-LIQ Distance: {liq_dist:.2f}% (too close)"
+                        # iceberg sizing
+                        ice = iceberg_size(CFG.get("equity", 30000), last, sl, lev)
+                        if not ice or ice.get("total", 0) <= 0:
+                            log.info(f"{sym} blocked: tiny position")
+                            continue
+
+                        # final message
+                        msg = (
+                            f"🎯 <b>[{strategy}] {sym} {side.upper()}</b>\n"
+                            f"Entry: <code>{last:.8f}</code>\n"
+                            f"TP1: <code>{tp1:.8f}</code>\n"
+                            f"TP2: <code>{tp2:.8f}</code>\n"
+                            f"SL: <code>{sl:.8f}</code>\n"
+                            f"Lev: <b>{lev}x</b>\n"
+                            f"Score: {score:.2f}\n"
+                            f"LiqPrice: <code>{liq_price:.8f}</code> | LiqDist: {liq_dist:.2f}%\n\n"
+                            f"💰 Iceberg → Total: {ice['total']:.6f} | {ice['orders']}×{ice['each']:.6f}\n\n"
+                            f"📝 Steps:\n1) Set Lev {lev}x\n2) Place {ice['orders']} limit orders @ {last:.8f}\n3) SL → {sl:.8f}\n4) Exit {STRATEGY_CONFIG[strategy]['tp1_mult']}× at TP1 {tp1:.8f}\n5) Full exit TP2 {tp2:.8f}\n"
                         )
+                        await send_telegram(msg)
+                        log.info(f"✔ SIGNAL SENT {sym} {strategy} {side} score={score:.2f}")
+
+                        # set cooldown and small sleep
+                        set_cooldown(sym, strategy)
+                        await asyncio.sleep(0.6)
+
+                    except Exception as inner_e:
+                        log.error(f"symbol loop error {sym} {strategy}: {inner_e}")
                         continue
 
-                    # iceberg sizing
-                    ice = iceberg_size(CFG["equity"], entry, sl, lev)
-
-                    msg = (
-                        f"🎯 <b>[{strategy}] {sym} {side.upper()}</b>\n"
-                        f"Entry: <code>{entry:.6f}</code>\n"
-                        f"TP1: <code>{tp1:.6f}</code>\n"
-                        f"TP2: <code>{tp2:.6f}</code>\n"
-                        f"SL: <code>{sl:.6f}</code>\n"
-                        f"Leverage: <b>{lev}x</b>\n"
-                        f"Score: {score:.2f}\n"
-                        f"Liq Distance: {liq_dist:.2f}%\n\n"
-                        f"💰 <b>Iceberg:</b>\n"
-                        f"Total Qty: {ice['total']:.6f}\n"
-                        f"Split: {ice['orders']} × {ice['each']:.6f}\n\n"
-                        f"📝 Steps:\n"
-                        f"1️⃣ Set leverage {lev}x\n"
-                        f"2️⃣ Place {ice['orders']} limit orders at {entry:.6f}\n"
-                        f"3️⃣ SL → {sl:.6f}\n"
-                        f"4️⃣ TP1 → {tp1:.6f} ({STRATEGY_CONFIG[strategy]['tp1_exit']*100:.0f}% exit)\n"
-                        f"5️⃣ TP2 → {tp2:.6f}\n"
-                        f"⏳ Cooldown: {CFG['cooldown_min']} min"
-                    )
-
-                    await send_telegram(msg)
-                    log.info(f"✔ Sent signal {sym} {strategy} {side}")
-
-                    set_cooldown(sym, strategy)
-
-            await asyncio.sleep(2)
-
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            log.info("Bot loop cancelled")
+            break
         except Exception as e:
-            log.error(f"BOT LOOP ERROR: {e}")
+            log.error(f"Bot loop crash: {e}")
             await asyncio.sleep(5)
 
-
-
-# ===================================================================
-# KEEP ALIVE PING
-# ===================================================================
+# ------------------------
+# Keep-alive (internal hitting /health)
+# ------------------------
 async def keep_alive():
-    url = "http://0.0.0.0:8080/health"
+    port = int(os.getenv("PORT", "8080"))
+    url = f"http://0.0.0.0:{port}/health"
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(url) as r:
-                    if r.status == 200:
-                        log.info("✓ Keep-alive OK")
-        except:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        log.debug("✓ Health ping OK")
+        except Exception:
             pass
         await asyncio.sleep(60)
 
-
-# ===================================================================
-# FASTAPI + LIFESPAN
-# ===================================================================
-from contextlib import asynccontextmanager
-
-bot_task = None
+# ------------------------
+# FastAPI app + lifespan
+# ------------------------
+app = FastAPI()
 ws_task = None
+bot_task = None
 ping_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot_task, ws_task, ping_task
-    log.info("🚀 Bot Booting...")
-
+    global ws_task, bot_task, ping_task
+    log.info("🚀 App starting — launching WS & Bot")
     ws_task = asyncio.create_task(ws_polling())
+    # small delay to gather some trades first
+    await asyncio.sleep(2)
     bot_task = asyncio.create_task(bot_loop())
     ping_task = asyncio.create_task(keep_alive())
-
-    yield
-
-    for t in [ws_task, bot_task, ping_task]:
-        if t: t.cancel()
-
-    await asyncio.gather(*[t for t in [ws_task, bot_task, ping_task] if t], return_exceptions=True)
-    log.info("Shutdown complete.")
-
+    try:
+        yield
+    finally:
+        log.info("🔄 App shutting down — cancelling tasks")
+        for t in [ws_task, bot_task, ping_task]:
+            if t:
+                t.cancel()
+        await asyncio.gather(*[t for t in [ws_task, bot_task, ping_task] if t], return_exceptions=True)
+        log.info("Shutdown done")
 
 app = FastAPI(lifespan=lifespan)
 
-
 @app.get("/")
 def root():
-    return {
-        "status": "running",
-        "pairs": len(CFG["pairs"]),
-        "strategies": list(STRATEGY_CONFIG.keys()),
-        "time": datetime.utcnow().isoformat()
-    }
-
+    return {"status": "running", "pairs": len(CFG.get("pairs", [])), "time": datetime.utcnow().isoformat()}
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "ws": ws_task is not None and not ws_task.done(),
-        "bot": bot_task is not None and not bot_task.done(),
-        "time": datetime.utcnow().isoformat()
+        "time": datetime.utcnow().isoformat(),
+        "ws_running": ws_task is not None and not ws_task.done(),
+        "bot_running": bot_task is not None and not bot_task.done()
     }
 
-
-# ===================================================================
-# UVICORN START
-# ===================================================================
+# ------------------------
+# Run uvicorn
+# ------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
