@@ -1,4 +1,5 @@
-main.py  CoinDCX Signal Generator (Manual Trading)
+"""
+CoinDCX Signal Generator (Manual Trading)
 Sends Telegram alerts with TP1/TP2/SL + iceberg instructions
 User executes trades manually on CoinDCX
 """
@@ -20,16 +21,13 @@ from helpers import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
 
-# ---------- Global ----------
 bot_task = None
 ping_task = None
 ws_task = None
 
-# ---------- Keep-Alive ----------
 async def keep_alive():
-    port = os.getenv("PORT", 8080)
+    port = int(os.getenv("PORT", 8080))
     url = f"http://0.0.0.0:{port}/health"
-
     while True:
         try:
             await asyncio.sleep(60)
@@ -40,90 +38,61 @@ async def keep_alive():
         except Exception as e:
             log.error(f"Keep-alive: {e}")
 
-# ---------- Signal Generator Bot ----------
 async def bot_loop():
     log.info("🤖 Starting CoinDCX signal generator...")
-
     try:
         ex = Exchange()
         signal_count = 0
-
         await asyncio.sleep(8)
         log.info("✓ Bot initialized - Monitoring 80 pairs")
-
         while True:
             try:
-                # Daily limit check
                 limit_ok, limit_reason = await check_daily_signal_limit()
                 if not limit_ok:
                     log.warning(f"⚠️ Daily limit reached: {limit_reason}")
                     await asyncio.sleep(3600)
                     continue
-
-                # Scan all pairs × strategies
                 for sym in CFG["pairs"]:
                     try:
-                        # Try each strategy
                         for strategy in ["QUICK", "MID", "TREND"]:
                             try:
-                                # Cooldown check
                                 cooldown_ok, cd_reason = await check_cooldown(sym, strategy)
                                 if not cooldown_ok:
                                     continue
-
-                                # Calculate score
                                 signal = await calculate_advanced_score(sym, strategy)
                                 if not signal or signal["side"] == "none":
                                     continue
-
                                 side = signal["side"]
                                 score = signal["score"]
                                 last = signal["last"]
-
-                                # AI review
                                 ai = await ai_review_ensemble(sym, side, score, strategy)
                                 if not ai["allow"]:
                                     continue
-
                                 confidence = ai["confidence"]
-
-                                # Calculate TP1, TP2, SL with liquidation safety
-                                tp1, tp2, sl, leverage, liq_price = await calc_tp1_tp2_sl_liq(
-                                    sym, side, last, confidence, strategy
-                                )
-
-                                # Risk:reward check
+                                tp1, tp2, sl, leverage, liq_price = await calc_tp1_tp2_sl_liq(sym, side, last, confidence, strategy)
                                 risk = abs(last - sl)
                                 reward1 = abs(tp1 - last)
                                 reward2 = abs(tp2 - last)
                                 rrr1 = reward1 / risk if risk > 0 else 0
                                 rrr2 = reward2 / risk if risk > 0 else 0
-
                                 if rrr1 < 1.0:
                                     continue
-
-                                # Position size + iceberg
                                 pos_info = position_size_iceberg(CFG["equity"], last, sl, leverage)
                                 total_qty = pos_info["total_qty"]
                                 iceberg_qty = pos_info["iceberg_qty"]
                                 num_orders = pos_info["num_orders"]
-
                                 if total_qty < 0.001:
                                     continue
-
-                                # === GENERATE SIGNAL ===
                                 signal_count += 1
                                 await increment_signal_count()
-
                                 log.info(f"🎯 [{strategy}] {sym} {side.upper()} #{signal_count}")
                                 log.info(f"   Entry: {last:.6f} | TP1: {tp1:.6f} | TP2: {tp2:.6f} | SL: {sl:.6f}")
                                 log.info(f"   Lev: {leverage}x | Conf: {confidence}% | Score: {score:.2f}")
-
-                                # Calculate distances
                                 sl_to_liq = abs(sl - liq_price) / liq_price * 100
                                 tp1_exit_pct = STRATEGY_CONFIG[strategy]["tp1_exit"] * 100
-
-                                # Telegram message
+                                flow = await orderflow_analysis(sym)
+                                spread_txt = f"{flow['spread']:.2f}%" if flow else "N/A"
+                                depth_txt = f"{flow['depth_usd']/1e3:.0f}k" if flow else "N/A"
                                 msg = (
                                     f"🎯 <b>[{strategy}] {sym} {side.upper()} #{signal_count}</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -133,6 +102,7 @@ async def bot_loop():
                                     f"🛑 <b>SL:</b> <code>{sl:,.2f}</code>\n"
                                     f"⚠️ <b>Liquidation:</b> <code>{liq_price:,.2f}</code>\n\n"
                                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"✅ <b>Spread:</b> {spread_txt} | <b>Depth:</b> {depth_txt} $\n"
                                     f"💰 <b>Position Size:</b>\n"
                                     f"   Total: <b>{total_qty:.6f} {sym.replace('USDT','')}</b>\n"
                                     f"   Iceberg: <b>{num_orders} orders × {iceberg_qty:.6f}</b>\n\n"
@@ -142,7 +112,7 @@ async def bot_loop():
                                     f"📊 <b>RRR:</b> TP1={rrr1:.2f} | TP2={rrr2:.2f}\n"
                                     f"✅ <b>SL Buffer:</b> {sl_to_liq:.1f}% from liq\n\n"
                                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"📋 <b>Manual Trading Steps:</b>\n"
+                                    f"📋 <b>Manual Steps:</b>\n"
                                     f"1️⃣ Set leverage: <b>{leverage}x</b>\n"
                                     f"2️⃣ Place <b>{num_orders}</b> limit orders @ <code>{last:,.2f}</code>\n"
                                     f"   (Each: {iceberg_qty:.6f} {sym.replace('USDT','')})\n"
@@ -153,30 +123,19 @@ async def bot_loop():
                                     f"🕐 <b>Signal time:</b> {datetime.utcnow().strftime('%H:%M UTC')}\n"
                                     f"🔄 <b>Cooldown:</b> {CFG['cooldown_min']} min"
                                 )
-
                                 await send_telegram(msg)
-
-                                # Set cooldown
                                 await set_cooldown(sym, strategy)
-
-                                # Found signal, skip other strategies for this symbol
                                 break
-
                             except Exception as e:
                                 log.error(f"Strategy {strategy} error {sym}: {e}")
                                 continue
-
                     except Exception as e:
                         log.error(f"Symbol processing {sym}: {e}")
                         continue
-
-                # Sleep between scans
                 await asyncio.sleep(3)
-
             except Exception as e:
                 log.error(f"Bot loop iteration: {e}")
                 await asyncio.sleep(10)
-
     except asyncio.CancelledError:
         log.info("🛑 Bot cancelled")
         await ex.close()
@@ -185,37 +144,28 @@ async def bot_loop():
         log.exception(f"💥 Bot crashed: {e}")
         raise
 
-# ---------- Lifespan ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task, ping_task, ws_task
-
     log.info("🚀 Starting CoinDCX Signal Bot...")
-
     ws = WS()
     ws_task = asyncio.create_task(ws.run())
     log.info("✓ WS task started")
-
     bot_task = asyncio.create_task(bot_loop())
     log.info("✓ Bot task started")
-
     ping_task = asyncio.create_task(keep_alive())
     log.info("✓ Keep-alive started")
-
     try:
         yield
     finally:
         log.info("🔄 Shutting down...")
-
         for task in [ws_task, bot_task, ping_task]:
             if task:
                 task.cancel()
-
         await asyncio.gather(ws_task, bot_task, ping_task, return_exceptions=True)
         await cleanup()
         log.info("✅ Shutdown complete")
 
-# ---------- FastAPI ----------
 app = FastAPI(lifespan=lifespan, title="CoinDCX Signal Bot", version="2.0")
 
 @app.get("/")
@@ -253,7 +203,6 @@ async def stats():
     from helpers import redis
     r = await redis()
     signal_count = await r.get("daily_signal_count") or 0
-
     return {
         "daily_signals": int(signal_count),
         "max_daily": 30,
@@ -301,8 +250,6 @@ def config():
         }
     }
 
-# ---------- Run ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
-"""
