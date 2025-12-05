@@ -1,85 +1,73 @@
-# binance_ws.py — Final production Binance WebSocket streamer (chunked)
-# Usage: run this module alongside main.py (it will push trades/orderbook into Redis used by helpers.py)
+# binance_ws.py — Final production Binance WebSocket streamer (Railway Ready)
 
 import asyncio
 import json
-import math
 import traceback
 from datetime import datetime
 import websockets
 
-# reuse redis and PAIRS from helpers to keep single source of truth
 from helpers import redis, PAIRS
 
-# Binance combined stream base
 BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream"
+CHUNK_SIZE = 18
 
-# how many pairs per websocket connection (safety for URL length)
-CHUNK_SIZE = 18  # 18 * 2 streams ≈ 36 stream entries per connection (safe)
-
-# Redis keys / TTLs
 TRADES_TTL_SEC = 1800
 OB_TTL_SEC = 120
 TK_TTL_SEC = 120
 
-# helper writers to redis (expects helpers.redis from helpers.py)
+
 async def push_trade(sym: str, price: float, qty: float, is_sell: bool, ts: int):
     try:
         await redis.lpush(f"tr:{sym}", json.dumps({"p": price, "q": qty, "m": is_sell, "t": ts}))
         await redis.ltrim(f"tr:{sym}", 0, 499)
         await redis.expire(f"tr:{sym}", TRADES_TTL_SEC)
     except Exception:
-        # don't crash on redis error
-        traceback.print_exc()
+        pass
 
 
 async def push_orderbook(sym: str, bid: float, ask: float):
     try:
         await redis.setex(f"ob:{sym}", OB_TTL_SEC, json.dumps({"bid": bid, "ask": ask, "t": int(datetime.utcnow().timestamp() * 1000)}))
     except Exception:
-        traceback.print_exc()
+        pass
 
 
 async def push_ticker(sym: str, last: float, vol: float, ts: int):
     try:
         await redis.setex(f"tk:{sym}", TK_TTL_SEC, json.dumps({"last": last, "vol": vol, "t": ts}))
     except Exception:
-        traceback.print_exc()
+        pass
 
 
-# build stream url for a chunk of pairs
 def build_stream_url(pairs_chunk):
     streams = []
     for p in pairs_chunk:
         p_low = p.lower()
         streams.append(f"{p_low}@aggTrade")
         streams.append(f"{p_low}@bookTicker")
-    # always include btc kline 1m (only once)
     if "BTCUSDT" in pairs_chunk:
         streams.append("btcusdt@kline_1m")
-    # join
     stream_path = "/".join(streams)
     return f"{BINANCE_WS_BASE}?streams={stream_path}"
 
 
-# single websocket worker per chunk
 async def ws_worker(pairs_chunk):
     url = build_stream_url(pairs_chunk)
     backoff = 1
+    
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                 backoff = 1
                 print(f"✅ WS connected for {len(pairs_chunk)} pairs")
+                
                 async for msg in ws:
                     try:
                         data = json.loads(msg)
                         stream = data.get("stream", "")
                         payload = data.get("data", {})
 
-                        # aggTrade
                         if stream.endswith("@aggTrade"):
-                            # payload example keys: "s","p","q","T","m"
                             sym = payload.get("s")
                             if not sym:
                                 continue
@@ -89,7 +77,6 @@ async def ws_worker(pairs_chunk):
                             ts = int(payload.get("T", int(datetime.utcnow().timestamp() * 1000)))
                             await push_trade(sym, price, qty, is_sell, ts)
 
-                        # bookTicker
                         elif stream.endswith("@bookTicker"):
                             sym = payload.get("s")
                             if not sym:
@@ -98,7 +85,6 @@ async def ws_worker(pairs_chunk):
                             ask = float(payload.get("a", 0))
                             await push_orderbook(sym, bid, ask)
 
-                        # kline 1m (only expecting btcusdt@kline_1m possibly)
                         elif "@kline" in stream:
                             k = payload.get("k", {})
                             sym = payload.get("s", "BTCUSDT")
@@ -108,7 +94,6 @@ async def ws_worker(pairs_chunk):
                             await push_ticker(sym, close, vol, ts)
 
                     except Exception:
-                        traceback.print_exc()
                         continue
 
         except (websockets.ConnectionClosedOK, websockets.ConnectionClosedError) as e:
@@ -118,24 +103,32 @@ async def ws_worker(pairs_chunk):
             continue
         except Exception as e:
             print("⚠️ WS worker exception:", e)
-            traceback.print_exc()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
 
 
-# spawn workers for all pairs in chunks
 async def start_all_ws():
-    # chunk PAIRS into groups
+    # Test Redis first
+    try:
+        await redis.ping()
+        print("✅ Redis connected in WS module")
+    except Exception as e:
+        print(f"❌ Redis connection failed in WS: {e}")
+        return
+    
     pairs = list(PAIRS)
     if not pairs:
         raise RuntimeError("PAIRS list empty in helpers.py")
+    
     chunks = [pairs[i:i + CHUNK_SIZE] for i in range(0, len(pairs), CHUNK_SIZE)]
     tasks = []
+    
     for chunk in chunks:
         tasks.append(asyncio.create_task(ws_worker(chunk)))
+    
     print(f"Started {len(tasks)} WS workers for {len(pairs)} pairs ({len(chunks)} chunks)")
-    # wait forever
+    
     await asyncio.gather(*tasks)
 
 
