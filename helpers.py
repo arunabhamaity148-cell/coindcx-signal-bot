@@ -1,13 +1,20 @@
-import os, json, asyncio, logging, joblib, aiohttp, pandas as pd, numpy as np
-from datetime import datetime, timedelta, timezone
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-import ccxt.async_support as ccxt
+
+import os
+import json
+import asyncio
+import logging
+import joblib
+import aiohttp
+import pandas as pd
+import numpy as np
+from datetime import datetime
 from redis.asyncio import Redis
+import ccxt.async_support as ccxt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("helpers")
 
+# ---------------- CONFIG ----------------
 CFG = {
     "key": os.getenv("COINDCX_KEY"),
     "secret": os.getenv("COINDCX_SECRET"),
@@ -20,7 +27,18 @@ CFG = {
     "max_lev": int(os.getenv("MAX_LEV", 30)),
     "liq_buffer": float(os.getenv("LIQ_BUFFER", 0.15)),
     "cooldown_min": int(os.getenv("COOLDOWN_MIN", 45)),
-    "pairs": json.loads(os.getenv("TOP_PAIRS", '["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]')),
+    "pairs": json.loads(os.getenv("TOP_PAIRS", '''[
+        "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","MATICUSDT",
+        "DOTUSDT","AVAXUSDT","LINKUSDT","ATOMUSDT","LTCUSDT","UNIUSDT","ETCUSDT","FILUSDT",
+        "TRXUSDT","NEARUSDT","ARBUSDT","APTUSDT","INJUSDT","STXUSDT","TIAUSDT","SEIUSDT",
+        "OPUSDT","SUIUSDT","FETUSDT","RENDERUSDT","IMXUSDT","RUNEUSDT","XLMUSDT","ALGOUSDT",
+        "SANDUSDT","ICPUSDT","GRTUSDT","AAVEUSDT","LDOUSDT","HBARUSDT","FTMUSDT","VETUSDT",
+        "MANAUSDT","AXSUSDT","THETAUSDT","FLOWUSDT","SNXUSDT","CHZUSDT","ENJUSDT","MKRUSDT",
+        "COMPUSDT","KSMUSDT","XTZUSDT","ZECUSDT","DASHUSDT","BATUSDT","ZILUSDT","ONTUSDT",
+        "IOSTUSDT","IOTAUSDT","QTUMUSDT","WAVESUSDT","ZRXUSDT","OMGUSDT","CRVUSDT","YFIUSDT",
+        "BALUSDT","1INCHUSDT","RLCUSDT","KAVAUSDT","SUSHIUSDT","OCEANUSDT","RSRUSDT","CELOUSDT",
+        "BANDUSDT","STORJUSDT","CELRUSDT","SKLUSDT","ANKRUSDT","BLZUSDT","ARPAUSDT","NMRUSDT"
+    ]''')),
 }
 
 STRATEGY_CONFIG = {
@@ -29,7 +47,8 @@ STRATEGY_CONFIG = {
     "TREND": {"min_score": 7.5, "max_score": 10.0, "tp1_mult": 2.0, "tp2_mult": 3.5, "sl_mult": 1.2, "min_conf": 70, "tp1_exit": 0.3}
 }
 
-redis_client: Redis = None
+# ---------------- Redis singleton ----------------
+redis_client: Redis | None = None
 async def redis():
     global redis_client
     if redis_client is None:
@@ -37,23 +56,26 @@ async def redis():
         await redis_client.ping()
         log.info("✓ Redis connected")
     return redis_client
+
 async def redis_close():
     global redis_client
     if redis_client:
         await redis_client.close()
         redis_client = None
 
+# ---------------- Exchange factory ----------------
 def get_exchange(**kwargs):
-    cls = getattr(ccxt, 'coincdcx', None)
+    cls = getattr(ccxt, 'coindcx', None) or getattr(ccxt, 'coincdcx', None)
     if cls:
         return cls({**kwargs, "enableRateLimit": True, "timeout": 30000})
     return ccxt.Exchange({
-        "id": "coincdcx", "name": "CoinCDCX",
+        "id": "coindcx", "name": "CoinDCX",
         "urls": {"api": {"public": "https://api.coindcx.com/exchange/v1", "private": "https://api.coindcx.com/exchange/v1"}},
         "api": {"public": {"get": ["markets", "tickers", "orderbook", "trades"]}, "private": {"get": ["orders", "balances"], "post": ["order/new", "order/cancel"]}},
         "markets": None, **kwargs, "enableRateLimit": True, "timeout": 30000
     })
 
+# ---------------- WS / Polling ----------------
 class WS:
     def __init__(self):
         self.running = False
@@ -69,10 +91,14 @@ class WS:
                         orderbook = await self.ex.fetch_order_book(sym, limit=20)
                         trades = await self.ex.fetch_trades(sym, limit=100)
                         r = await redis()
-                        await r.hset(f"t:{sym}", mapping={"last": ticker['last'], "vol": ticker.get('baseVolume', 0), "E": int(datetime.utcnow().timestamp() * 1000)})
-                        await r.hset(f"d:{sym}", mapping={"bids": json.dumps(orderbook['bids'][:20]), "asks": json.dumps(orderbook['asks'][:20]), "E": int(datetime.utcnow().timestamp() * 1000)})
+                        await r.hset(f"t:{sym}", mapping={"last": ticker.get('last', 0), "vol": ticker.get('baseVolume', 0), "E": int(datetime.utcnow().timestamp() * 1000)})
+                        await r.hset(f"d:{sym}", mapping={"bids": json.dumps(orderbook.get('bids', [])[:20]), "asks": json.dumps(orderbook.get('asks', [])[:20]), "E": int(datetime.utcnow().timestamp() * 1000)})
                         for t in trades[-100:]:
-                            await r.lpush(f"tr:{sym}", json.dumps({"p": t['price'], "q": t['amount'], "m": t['side'] == 'sell', "t": t['timestamp']}))
+                            p = t.get('price') or t.get('p') or 0
+                            q = t.get('amount') or t.get('q') or 0
+                            side = t.get('side') or ('sell' if t.get('takerSide')=='sell' else 'buy')
+                            timestamp = t.get('timestamp') or int(datetime.utcnow().timestamp() * 1000)
+                            await r.lpush(f"tr:{sym}", json.dumps({"p": p, "q": q, "m": side == 'sell', "t": timestamp}))
                         await r.ltrim(f"tr:{sym}", 0, 499)
                     except Exception as e:
                         log.debug(f"Poll {sym}: {e}")
@@ -85,6 +111,7 @@ class WS:
                 log.error(f"WS polling: {e}")
                 await asyncio.sleep(5)
 
+# ---------------- OHLCV builder ----------------
 async def build_ohlcv_from_trades(sym, timeframe='1m', bars=100):
     r = await redis()
     trades_raw = await r.lrange(f"tr:{sym}", 0, bars * 70)
@@ -115,6 +142,7 @@ async def get_ohlcv(sym, tf="5m", limit=100):
         return pd.concat([flat] * limit, ignore_index=True)
     return df
 
+# ---------------- indicators ----------------
 def calc_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
@@ -122,6 +150,33 @@ def calc_rsi(series, period=14):
     rs = gain / (loss + 1e-10)
     return 100 - (100 / (1 + rs))
 
+async def get_real_atr(sym, tf, period):
+    df = await get_ohlcv(sym, tf, period + 5)
+    if df is None or len(df) < period + 1:
+        return 0.001
+    high = df['h'].values
+    low = df['l'].values
+    close = df['c'].values
+    tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
+    atr = pd.Series(tr).rolling(period).mean().iloc[-1]
+    if np.isnan(atr) or atr == 0:
+        return 0.001
+    return atr / close[-1]
+
+# End of Part 1
+# Continue from Part 1 (features, ML, tp/sl, sizing, cooldowns, telegram, scoring)
+
+import os
+import json
+import logging
+import joblib
+import numpy as np
+import pandas as pd
+from datetime import datetime
+
+log = logging.getLogger("helpers")
+
+# ---------- trend + flow + regime ----------
 async def mtf_trend(sym):
     trends = []
     for tf in ["1m", "5m"]:
@@ -145,8 +200,8 @@ async def orderflow_analysis(sym):
         trades = [json.loads(t) for t in trades_raw]
         delta = sum(float(t["q"]) if not t["m"] else -float(t["q"]) for t in trades)
         recent_delta = sum(float(t["q"]) if not t["m"] else -float(t["q"]) for t in trades[:50])
-        volumes = [float(t["q"]) for t in trades]
-        avg_vol, std_vol = np.mean(volumes), np.std(volumes)
+        volumes = [float(t["q"]) for t in trades] if trades else [0]
+        avg_vol, std_vol = (np.mean(volumes), np.std(volumes)) if volumes else (0, 0)
         large_buys = sum(1 for t in trades[:20] if not t["m"] and float(t["q"]) > avg_vol + 2 * std_vol)
         large_sells = sum(1 for t in trades[:20] if t["m"] and float(t["q"]) > avg_vol + 2 * std_vol)
         depth_raw = await r.hgetall(f"d:{sym}")
@@ -156,10 +211,10 @@ async def orderflow_analysis(sym):
         asks = json.loads(depth_raw.get("asks", "[]"))
         if not bids or not asks:
             return None
-        bid_vol = sum(float(b[1]) for b in bids[:5])
-        ask_vol = sum(float(a[1]) for a in asks[:5])
+        bid_vol = sum(float(b[1]) for b in bids[:5]) if bids else 0
+        ask_vol = sum(float(a[1]) for a in asks[:5]) if asks else 0
         imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-10)
-        spread = (float(asks[0][0]) - float(bids[0][0])) / float(bids[0][0]) * 100
+        spread = (float(asks[0][0]) - float(bids[0][0])) / float(bids[0][0]) * 100 if bids and asks else 0.0
         depth_usd = sum(float(b[0]) * float(b[1]) for b in bids[:10]) + sum(float(a[0]) * float(a[1]) for a in asks[:10])
         return {"delta": delta, "recent_delta": recent_delta, "large_buys": large_buys, "large_sells": large_sells, "imbalance": imbalance, "spread": spread, "depth_usd": depth_usd, "delta_momentum": recent_delta / (abs(delta) + 1e-6)}
     except Exception as e:
@@ -178,6 +233,7 @@ async def regime(sym):
     except:
         return "NORMAL"
 
+# ---------- features ----------
 FEATURE_COLS = ["rsi_1m", "rsi_5m", "macd_hist", "mom_1m", "mom_5m", "vol_ratio", "atr_1m", "atr_5m", "delta_norm", "delta_momentum", "imbalance", "large_buys", "large_sells", "spread", "depth", "mtf_trend", "reg_trend", "reg_chop", "funding", "poc_dist"]
 
 async def extract_features(sym):
@@ -194,9 +250,9 @@ async def extract_features(sym):
         macd = ema12 - ema26
         macd_signal = macd.ewm(span=9).mean()
         macd_hist = macd.iloc[-1] - macd_signal.iloc[-1]
-        mom_1m = (df_1m["c"].iloc[-1] - df_1m["c"].iloc[-10]) / df_1m["c"].iloc[-10]
-        mom_5m = (df_5m["c"].iloc[-1] - df_5m["c"].iloc[-5]) / df_5m["c"].iloc[-5] if df_5m is not None else 0
-        vol_ratio = df_1m["v"].iloc[-10:].mean() / df_1m["v"].iloc[-50:].mean()
+        mom_1m = (df_1m["c"].iloc[-1] - df_1m["c"].iloc[-10]) / df_1m["c"].iloc[-10] if len(df_1m)>=11 else 0
+        mom_5m = (df_5m["c"].iloc[-1] - df_5m["c"].iloc[-5]) / df_5m["c"].iloc[-5] if df_5m is not None and len(df_5m)>5 else 0
+        vol_ratio = df_1m["v"].iloc[-10:].mean() / (df_1m["v"].iloc[-50:].mean() + 1e-9)
         atr_1m = await get_real_atr(sym, "1m", 14)
         atr_5m = await get_real_atr(sym, "5m", 14)
         flow = await orderflow_analysis(sym)
@@ -204,16 +260,42 @@ async def extract_features(sym):
             return None
         mtf = await mtf_trend(sym)
         reg = await regime(sym)
-        return {"rsi_1m": rsi_1m / 100, "rsi_5m": rsi_5m / 100, "macd_hist": np.tanh(macd_hist / last), "mom_1m": np.tanh(mom_1m * 100), "mom_5m": np.tanh(mom_5m * 100), "vol_ratio": min(vol_ratio, 3) / 3, "atr_1m": min(atr_1m, 0.02) / 0.02, "atr_5m": min(atr_5m, 0.02) / 0.02, "delta_norm": np.tanh(flow["delta"] / 1e6), "delta_momentum": flow["delta_momentum"], "imbalance": (flow["imbalance"] + 1) / 2, "large_buys": min(flow["large_buys"], 5) / 5, "large_sells": min(flow["large_sells"], 5) / 5, "spread": min(flow["spread"], 0.2) / 0.2, "depth": np.tanh(flow["depth_usd"] / 5e6), "mtf_trend": (mtf + 1) / 2, "reg_trend": 1 if reg == "TREND" else 0, "reg_chop": 1 if reg == "CHOP" else 0, "funding": 0.0, "poc_dist": 0.0, "last": last}
+        return {
+            "rsi_1m": rsi_1m / 100,
+            "rsi_5m": rsi_5m / 100,
+            "macd_hist": np.tanh(macd_hist / max(last,1e-9)),
+            "mom_1m": np.tanh(mom_1m * 100),
+            "mom_5m": np.tanh(mom_5m * 100),
+            "vol_ratio": min(vol_ratio, 3) / 3,
+            "atr_1m": min(atr_1m, 0.02) / 0.02,
+            "atr_5m": min(atr_5m, 0.02) / 0.02,
+            "delta_norm": np.tanh(flow["delta"] / 1e6),
+            "delta_momentum": flow["delta_momentum"],
+            "imbalance": (flow["imbalance"] + 1) / 2,
+            "large_buys": min(flow["large_buys"], 5) / 5,
+            "large_sells": min(flow["large_sells"], 5) / 5,
+            "spread": min(flow["spread"], 0.2) / 0.2,
+            "depth": np.tanh(flow["depth_usd"] / 5e6),
+            "mtf_trend": (mtf + 1) / 2,
+            "reg_trend": 1 if reg == "TREND" else 0,
+            "reg_chop": 1 if reg == "CHOP" else 0,
+            "funding": 0.0,
+            "poc_dist": 0.0,
+            "last": last
+        }
     except Exception as e:
         log.error(f"Feature {sym}: {e}")
         return None
 
+# ---------- ML ensemble loader ----------
 def load_ensemble():
     models = []
     for name in ["gb_model.pkl", "rf_model.pkl", "lr_model.pkl"]:
         if os.path.exists(name):
-            models.append(joblib.load(name))
+            try:
+                models.append(joblib.load(name))
+            except Exception as e:
+                log.error(f"Loading {name}: {e}")
     return models if len(models) == 3 else None
 
 async def ai_review_ensemble(sym, side, score, strategy):
@@ -222,7 +304,7 @@ async def ai_review_ensemble(sym, side, score, strategy):
         if not features:
             return {"allow": False, "confidence": 30, "reason": "no-features"}
         last = features.pop("last")
-        X = np.array([features[c] for c in FEATURE_COLS]).reshape(1, -1)
+        X = np.array([features.get(c, 0.0) for c in FEATURE_COLS]).reshape(1, -1)
         models = load_ensemble()
         if not models:
             return {"allow": True, "confidence": 55, "reason": "no-ml"}
@@ -231,7 +313,7 @@ async def ai_review_ensemble(sym, side, score, strategy):
             try:
                 proba = m.predict_proba(X)[0]
                 preds.append(proba[1] if len(proba) > 1 else 0.5)
-            except:
+            except Exception:
                 preds.append(0.5)
         avg_prob = np.mean(preds)
         confidence = int(abs(avg_prob - 0.5) * 200)
@@ -255,6 +337,7 @@ async def ai_review_ensemble(sym, side, score, strategy):
         log.error(f"AI review {sym}: {e}")
         return {"allow": False, "confidence": 30, "reason": "error"}
 
+# ---------- TP/SL and sizing ----------
 async def calc_tp1_tp2_sl_liq(sym, side, entry, confidence, strategy):
     try:
         atr = await get_real_atr(sym, "5m", 14)
@@ -283,24 +366,25 @@ async def calc_tp1_tp2_sl_liq(sym, side, entry, confidence, strategy):
     except Exception as e:
         log.error(f"TP/SL calc {sym}: {e}")
         if side == "long":
-            return entry * 1.012, entry * 1.018, entry * 0.992, 15, entry * 0.93
-        return entry * 0.988, entry * 0.982, entry * 1.008, 15, entry * 1.07
+            return entry * 1.012, entry * 1.018, entry * 0.992, CFG["min_lev"], entry * 0.93
+        return entry * 0.988, entry * 0.982, entry * 1.008, CFG["min_lev"], entry * 1.07
 
 def position_size_iceberg(equity, entry, sl, leverage):
     try:
         risk_usd = equity * CFG["risk_perc"] / 100
         entry, sl = float(entry), float(sl)
         price_risk = abs(entry - sl)
-        qty = (risk_usd / price_risk) / leverage
+        qty = (risk_usd / (price_risk + 1e-9)) / leverage
         max_qty = (equity * 0.3) / entry
         total_qty = round(min(qty, max_qty), 6)
         num_orders = 4
-        iceberg_qty = round(total_qty / num_orders, 6)
+        iceberg_qty = round(total_qty / num_orders, 6) if num_orders>0 else total_qty
         return {"total_qty": total_qty, "iceberg_qty": iceberg_qty, "num_orders": num_orders}
     except Exception as e:
         log.error(f"Position size: {e}")
         return {"total_qty": 0.001, "iceberg_qty": 0.0003, "num_orders": 3}
 
+# ---------- cooldowns and daily limit ----------
 async def check_cooldown(sym, strategy):
     try:
         r = await redis()
@@ -341,8 +425,10 @@ async def increment_signal_count():
     except:
         pass
 
+# ---------- telegram ----------
 async def send_telegram(txt):
     if not CFG["tg_token"] or not CFG["tg_chat"]:
+        log.debug("Telegram not configured.")
         return
     url = f"https://api.telegram.org/bot{CFG['tg_token']}/sendMessage"
     for attempt in range(3):
@@ -352,23 +438,77 @@ async def send_telegram(txt):
                     if resp.status == 200:
                         log.info("✓ Telegram sent")
                         return
+                    else:
+                        log.debug(f"Telegram status: {resp.status}")
         except Exception as e:
             await asyncio.sleep(1)
+    log.error("Telegram send failed after attempts.")
 
 class Exchange:
     def __init__(self):
         self.ex = get_exchange(apiKey=CFG["key"], secret=CFG["secret"], options={"defaultType": "swap"})
         log.info("✓ CoinDCX initialized (manual trading mode)")
     async def close(self):
-        await self.ex.close()
+        try:
+            await self.ex.close()
+        except Exception:
+            pass
 
 async def cleanup():
     await redis_close()
     log.info("✓ Cleanup complete")
 
-# ---------- alias (no relative import) ----------
+# ---------- scoring (fix for NameError) ----------
+async def calc_advanced_score(sym, strategy):
+    """
+    Implements an on-device heuristic scorer.
+    Returns: {"side": "long"/"short"/"none", "score": float, "last": float}
+    """
+    try:
+        features = await extract_features(sym)
+        if not features:
+            return None
+        last = features.get("last", 0.0)
+
+        # baseline
+        score = 5.0
+        score += float(features.get("macd_hist", 0.0)) * 2.5
+        score += float(features.get("mom_1m", 0.0)) * 1.5
+
+        rsi = features.get("rsi_1m", 0.5)
+        if rsi < 0.2:
+            score += 1.0
+        elif rsi > 0.8:
+            score -= 1.0
+
+        score += float(features.get("delta_momentum", 0.0)) * 2.0
+        score += (features.get("imbalance", 0.5) - 0.5) * 2.0
+        score += min(max(features.get("depth", 0.0), 0.0), 1.0) * 0.5
+        score -= min(max(features.get("spread", 0.0), 0.0), 1.0) * 1.0
+        score += (features.get("mtf_trend", 0.5) - 0.5) * 2.0
+
+        score = max(0.0, min(10.0, score))
+
+        dir_score = 0.0
+        dir_score += features.get("macd_hist", 0.0) * 1.5
+        dir_score += features.get("mom_1m", 0.0) * 1.0
+        dir_score += features.get("delta_momentum", 0.0) * 1.0
+        dir_score += (features.get("imbalance", 0.5) - 0.5) * 2.0
+        dir_score += (features.get("mtf_trend", 0.5) - 0.5) * 2.0
+
+        side = "none"
+        if dir_score > 0.6 and score >= STRATEGY_CONFIG[strategy]["min_score"]:
+            side = "long"
+        elif dir_score < -0.6 and score >= STRATEGY_CONFIG[strategy]["min_score"]:
+            side = "short"
+
+        return {"side": side, "score": float(score), "last": float(last)}
+    except Exception as e:
+        log.error(f"calc_advanced_score {sym}: {e}")
+        return None
+
+# alias kept for backward compatibility
 async def calculate_advanced_score(sym, strategy):
-    # call the real function (already defined above)
     return await calc_advanced_score(sym, strategy)
 
-
+# End of Part 2
