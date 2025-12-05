@@ -4,7 +4,7 @@ from datetime import datetime
 from redis.asyncio import Redis
 import ccxt.async_support as ccxt
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("helpers")
 
 TOP_PAIRS = [
@@ -31,7 +31,7 @@ CFG = {
     "min_lev": int(os.getenv("MIN_LEV", 15)),
     "max_lev": int(os.getenv("MAX_LEV", 30)),
     "liq_buffer": float(os.getenv("LIQ_BUFFER", 0.15)),
-    "cooldown_min": int(os.getenv("COOLDOWN_MIN", 30)),
+    "cooldown_min": int(os.getenv("COOLDOWN_MIN", 60)),  # 30 → 60 minutes
     "pairs": TOP_PAIRS,
 }
 
@@ -39,6 +39,15 @@ STRATEGY_CONFIG = {
     "QUICK":  {"min_score": 6.2, "tp1_mult": 1.2, "tp2_mult": 1.8, "sl_mult": 0.8, "tp1_exit": 0.6},
     "MID":    {"min_score": 6.5, "tp1_mult": 1.5, "tp2_mult": 2.3, "sl_mult": 1.0, "tp1_exit": 0.5},
     "TREND":  {"min_score": 7.0, "tp1_mult": 2.0, "tp2_mult": 3.2, "sl_mult": 1.2, "tp1_exit": 0.4}
+}
+
+# Daily stats tracking
+DAILY_STATS = {
+    "signals_sent": 0,
+    "tp1_hits": 0,
+    "tp2_hits": 0,
+    "sl_hits": 0,
+    "last_reset": datetime.utcnow()
 }
 
 redis_client: Redis = None
@@ -197,27 +206,12 @@ async def news_guard(sym):
         elif fg_val >= 80: 
             fg_score = -1
         
-        lc_key = os.getenv("LUNARCRUSH_KEY", "")
-        lc_score = 0
-        if lc_key and sym.replace("USDT", "") in {"BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "MATIC", "DOT", "AVAX"}:
-            url = f"https://lunarcrush.com/api4/coin/{sym.replace('USDT', '')}/metrics"
-            headers = {"Authorization": f"Bearer {lc_key}"}
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        sent = (await resp.json()).get("data", {}).get("sentiment", 0)
-                        if sent > 0.6: 
-                            lc_score = +1
-                        elif sent < -0.6: 
-                            lc_score = -1
-        
-        total = fg_score + lc_score
-        return {"score": np.clip(total, -2, 2)}
+        return {"score": fg_score}
     except Exception as e:
         log.debug(f"news-guard err {e}")
         return {"score": 0}
 
-# ---------- DYNAMIC PAIR FILTER (80 coin) ----------
+# ---------- DYNAMIC PAIR FILTER ----------
 async def filtered_pairs():
     r = await redis()
     good = []
@@ -225,7 +219,6 @@ async def filtered_pairs():
     for sym in TOP_PAIRS:
         try:
             ticker = await r.hgetall(f"t:{sym}")
-            # প্রথম run-এ data না থাকলে সব pair allow করো
             if not ticker:
                 good.append(sym)
                 continue
@@ -233,7 +226,6 @@ async def filtered_pairs():
             last = float(ticker.get("last", 0))
             vol24 = float(ticker.get("quoteVolume", 0))
             
-            # যদি data incomplete থাকে, তাও allow করো
             if last == 0 or vol24 == 0:
                 good.append(sym)
                 continue
@@ -252,18 +244,16 @@ async def filtered_pairs():
                 
             spread = (float(asks[0][0]) - float(bids[0][0])) / last * 100
             
-            # নরম শর্ত – 80 কয়েনই পাস করতে চাই
             if vol24 >= 500000 and spread <= 1.5:
                 good.append(sym)
         except Exception as e:
             log.debug(f"filter error {sym}: {e}")
-            good.append(sym)  # error হলেও include করো
+            good.append(sym)
             continue
     
-    log.info(f"✓ Filtered pairs: {len(good)}/{len(TOP_PAIRS)}")
     return good
 
-# ---------- SCORE + DONE-LIST + LEVERAGE ----------
+# ---------- SCORE ----------
 async def calculate_advanced_score(sym, strategy):
     try:
         df = await get_ohlcv(sym, "1m", 120)
@@ -288,7 +278,6 @@ async def calculate_advanced_score(sym, strategy):
         trend = await mtf(sym)
         ng = await news_guard(sym)
 
-        # --- Done list ---
         done = []
         if trend != 0: 
             done.append("EMA-MTF ✅")
@@ -307,7 +296,6 @@ async def calculate_advanced_score(sym, strategy):
         if cv["cvd"] != 0: 
             done.append("CVD ✅")
 
-        # --- Score ---
         score = 0
         score += (50 - abs(rsi - 50)) / 25 * 2
         score += mom * 400
@@ -337,7 +325,7 @@ async def calculate_advanced_score(sym, strategy):
         log.error(f"score error {sym}: {e}")
         return None
 
-# ---------- LEVERAGE SUGGEST ----------
+# ---------- LEVERAGE ----------
 def suggest_leverage(liq_dist, side):
     if liq_dist >= 10: 
         return 30
@@ -353,7 +341,7 @@ def suggest_leverage(liq_dist, side):
 async def calc_tp_sl(sym, side, entry, strategy):
     atr = await get_atr(sym, "5m", 14)
     cfg = STRATEGY_CONFIG[strategy]
-    lev = 15  # default
+    lev = 15
     sl_dist = atr * entry * cfg["sl_mult"]
     liq = entry * (1 - 1 / lev) if side == "long" else entry * (1 + 1 / lev)
     
@@ -369,7 +357,6 @@ async def calc_tp_sl(sym, side, entry, strategy):
     liq_dist = abs(sl - liq) / liq * 100
     lev = suggest_leverage(liq_dist, side)
     
-    # re-calc liq with new lev
     liq = entry * (1 - 1 / lev) if side == "long" else entry * (1 + 1 / lev)
     liq_dist = abs(sl - liq) / liq * 100
     
@@ -394,4 +381,32 @@ async def send_telegram(text):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-log.info("✓ helpers loaded (FINAL-FIXED)")
+# ---------- DAILY SUMMARY ----------
+async def send_daily_summary():
+    total = DAILY_STATS["signals_sent"]
+    tp1 = DAILY_STATS["tp1_hits"]
+    tp2 = DAILY_STATS["tp2_hits"]
+    sl = DAILY_STATS["sl_hits"]
+    
+    win_rate = ((tp1 + tp2) / total * 100) if total > 0 else 0
+    
+    msg = (
+        f"📊 <b>Daily Summary Report</b>\n\n"
+        f"🎯 Signals Sent: {total}\n"
+        f"✅ TP1 Hits: {tp1}\n"
+        f"✅ TP2 Hits: {tp2}\n"
+        f"❌ SL Hits: {sl}\n"
+        f"📈 Win Rate: {win_rate:.1f}%\n\n"
+        f"🕐 Report Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    
+    await send_telegram(msg)
+    
+    # Reset stats
+    DAILY_STATS["signals_sent"] = 0
+    DAILY_STATS["tp1_hits"] = 0
+    DAILY_STATS["tp2_hits"] = 0
+    DAILY_STATS["sl_hits"] = 0
+    DAILY_STATS["last_reset"] = datetime.utcnow()
+
+log.info("✓ helpers loaded (8.5/10 IMPROVED)")
