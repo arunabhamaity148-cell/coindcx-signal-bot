@@ -1,4 +1,4 @@
-main.py — CoinDCX Signal Generator (Manual Trading)
+main.py  CoinDCX Signal Generator (Manual Trading)
 Sends Telegram alerts with TP1/TP2/SL + iceberg instructions
 User executes trades manually on CoinDCX
 """
