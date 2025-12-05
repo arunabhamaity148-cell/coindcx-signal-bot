@@ -182,4 +182,12 @@ async def regime(sym):
 
 FEATURE_COLS = ["rsi_1m", "rsi_5m", "macd_hist", "mom_1m", "mom_5m", "vol_ratio", "atr_1m", "atr_5m", "delta_norm", "delta_momentum", "imbalance", "large_buys", "large_sells", "spread", "depth", "mtf_trend", "reg_trend", "reg_chop", "funding", "poc_dist"]
 
+# ---------- Exchange wrapper ----------
+class Exchange:
+    def __init__(self):
+        self.ex = get_exchange(apiKey=CFG["key"], secret=CFG["secret"], options={"defaultType": "swap"})
+        log.info("✓ CoinDCX initialized (manual trading mode)")
+    async def close(self):
+        await self.ex.close()
+
 # ---------- rest of helpers ----------
