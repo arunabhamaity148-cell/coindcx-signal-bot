@@ -1,9 +1,12 @@
-# ================================================================
-# scorer.py — Optimized (Uses in-memory buffers) — UPDATED
-# ================================================================
-
+# ===========================
+# scorer.py — Optimized + Enhanced
+# ===========================
 import numpy as np
 import logging
+from datetime import datetime
+from typing import Optional
+
+log = logging.getLogger("scorer_v10")
 
 from helpers import (
     build_ohlcv_from_trades,
@@ -14,13 +17,10 @@ from helpers import (
     btc_calm_check,
 )
 
-# NEW imports
-from chart_image import generate_chart_image
-from correlation_engine import correlation_with_btc
+# External enhancement modules (local files in repo)
+# NOTE: import these lazily inside compute_signal to avoid circular imports where needed.
 
-log = logging.getLogger("scorer_v10")
 
-# Strategy thresholds
 STRAT_MIN = {
     "QUICK": 6.8,
     "MID": 7.4,
@@ -86,11 +86,6 @@ def evaluate_logic(params):
     # Volatility Logic
     L["low_atr"] = 1 if atr < last * 0.0018 else 0
 
-    # Correlation based logic (added)
-    corr = params.get("corr_btc", 0)
-    L["corr_positive"] = 1 if corr > 0.4 else 0
-    L["corr_negative"] = 1 if corr < -0.4 else 0
-
     return L
 
 
@@ -103,16 +98,28 @@ def aggregate_score(logic_dict):
 
 async def compute_signal(sym: str, strat: str):
     """
-    Compute signal using in-memory buffers
-
-    NOTE: This function needs to be called with buffers from main.py
-    Import TRADE_BUFFER, OB_CACHE from main when calling
+    Compute signal using in-memory buffers and enhanced modules.
+    This function should be called from main where TRADE_BUFFER and OB_CACHE exist.
     """
+    # Local import to avoid circular imports
+    from main import TRADE_BUFFER, OB_CACHE  # noqa: F401
+    try:
+        from signal_confidence import SignalConfidence, enhance_signal
+        from price_levels import get_complete_levels
+        from volume_analysis import get_volume_insights
+        from telegram_formatter import TelegramFormatter  # if needed
+        from chart_image import generate_chart_image
+        from correlation_engine import correlation_with_btc
+    except Exception as e:
+        log.debug(f"Optional enhancement modules missing: {e}")
+        SignalConfidence = None
+        enhance_signal = None
+        get_complete_levels = None
+        get_volume_insights = None
+        generate_chart_image = None
+        correlation_with_btc = None
 
-    # Import buffers from main (will be set when main imports this)
-    from main import TRADE_BUFFER, OB_CACHE
-
-    # BTC Calm check
+    # BTC calm check
     if sym != "BTCUSDT":
         ok = await btc_calm_check(buffer_dict=TRADE_BUFFER)
         if not ok:
@@ -132,7 +139,7 @@ async def compute_signal(sym: str, strat: str):
     # Indicators
     last = float(o1["close"].iloc[-1])
     mom1 = (last - float(o1["close"].iloc[-2])) / last
-    mom5 = 0
+    mom5 = 0.0
     if o5 is not None and len(o5) > 2:
         mom5 = (last - float(o5["close"].iloc[-2])) / last
 
@@ -160,26 +167,28 @@ async def compute_signal(sym: str, strat: str):
         "mtf": mtf,
     }
 
-    # Correlation: compute with BTC closes from in-memory buffer
+    # Correlation with BTC (optional)
     try:
-        btc_trades = TRADE_BUFFER.get("BTCUSDT", [])
-        btc_closes = [t["p"] for t in btc_trades][-200:]
-        sym_closes = list(o1["close"].values)
-        corr_btc = correlation_with_btc(sym_closes, btc_closes)
-        params["corr_btc"] = corr_btc
-    except Exception as e:
-        params["corr_btc"] = 0
-        log.debug(f"Corr calc failed for {sym}: {e}")
+        if correlation_with_btc and "BTCUSDT" in TRADE_BUFFER:
+            btc = TRADE_BUFFER["BTCUSDT"]
+            btc_closes = [float(t["p"]) for t in list(btc)[-200:]] if btc else []
+            sym_closes = list(map(float, o1["close"].values))
+            if btc_closes and sym_closes:
+                corr_btc = correlation_with_btc(sym_closes, btc_closes)
+                params["corr_btc"] = corr_btc
+    except Exception:
+        params["corr_btc"] = 0.0
 
     # 47 Logic Evaluation
     L = evaluate_logic(params)
     score = aggregate_score(L)
 
-    if score < STRAT_MIN[strat]:
+    if score < STRAT_MIN.get(strat, 0):
         return None
 
     side = "long" if params["imb"] > 0 else "short"
 
+    # Base signal
     signal = {
         "symbol": sym,
         "side": side,
@@ -187,15 +196,55 @@ async def compute_signal(sym: str, strat: str):
         "last": last,
         "strategy": strat,
         "logic": L,
-        "passed": [k for k, v in L.items() if v == 1]
+        "passed": [k for k, v in L.items() if v == 1],
+        "timestamp": datetime.utcnow().isoformat()
     }
 
-    # Add chart image/url
+    # Attach advanced modules if available
+    # 1) Price Levels
     try:
-        chart_url = await generate_chart_image(sym, "1")
-        signal["chart"] = chart_url
+        if get_complete_levels:
+            levels = await get_complete_levels(sym, o1)
+            signal["levels"] = levels
     except Exception as e:
-        signal["chart"] = None
-        log.debug(f"Chart generation failed for {sym}: {e}")
+        log.debug(f"levels error: {e}")
+
+    # 2) Volume Insights
+    try:
+        if get_volume_insights:
+            trades = list(TRADE_BUFFER.get(sym, []))
+            volume = await get_volume_insights(o1, trades)
+            signal["volume"] = volume
+    except Exception as e:
+        log.debug(f"volume error: {e}")
+
+    # 3) Chart image (TradingView or generate)
+    try:
+        if generate_chart_image:
+            chart_url = await generate_chart_image(sym, "1")
+            if chart_url:
+                signal["chart"] = chart_url
+    except Exception as e:
+        log.debug(f"chart image error: {e}")
+
+    # 4) Correlation flags to logic
+    try:
+        corr_val = params.get("corr_btc", 0.0)
+        L["corr_positive"] = 1 if corr_val > 0.4 else 0
+        L["corr_negative"] = 1 if corr_val < -0.4 else 0
+        signal["logic"] = L
+    except Exception:
+        pass
+
+    # 5) Enhance with confidence (optional)
+    try:
+        if SignalConfidence and enhance_signal:
+            # enhance_signal expects signal dict and params; adapt if signature differs
+            enhanced = enhance_signal(signal, params)
+            # ensure we merge fields
+            if isinstance(enhanced, dict):
+                signal.update(enhanced)
+    except Exception as e:
+        log.debug(f"confidence error: {e}")
 
     return signal
