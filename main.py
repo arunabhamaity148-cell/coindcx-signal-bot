@@ -1,246 +1,133 @@
-# main.py — FINAL PATCHED VERSION (BLOCK LOG FIXED)
-
-import os
-import asyncio
-import logging
+# main.py — uses helpers.py, pure-logic signals, telegram notify
+import os, asyncio, logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI
 import uvicorn
-import aiohttp
 
-from helpers import (
-    WS, Exchange, calculate_advanced_score, ai_review_ensemble,
-    calc_tp1_tp2_sl_liq, position_size_iceberg, send_telegram,
-    check_cooldown, set_cooldown, check_daily_signal_limit,
-    increment_signal_count, cleanup, CFG, STRATEGY_CONFIG
-)
+from helpers import WS, calc_score, calc_tp1_tp2_sl_liq, position_size_iceberg, send_signal_telegram, send_telegram, check_cooldown, set_cooldown, increment_signal_count, check_daily_signal_limit, cleanup, CFG
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("main")
 
 bot_task = None
-ping_task = None
 ws_task = None
+ping_task = None
 deploy_notify_task = None
 
-
-# ---------------------------------------------------------------------
-# KEEP ALIVE
-# ---------------------------------------------------------------------
 async def keep_alive():
     port = int(os.getenv("PORT", 8080))
     url = f"http://0.0.0.0:{port}/health"
+    import aiohttp
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        log.debug("Health ping ok")
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+async def bot_loop():
+    log.info("🤖 Starting Signal Bot (Aggressive Mode)...")
+    await asyncio.sleep(5)
+    await send_telegram("🚀 <b>Bot Deployed — Aggressive Logic (No ML)</b>")
 
     while True:
         try:
-            await asyncio.sleep(60)
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        log.info("✓ Health ping OK")
-        except Exception as e:
-            log.error(f"Keep-alive: {e}")
+            limit_ok, reason = await check_daily_signal_limit()
+            if not limit_ok:
+                log.warning(f"Daily limit reached: {reason}")
+                await asyncio.sleep(3600)
+                continue
 
+            for sym in CFG["top_pairs"]:
+                try:
+                    cd_ok, cd_reason = await check_cooldown(sym, "GLOBAL")
+                    if not cd_ok:
+                        log.debug(f"{sym} cooldown: {cd_reason}")
+                        continue
 
-# ---------------------------------------------------------------------
-# BOT LOOP — FULL BLOCK LOG VERSION
-# ---------------------------------------------------------------------
-async def bot_loop():
-    log.info("🤖 Starting CoinDCX signal generator...")
+                    sc = await calc_score(sym)
+                    if sc["side"] == "none":
+                        log.debug(f"{sym} blocked: {sc['reason']}")
+                        continue
 
-    try:
-        ex = Exchange()
-        signal_count = 0
-        await asyncio.sleep(8)
+                    side = sc["side"]
+                    score = sc["score"]
+                    last = sc["last"]
 
-        log.info(f"✓ Bot initialized - Monitoring {len(CFG['pairs'])} pairs")
+                    # TP/SL calculation & liq distance
+                    tp1, tp2, sl, lev, liq_price, liq_dist_pct = await calc_tp1_tp2_sl_liq(sym, side, last, confidence=60, strategy="QUICK")
 
-        while True:
-            try:
-                limit_ok, _ = await check_daily_signal_limit()
-                if not limit_ok:
-                    log.warning("⚠️ Daily signal limit reached (30) — sleeping 1h")
-                    await asyncio.sleep(3600)
+                    # iceberg sizing
+                    iceberg = position_size_iceberg(CFG["equity"], last, sl, lev)
+                    if iceberg["total_qty"] < 0.0005:
+                        log.info(f"{sym} BLOCKED: position too small ({iceberg['total_qty']})")
+                        continue
+
+                    # liq distance alarm: if too close, warn and skip sending normal signal
+                    if liq_dist_pct < float(os.getenv("LIQ_ALERT_PCT", CFG.get("liq_alert_pct", 0.7))):
+                        log.warning(f"LIQ CLOSE {sym}: {liq_dist_pct:.2f}% — skipping signal")
+                        await send_telegram(f"⚠️ LIQ CLOSE ALERT: {sym} | Entry={last} | LiqDist={liq_dist_pct:.2f}%")
+                        # you can choose to continue or still send with warning; we skip to be safe
+                        continue
+
+                    # final signal send
+                    await increment_signal_count()
+                    await send_signal_telegram(sym, "HYBRID", side, last, tp1, tp2, sl, lev, iceberg_info=iceberg, liq_dist_pct=liq_dist_pct, extra=f"Score:{score}")
+                    await set_cooldown(sym, "GLOBAL")
+                    log.info(f"✅ SIGNAL {sym} {side} Score={score} Lev={lev} LiqDist={liq_dist_pct:.2f}%")
+                    # aggressive mode cadence: small sleep between symbols
+                    await asyncio.sleep(0.6)
+
+                except Exception as e:
+                    log.error(f"Symbol loop error {sym}: {e}")
                     continue
 
-                # ========== MAIN PAIR LOOP ==============
-                for sym in CFG["pairs"]:
-                    for strategy in ["QUICK", "MID", "TREND"]:
+            await asyncio.sleep(1)
 
-                        # cooldown
-                        ok, cd_reason = await check_cooldown(sym, strategy)
-                        if not ok:
-                            log.debug(f"⏳ Cooldown [{strategy}] {sym}: {cd_reason}")
-                            continue
+        except Exception as e:
+            log.error(f"Bot loop error: {e}")
+            await asyncio.sleep(5)
 
-                        # heuristic score
-                        try:
-                            signal = await calculate_advanced_score(sym, strategy)
-                        except Exception as e:
-                            log.error(f"Score error {sym} [{strategy}]: {e}")
-                            continue
-
-                        if not signal:
-                            continue
-                        if signal["side"] == "none":
-                            continue
-
-                        side = signal["side"]
-                        score = signal["score"]
-                        last = signal["last"]
-
-                        # ML/AI check
-                        ai = await ai_review_ensemble(sym, side, score, strategy)
-                        if not ai["allow"]:
-                            log.info(
-                                f"🚫 BLOCKED [{strategy}] {sym} — {ai['reason']} | "
-                                f"Conf={ai['confidence']} | Score={score:.2f}"
-                            )
-                            continue
-
-                        confidence = ai["confidence"]
-
-                        # TP/SL
-                        try:
-                            tp1, tp2, sl, leverage, liq_price = await calc_tp1_tp2_sl_liq(
-                                sym, side, last, confidence, strategy
-                            )
-                        except Exception as e:
-                            log.error(f"TP/SL error {sym}: {e}")
-                            continue
-
-                        # RRR
-                        risk = abs(last - sl)
-                        reward = abs(tp1 - last)
-                        rrr = reward / risk if risk > 0 else 0
-
-                        if rrr < 1.0:
-                            log.info(f"🚫 BLOCKED [{strategy}] {sym} — RRR low ({rrr:.2f})")
-                            continue
-
-                        # ORDERFLOW — FIXED IMPORT
-                        from helpers import orderflow_analysis
-                        flow = await orderflow_analysis(sym)
-
-                        if not flow:
-                            log.info(f"🚫 BLOCKED [{strategy}] {sym} — no-flow")
-                            continue
-
-                        if flow["spread"] > 0.25:
-                            log.info(f"🚫 BLOCKED [{strategy}] {sym} — spread {flow['spread']:.3f}%")
-                            continue
-
-                        if flow["depth_usd"] < 300000:
-                            log.info(
-                                f"🚫 BLOCKED [{strategy}] {sym} — depth low ({flow['depth_usd']})"
-                            )
-                            continue
-
-                        # position size
-                        pos = position_size_iceberg(CFG["equity"], last, sl, leverage)
-                        if pos["total_qty"] < 0.001:
-                            log.info(f"🚫 BLOCKED [{strategy}] {sym} — pos too small")
-                            continue
-
-                        # ---------- SIGNAL APPROVED ----------
-                        signal_count += 1
-                        await increment_signal_count()
-
-                        log.info(
-                            f"✅ SIGNAL [{strategy}] {sym} {side.upper()} #{signal_count} "
-                            f"Entry={last:.6f} | TP1={tp1:.6f} | SL={sl:.6f}"
-                        )
-
-                        # telegram
-                        msg = (
-                            f"🎯 <b>[{strategy}] {sym} {side.upper()} #{signal_count}</b>\n"
-                            f"Entry: <code>{last:.2f}</code>\n"
-                            f"TP1: <code>{tp1:.2f}</code>\n"
-                            f"TP2: <code>{tp2:.2f}</code>\n"
-                            f"SL: <code>{sl:.2f}</code>\n"
-                            f"Lev: {leverage}x\n"
-                            f"Score: {score:.2f}\n"
-                            f"Conf: {confidence}%\n"
-                            f"RRR: {rrr:.2f}\n"
-                        )
-
-                        await send_telegram(msg)
-                        await set_cooldown(sym, strategy)
-                        break
-
-                await asyncio.sleep(3)
-
-            except Exception as e:
-                log.error(f"Bot loop error: {e}")
-                await asyncio.sleep(5)
-
-    except Exception as e:
-        log.exception(f"FATAL BOT CRASH: {e}")
-
-
-# ---------------------------------------------------------------------
-# DEPLOY NOTIFICATION
-# ---------------------------------------------------------------------
-async def send_deploy_telegram():
-    await asyncio.sleep(5)
+async def send_deploy_notify():
+    await asyncio.sleep(3)
     try:
-        msg = (
-            f"🚀 <b>Bot Deployed</b>\n"
-            f"Env: production\n"
-            f"Pairs: {len(CFG['pairs'])}\n"
-            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-        await send_telegram(msg)
-        log.info("📨 Deploy message sent.")
+        await send_telegram(f"🚀 Bot active — pairs: {len(CFG['top_pairs'])} — Mode: Aggressive (No ML) — Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     except Exception as e:
-        log.error(f"Deploy telegram error: {e}")
+        log.error(f"Deploy notify error: {e}")
 
-
-# ---------------------------------------------------------------------
-# LIFESPAN MANAGER
-# ---------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task, bot_task, ping_task, deploy_notify_task
-
-    log.info("🚀 Starting services...")
-
+    log.info("Starting services...")
     ws = WS()
     ws_task = asyncio.create_task(ws.run())
     bot_task = asyncio.create_task(bot_loop())
     ping_task = asyncio.create_task(keep_alive())
-    deploy_notify_task = asyncio.create_task(send_deploy_telegram())
-
+    deploy_notify_task = asyncio.create_task(send_deploy_notify())
     try:
         yield
     finally:
-        log.info("🛑 Shutting down tasks...")
+        log.info("Shutting down...")
         for t in [ws_task, bot_task, ping_task, deploy_notify_task]:
             if t:
                 t.cancel()
         await asyncio.gather(*[t for t in [ws_task, bot_task, ping_task, deploy_notify_task] if t], return_exceptions=True)
         await cleanup()
-        log.info("✓ Shutdown complete")
+        log.info("Shutdown complete")
 
-
-# ---------------------------------------------------------------------
-# FASTAPI APP
-# ---------------------------------------------------------------------
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def root():
-    return {"status": "running", "pairs": len(CFG["pairs"])}
+    return {"status":"running","pairs":len(CFG["top_pairs"])}
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status":"ok"}
 
-
-# ---------------------------------------------------------------------
-# RUN UVICORN
-# ---------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
