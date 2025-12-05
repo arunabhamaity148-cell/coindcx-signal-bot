@@ -76,7 +76,7 @@ class WS:
 
 async def get_ohlcv(sym, tf="5m", limit=100):
     try:
-        ex = ccxt.coindcx({"enableRateLimit": True})
+        ex = ccxt.coincdcx({"enableRateLimit": True})
         ohlcv = await ex.fetch_ohlcv(sym, tf, limit=limit)
         await ex.close()
         df = pd.DataFrame(ohlcv, columns=["t", "o", "h", "l", "c", "v"])
