@@ -1,8 +1,4 @@
-"""
-CoinDCX Signal Generator (Manual Trading)
-Sends Telegram alerts with TP1/TP2/SL + iceberg instructions
-User executes trades manually on CoinDCX
-"""
+# main.py
 import os
 import asyncio
 import logging
@@ -11,6 +7,7 @@ from datetime import datetime
 from fastapi import FastAPI
 import uvicorn
 import aiohttp
+
 from helpers import (
     WS, Exchange, calculate_advanced_score, ai_review_ensemble,
     calc_tp1_tp2_sl_liq, position_size_iceberg, send_telegram,
@@ -44,7 +41,7 @@ async def bot_loop():
         ex = Exchange()
         signal_count = 0
         await asyncio.sleep(8)
-        log.info("✓ Bot initialized - Monitoring 80 pairs")
+        log.info(f"✓ Bot initialized - Monitoring {len(CFG['pairs'])} pairs")
         while True:
             try:
                 limit_ok, limit_reason = await check_daily_signal_limit()
@@ -60,7 +57,7 @@ async def bot_loop():
                                 if not cooldown_ok:
                                     continue
                                 signal = await calculate_advanced_score(sym, strategy)
-                                if not signal or signal["side"] == "none":
+                                if not signal or signal.get("side") == "none":
                                     continue
                                 side = signal["side"]
                                 score = signal["score"]
@@ -88,11 +85,14 @@ async def bot_loop():
                                 log.info(f"🎯 [{strategy}] {sym} {side.upper()} #{signal_count}")
                                 log.info(f"   Entry: {last:.6f} | TP1: {tp1:.6f} | TP2: {tp2:.6f} | SL: {sl:.6f}")
                                 log.info(f"   Lev: {leverage}x | Conf: {confidence}% | Score: {score:.2f}")
-                                sl_to_liq = abs(sl - liq_price) / liq_price * 100
+                                sl_to_liq = abs(sl - liq_price) / liq_price * 100 if liq_price else 0
                                 tp1_exit_pct = STRATEGY_CONFIG[strategy]["tp1_exit"] * 100
+                                flow = await ai_review_ensemble.__self__.orderflow_analysis(sym) if False else None  # noop; flow fetched below
+                                # we'll fetch flow for display via helpers.orderflow_analysis
+                                from helpers import orderflow_analysis
                                 flow = await orderflow_analysis(sym)
                                 spread_txt = f"{flow['spread']:.2f}%" if flow else "N/A"
-                                depth_txt = f"{flow['depth_usd']/1e3:.0f}k" if flow else "N/A"
+                                depth_txt = f"{(flow['depth_usd']/1e3):.0f}k" if flow else "N/A"
                                 msg = (
                                     f"🎯 <b>[{strategy}] {sym} {side.upper()} #{signal_count}</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -119,7 +119,7 @@ async def bot_loop():
                                     f"3️⃣ Set SL @ <code>{sl:,.2f}</code>\n"
                                     f"4️⃣ Exit <b>{tp1_exit_pct:.0f}%</b> @ TP1: <code>{tp1:,.2f}</code>\n"
                                     f"5️⃣ Exit remaining @ TP2: <code>{tp2:,.2f}</code>\n\n"
-                                    f"⏰ <b>Strategy:</b> {strategy} scalp<b>Strategy:</b> {strategy} scalp\n"
+                                    f"⏰ <b>Strategy:</b> {strategy} scalp\n"
                                     f"🕐 <b>Signal time:</b> {datetime.utcnow().strftime('%H:%M UTC')}\n"
                                     f"🔄 <b>Cooldown:</b> {CFG['cooldown_min']} min"
                                 )
@@ -138,7 +138,10 @@ async def bot_loop():
                 await asyncio.sleep(10)
     except asyncio.CancelledError:
         log.info("🛑 Bot cancelled")
-        await ex.close()
+        try:
+            await ex.close()
+        except Exception:
+            pass
         raise
     except Exception as e:
         log.exception(f"💥 Bot crashed: {e}")
@@ -162,7 +165,7 @@ async def lifespan(app: FastAPI):
         for task in [ws_task, bot_task, ping_task]:
             if task:
                 task.cancel()
-        await asyncio.gather(ws_task, bot_task, ping_task, return_exceptions=True)
+        await asyncio.gather(*(t for t in [ws_task, bot_task, ping_task] if t), return_exceptions=True)
         await cleanup()
         log.info("✅ Shutdown complete")
 
@@ -178,14 +181,6 @@ def root():
         "time": datetime.utcnow().isoformat(),
         "pairs": len(CFG["pairs"]),
         "strategies": ["QUICK", "MID", "TREND"],
-        "features": [
-            "TP1/TP2/SL signals",
-            "Iceberg order instructions",
-            "Liquidation-safe calculations",
-            "15-30x smart leverage",
-            "45min cooldown",
-            "20-30 alerts/day"
-        ]
     }
 
 @app.get("/health")
