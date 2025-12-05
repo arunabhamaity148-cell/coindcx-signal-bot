@@ -1,10 +1,9 @@
-# ============================================================
-# scorer.py — ADVANCED SCORING ENGINE (Quick / Mid / Trend)
-# ============================================================
+# ================================================================
+# scorer.py — Hybrid Scorer v10 (BTC Calm + MTF + 47 Logic System)
+# ================================================================
 
-import asyncio
+import numpy as np
 import logging
-from typing import Dict, Any, Optional
 
 from helpers import (
     build_ohlcv_from_trades,
@@ -13,137 +12,170 @@ from helpers import (
     calc_vwap_from_trades,
     orderflow_metrics,
     btc_calm_check,
-    score_from_components,
 )
 
-log = logging.getLogger("scorer")
+log = logging.getLogger("scorer_v10")
 
-
-# STRATEGY CONFIG
-STRATEGY = {
-    "QUICK": {
-        "min_score": 6.2,
-        "tp1_mult": 1.2,
-        "tp2_mult": 1.8,
-        "sl_mult": 0.8,
-    },
-    "MID": {
-        "min_score": 6.6,
-        "tp1_mult": 1.5,
-        "tp2_mult": 2.3,
-        "sl_mult": 1.0,
-    },
-    "TREND": {
-        "min_score": 7.4,
-        "tp1_mult": 2.0,
-        "tp2_mult": 3.2,
-        "sl_mult": 1.2,
-    }
+# Strategy thresholds
+STRAT_MIN = {
+    "QUICK": 6.8,
+    "MID": 7.4,
+    "TREND": 8.0
 }
 
 
-# -----------------------------
-# CORE SCORE BUILDER
-# -----------------------------
-async def compute_score(sym: str, strategy: str) -> Optional[Dict[str, Any]]:
-    """
-    Build complete scoring result for a symbol.
-    Returns None if insufficient data OR filters fail.
-    Output:
-    {
-        'side': 'long/short',
-        'score': float,
-        'entry': price,
-        'done': 'RSI|VWAP|FLOW|...',
-        ...
-    }
-    """
+# --------------------------------------------------------------
+# Compute MTF EMA structure (1m/5m/15m/60m)
+# --------------------------------------------------------------
+def compute_mtf(df1, df5, df15, df60):
+    def ema_state(df):
+        if df is None or len(df) < 60:
+            return None
+        close = df["close"]
+        ema20 = close.ewm(span=20).mean().iloc[-1]
+        ema50 = close.ewm(span=50).mean().iloc[-1]
+        return 1 if ema20 > ema50 else -1
 
-    # 1️⃣ BTC calm check (mandatory)
-    calm = await btc_calm_check()
-    if not calm:
-        log.debug(f"{sym} blocked → BTC not calm")
+    states = [ema_state(df1), ema_state(df5), ema_state(df15), ema_state(df60)]
+    bull = sum(1 for s in states if s == 1)
+    bear = sum(1 for s in states if s == -1)
+    return {"bull": bull, "bear": bear}
+
+
+# --------------------------------------------------------------
+# 47 LOGIC EVALUATOR
+# --------------------------------------------------------------
+def evaluate_logic(params):
+    L = {}
+
+    rsi = params["rsi"]
+    last = params["last"]
+    vwap = params["vwap"]
+    imb = params["imb"]
+    depth = params["depth"]
+    spread = params["spread"]
+    atr = params["atr"]
+    mom1 = params["mom1"]
+    mom5 = params["mom5"]
+    mtf = params["mtf"]
+
+    # ========== Trend & MTF Logic ==========
+    L["mtf_bull"] = 1 if mtf["bull"] >= 3 else 0
+    L["mtf_bear"] = 1 if mtf["bear"] >= 3 else 0
+    L["atr_stable"] = 1 if atr < (last * 0.002) else 0
+    L["vwap_close"] = 1 if abs(last - vwap) / vwap < 0.002 else 0
+
+    # ========== Momentum Logic ==========
+    L["mom1"] = 1 if abs(mom1) > 0.0008 else 0
+    L["mom5"] = 1 if abs(mom5) > 0.0015 else 0
+    L["imbalance"] = 1 if abs(imb) > 0.05 else 0
+    L["spread_ok"] = 1 if spread < 0.32 else 0
+    L["depth_ok"] = 1 if depth > 30000 else 0
+
+    # ========== RSI Logic ==========
+    L["rsi_mid"] = 1 if 45 <= rsi <= 55 else 0
+    L["rsi_flip"] = 1 if (rsi > 50 and mom1 > 0) else 0
+    L["rsi_div"] = 1 if (mom1 > 0 and rsi < 50) or (mom1 < 0 and rsi > 50) else 0
+
+    # ========== VWAP Logic ==========
+    L["vwap_small_dev"] = 1 if abs(last - vwap) / vwap < 0.0025 else 0
+    L["vwap_momentum"] = 1 if (last > vwap and mom1 > 0) else 0
+
+    # ========== Orderflow Logic ==========
+    L["imb_buy"] = 1 if imb > 0.05 else 0
+    L["imb_sell"] = 1 if imb < -0.05 else 0
+
+    # ========== Volatility Logic ==========
+    L["low_atr"] = 1 if atr < last * 0.0018 else 0
+
+    return L
+
+
+# --------------------------------------------------------------
+# Hybrid score aggregator
+# --------------------------------------------------------------
+def aggregate_score(logic_dict):
+    score = 0
+    for k, v in logic_dict.items():
+        score += v
+    return float(score)
+
+
+# --------------------------------------------------------------
+# Compute final signal for a symbol
+# --------------------------------------------------------------
+async def compute_signal(sym: str, strat: str):
+    # -------------------------
+    # BTC Calm mandatory
+    # -------------------------
+    if sym != "BTCUSDT":
+        ok = await btc_calm_check()
+        if not ok:
+            return None
+
+    # -------------------------
+    # Build MTF OHLC
+    # -------------------------
+    o1 = await build_ohlcv_from_trades(sym, "1min", 200)
+    if o1 is None or len(o1) < 60:
         return None
 
-    # 2️⃣ Build OHLC
-    ohlc = await build_ohlcv_from_trades(sym, tf="1min", limit=120)
-    if ohlc is None or len(ohlc) < 30:
-        log.debug(f"{sym} no OHLC data")
-        return None
+    o5 = await build_ohlcv_from_trades(sym, "5min", 200)
+    o15 = await build_ohlcv_from_trades(sym, "15min", 200)
+    o60 = await build_ohlcv_from_trades(sym, "60min", 200)
 
-    close = ohlc["close"]
-    last = float(close.iloc[-1])
+    mtf = compute_mtf(o1, o5, o15, o60)
 
-    # 3️⃣ Indicators
-    # RSI
-    rsi = float(calc_rsi(close).iloc[-1] or 50.0)
+    # -------------------------
+    # Indicators
+    # -------------------------
+    last = float(o1["close"].iloc[-1])
+    mom1 = (last - float(o1["close"].iloc[-2])) / last
+    mom5 = 0
+    if o5 is not None and len(o5) > 2:
+        mom5 = (last - float(o5["close"].iloc[-2])) / last
 
-    # ATR
-    atr = float(calc_atr(ohlc, period=14))
+    rsi = float(calc_rsi(o1["close"]).iloc[-1])
+    atr = float(calc_atr(o1))
 
-    # VWAP
     vwap = await calc_vwap_from_trades(sym)
     if vwap is None:
         return None
 
-    # Orderflow
     flow = await orderflow_metrics(sym)
     if not flow:
         return None
 
-    imb = flow["imbalance"]
-    spread = flow["spread_pct"] if flow["spread_pct"] else 0.2
-    depth = flow["depth_usd"]
+    params = {
+        "rsi": rsi,
+        "atr": atr,
+        "vwap": vwap,
+        "imb": flow["imbalance"],
+        "depth": flow["depth_usd"],
+        "spread": flow["spread_pct"],
+        "last": last,
+        "mom1": mom1,
+        "mom5": mom5,
+        "mtf": mtf,
+    }
 
-    # 4️⃣ Filters
-    passed = []
+    # -------------------------
+    # 47 Logic Evaluation
+    # -------------------------
+    L = evaluate_logic(params)
+    score = aggregate_score(L)
 
-    # RSI filter
-    if abs(rsi - 50) < 25:
-        passed.append("RSI")
-
-    # VWAP filter
-    if abs(last - vwap) / vwap < 0.0025:
-        passed.append("VWAP")
-
-    # Imbalance filter
-    if abs(imb) > 0.05:
-        passed.append("Flow")
-
-    # Depth filter
-    if depth > 30000:
-        passed.append("Depth")
-
-    # Spread filter
-    if spread < 0.3:
-        passed.append("Spread")
-
-    # No filters → reject
-    if len(passed) == 0:
+    if score < STRAT_MIN[strat]:
         return None
 
-    # 5️⃣ Side detection
-    side = "long" if imb > 0 else "short"
+    side = "long" if params["imb"] > 0 else "short"
 
-    # 6️⃣ Composite Score
-    score = score_from_components(rsi, imb, spread, atr)
-
-    # 7️⃣ Strategy threshold
-    req = STRATEGY[strategy]["min_score"]
-    if score < req:
-        return None
-
-    # 8️⃣ Return final dict
     return {
         "symbol": sym,
         "side": side,
-        "score": float(score),
-        "entry": last,
-        "rsi": rsi,
-        "vwap": vwap,
-        "imb": imb,
-        "spread": spread,
-        "depth": depth,
-        "done": " | ".join(passed),
-        "strategy_cfg": STRATEGY[strategy],
+        "score": score,
+        "last": last,
+        "strategy": strat,
+        "logic": L,
+        "passed": [k for k, v in L.items() if v == 1]
     }
