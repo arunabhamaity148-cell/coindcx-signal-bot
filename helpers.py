@@ -1,6 +1,13 @@
-"""
-helpers.py  –  FULL (Redis / WS / ML / risk / Telegram / exchange)
-DEBUG print inside calculate_advanced_score
+helpers.py — CoinDCX Manual Trading System (FINAL)
+Features:
+- 3 Strategies: QUICK/MID/TREND
+- Telegram signals: Entry, TP1, TP2, SL
+- Manual execution (no auto-trading)
+- Iceberg order support
+- 15-30x smart leverage
+- Liquidation-safe calculations
+- 80 pairs, 20-30 alerts/day
+- 45min cooldown per symbol-strategy
 """
 import os, json, asyncio, logging, joblib, aiohttp, pandas as pd, numpy as np
 from datetime import datetime, timedelta
@@ -14,18 +21,48 @@ log = logging.getLogger("helpers")
 
 # ---------- CONFIG ----------
 CFG = {
-    "key": os.getenv("BINANCE_KEY"),
-    "secret": os.getenv("BINANCE_SECRET"),
+    "key": os.getenv("COINDCX_KEY"),
+    "secret": os.getenv("COINDCX_SECRET"),
     "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379"),
-    "testnet": os.getenv("USE_TESTNET", "false").lower() == "true",
     "tg_token": os.getenv("TELEGRAM_TOKEN"),
     "tg_chat": os.getenv("TELEGRAM_CHAT_ID"),
-    "equity": float(os.getenv("EQUITY_USD", 6000)),
-    "risk_perc": float(os.getenv("RISK_PERC", 0.8)),
-    "max_lev": int(os.getenv("MAX_LEV", 15)),
-    "pairs": json.loads(os.getenv("TOP_PAIRS", '["BTCUSDT","ETHUSDT"]')),
-    "min_score": float(os.getenv("MIN_SCORE", 5.8)),
-    "min_rrr": float(os.getenv("MIN_RRR", 1.0)),
+    "equity": float(os.getenv("EQUITY_USD", 100000)),
+    "risk_perc": float(os.getenv("RISK_PERC", 1.0)),
+    "min_lev": int(os.getenv("MIN_LEV", 15)),
+    "max_lev": int(os.getenv("MAX_LEV", 30)),
+    "liq_buffer": float(os.getenv("LIQ_BUFFER", 0.15)),
+    "cooldown_min": int(os.getenv("COOLDOWN_MIN", 45)),
+    "pairs": json.loads(os.getenv("TOP_PAIRS", '''[
+        "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","MATICUSDT",
+        "DOTUSDT","AVAXUSDT","LINKUSDT","ATOMUSDT","LTCUSDT","UNIUSDT","ETCUSDT","FILUSDT",
+        "TRXUSDT","NEARUSDT","ARBUSDT","APTUSDT","INJUSDT","STXUSDT","TIAUSDT","SEIUSDT",
+        "OPUSDT","SUIUSDT","FETUSDT","RENDERUSDT","IMXUSDT","RUNEUSDT","XLMUSDT","ALGOUSDT",
+        "SANDUSDT","ICPUSDT","GRTUSDT","AAVEUSDT","LDOUSDT","HBARUSDT","FTMUSDT","VETUSDT",
+        "MANAUSDT","AXSUSDT","THETAUSDT","FLOWUSDT","SNXUSDT","CHZUSDT","ENJUSDT","MKRUSDT",
+        "COMPUSDT","KSMUSDT","XTZUSDT","ZECUSDT","DASHUSDT","BATUSDT","ZILUSDT","ONTUSDT",
+        "IOSTUSDT","IOTAUSDT","QTUMUSDT","WAVESUSDT","ZRXUSDT","OMGUSDT","CRVUSDT","YFIUSDT",
+        "BALUSDT","1INCHUSDT","RLCUSDT","KAVAUSDT","SUSHIUSDT","OCEANUSDT","RSRUSDT","CELOUSDT",
+        "BANDUSDT","STORJUSDT","CELRUSDT","SKLUSDT","ANKRUSDT","BLZUSDT","ARPAUSDT","NMRUSDT"
+    ]''')),
+}
+
+# Strategy configs
+STRATEGY_CONFIG = {
+    "QUICK": {
+        "min_score": 7.0, "max_score": 8.5,
+        "tp1_mult": 1.2, "tp2_mult": 1.8, "sl_mult": 0.8,
+        "min_conf": 60, "tp1_exit": 0.5  # Exit 50% at TP1
+    },
+    "MID": {
+        "min_score": 7.2, "max_score": 8.8,
+        "tp1_mult": 1.5, "tp2_mult": 2.5, "sl_mult": 1.0,
+        "min_conf": 65, "tp1_exit": 0.4  # Exit 40% at TP1
+    },
+    "TREND": {
+        "min_score": 7.5, "max_score": 10.0,
+        "tp1_mult": 2.0, "tp2_mult": 3.5, "sl_mult": 1.2,
+        "min_conf": 70, "tp1_exit": 0.3  # Exit 30% at TP1
+    },
 }
 
 # ---------- REDIS ----------
@@ -38,297 +75,485 @@ async def redis():
         log.info("✓ Redis connected")
     return redis_client
 async def redis_close():
-    if redis_client: await redis_client.close()
+    global redis_client
+    if redis_client:
+        await redis_client.close()
+        redis_client = None
 
-# ---------- WEBSOCKET ----------
+# ---------- WEBSOCKET (REST Polling) ----------
 class WS:
-    def __init__(self): self.url = "wss://fstream.binance.com/stream?streams="; self.running = False
-    def build(self):
-        streams = []
-        for p in CFG["pairs"]:
-            pl = p.lower()
-            streams += [f"{pl}@ticker", f"{pl}@depth20@100ms", f"{pl}@trade", f"{pl}@kline_1m", f"{pl}@kline_5m"]
-        self.url += "/".join(streams)
+    def __init__(self):
+        self.running = False
+        self.ex = ccxt.coindcx({"enableRateLimit": True})
+    
     async def run(self):
-        self.build(); self.running = True; retry = 0
-        while self.running and retry < 10:
+        self.running = True
+        log.info("🔌 Starting CoinDCX data polling...")
+        
+        while self.running:
             try:
-                log.info("🔌 WS connect")
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(self.url, heartbeat=30) as ws:
-                        log.info("✓ WS connected"); retry = 0
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._handle(json.loads(msg.data))
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
+                for sym in CFG["pairs"]:
+                    try:
+                        ticker = await self.ex.fetch_ticker(sym)
+                        orderbook = await self.ex.fetch_order_book(sym, limit=20)
+                        trades = await self.ex.fetch_trades(sym, limit=100)
+                        
+                        r = await redis()
+                        
+                        await r.hset(f"t:{sym}", mapping={
+                            "last": ticker['last'],
+                            "vol": ticker.get('baseVolume', 0),
+                            "E": int(datetime.utcnow().timestamp() * 1000)
+                        })
+                        
+                        await r.hset(f"d:{sym}", mapping={
+                            "bids": json.dumps(orderbook['bids'][:20]),
+                            "asks": json.dumps(orderbook['asks'][:20]),
+                            "E": int(datetime.utcnow().timestamp() * 1000)
+                        })
+                        
+                        for t in trades[-100:]:
+                            trade = json.dumps({
+                                "p": t['price'],
+                                "q": t['amount'],
+                                "m": t['side'] == 'sell'
+                            })
+                            await r.lpush(f"tr:{sym}", trade)
+                        await r.ltrim(f"tr:{sym}", 0, 499)
+                        
+                    except Exception as e:
+                        log.debug(f"Poll {sym}: {e}")
+                        continue
+                
+                await asyncio.sleep(2)
+                
             except asyncio.CancelledError:
-                self.running = False; break
+                self.running = False
+                break
             except Exception as e:
-                retry += 1; await asyncio.sleep(min(retry * 2, 30))
-    async def _handle(self, data):
-        try:
-            r = await redis(); stream = data.get("stream", ""); d = data.get("data", {}); s = d.get("s")
-            if not s: return
-            if "@ticker" in stream:
-                await r.hset(f"t:{s}", mapping={"last": d.get("c"), "vol": d.get("v")})
-            elif "@depth20" in stream:
-                await r.hset(f"d:{s}", mapping={"bids": json.dumps(d.get("bids")), "asks": json.dumps(d.get("asks"))})
-            elif "@trade" in stream:
-                trade = json.dumps({"p": d.get("p"), "q": d.get("q"), "m": d.get("m")})
-                await r.lpush(f"tr:{s}", trade); await r.ltrim(f"tr:{s}", 0, 499)
-            elif "@kline" in stream and d.get("k", {}).get("x"):
-                k = d["k"]; kline = json.dumps({"t": k["t"], "o": k["o"], "h": k["h"], "l": k["l"], "c": k["c"], "v": k["v"]})
-                await r.lpush(f"kline_{k['i']}:{s}", kline); await r.ltrim(f"kline_{k['i']}:{s}", 0, 199)
-        except Exception as e: log.error(f"WS handler: {e}")
+                log.error(f"WS polling: {e}")
+                await asyncio.sleep(5)
 
-# ---------- OHLCV / ATR / RSI / MTF / ORDERFLOW / REGIME / FEATURE ----------
+# ---------- OHLCV ----------
 async def get_ohlcv(sym, tf="5m", limit=100):
     try:
-        r = await redis(); klines_raw = await r.lrange(f"kline_{tf}:{sym}", 0, limit - 1)
-        if not klines_raw: return None
-        klines = [json.loads(k) for k in reversed(klines_raw)]
-        df = pd.DataFrame(klines); df[["o", "h", "l", "c", "v"]] = df[["o", "h", "l", "c", "v"]].astype(float); df["t"] = pd.to_datetime(df["t"], unit="ms")
+        ex = ccxt.coindcx({"enableRateLimit": True})
+        ohlcv = await ex.fetch_ohlcv(sym, tf, limit=limit)
+        await ex.close()
+        df = pd.DataFrame(ohlcv, columns=["t", "o", "h", "l", "c", "v"])
+        df["t"] = pd.to_datetime(df["t"], unit="ms")
         return df
-    except Exception as e: log.error(f"OHLCV {sym}: {e}"); return None
+    except Exception as e:
+        log.error(f"OHLCV {sym} {tf}: {e}")
+        return None
 
 async def get_real_atr(sym, tf="5m", period=14):
     df = await get_ohlcv(sym, tf, limit=period + 20)
     if df is None or len(df) < period: return 0.005
     tr = np.maximum(df["h"] - df["l"], np.maximum(np.abs(df["h"] - df["c"].shift()), np.abs(df["l"] - df["c"].shift())))
-    return float(tr.rolling(period).mean().iloc[-1] / df["c"].iloc[-1])
+    atr = tr.rolling(period).mean().iloc[-1]
+    return float(atr / df["c"].iloc[-1])
 
 def calc_rsi(series, period=14):
-    delta = series.diff(); gain = delta.clip(lower=0).rolling(period).mean(); loss = -delta.clip(upper=0).rolling(period).mean()
-    rs = gain / (loss + 1e-10); return 100 - (100 / (1 + rs))
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / (loss + 1e-10)
+    return 100 - (100 / (1 + rs))
 
 async def mtf_trend(sym):
     trends = []
-    for tf in ["1m", "5m", "15m"]:
+    for tf in ["1m", "5m"]:
         df = await get_ohlcv(sym, tf, 50)
         if df is None or len(df) < 50: continue
-        ema20, ema50 = df["c"].ewm(span=20).mean().iloc[-1], df["c"].ewm(span=50).mean().iloc[-1]
+        ema20 = df["c"].ewm(span=20).mean().iloc[-1]
+        ema50 = df["c"].ewm(span=50).mean().iloc[-1]
         trends.append(1 if ema20 > ema50 else -1)
     if not trends: return 0
     avg = sum(trends) / len(trends)
-    return 1 if avg > 0.6 else -1 if avg < -0.6 else 0
+    return 1 if avg > 0.5 else -1 if avg < -0.5 else 0
 
 async def orderflow_analysis(sym):
     try:
-        r, trades_raw = await redis(), await r.lrange(f"tr:{sym}", 0, 499)
+        r = await redis()
+        trades_raw = await r.lrange(f"tr:{sym}", 0, 499)
         if not trades_raw: return None
+        
         trades = [json.loads(t) for t in trades_raw]
-        delta = sum(float(t["q"]) if t["m"] == "false" else -float(t["q"]) for t in trades)
-        recent_delta = sum(float(t["q"]) if t["m"] == "false" else -float(t["q"]) for t in trades[:50])
-        volumes = [float(t["q"]) for t in trades]; avg_vol, std_vol = np.mean(volumes), np.std(volumes)
-        large_buys = sum(1 for t in trades[:20] if t["m"] == "false" and float(t["q"]) > avg_vol + 2 * std_vol)
-        large_sells = sum(1 for t in trades[:20] if t["m"] == "true" and float(t["q"]) > avg_vol + 2 * std_vol)
+        delta = sum(float(t["q"]) if not t["m"] else -float(t["q"]) for t in trades)
+        recent_delta = sum(float(t["q"]) if not t["m"] else -float(t["q"]) for t in trades[:50])
+        
+        volumes = [float(t["q"]) for t in trades]
+        avg_vol = np.mean(volumes)
+        std_vol = np.std(volumes)
+        large_buys = sum(1 for t in trades[:20] if not t["m"] and float(t["q"]) > avg_vol + 2 * std_vol)
+        large_sells = sum(1 for t in trades[:20] if t["m"] and float(t["q"]) > avg_vol + 2 * std_vol)
+        
         depth_raw = await r.hgetall(f"d:{sym}")
         if not depth_raw: return None
-        bids, asks = json.loads(depth_raw.get("bids", "[]")), json.loads(depth_raw.get("asks", "[]"))
+        
+        bids = json.loads(depth_raw.get("bids", "[]"))
+        asks = json.loads(depth_raw.get("asks", "[]"))
         if not bids or not asks: return None
-        bid_vol, ask_vol = sum(float(b[1]) for b in bids[:5]), sum(float(a[1]) for a in asks[:5])
+        
+        bid_vol = sum(float(b[1]) for b in bids[:5])
+        ask_vol = sum(float(a[1]) for a in asks[:5])
         imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-10)
+        
         spread = (float(asks[0][0]) - float(bids[0][0])) / float(bids[0][0]) * 100
         depth_usd = sum(float(b[0]) * float(b[1]) for b in bids[:10]) + sum(float(a[0]) * float(a[1]) for a in asks[:10])
-        return {"delta": delta, "recent_delta": recent_delta, "large_buys": large_buys, "large_sells": large_sells, "imbalance": imbalance, "spread": spread, "depth_usd": depth_usd, "delta_momentum": recent_delta / (abs(delta) + 1e-6)}
-    except Exception as e: log.error(f"Orderflow {sym}: {e}"); return None
+        
+        return {
+            "delta": delta, "recent_delta": recent_delta,
+            "large_buys": large_buys, "large_sells": large_sells,
+            "imbalance": imbalance, "spread": spread, "depth_usd": depth_usd,
+            "delta_momentum": recent_delta / (abs(delta) + 1e-6)
+        }
+    except Exception as e:
+        log.error(f"Orderflow {sym}: {e}")
+        return None
 
 async def regime(sym):
-    df = await get_ohlcv(sym, "15m", 50)
-    if df is None or len(df) < 30: return "CHOP"
-    atr_pct = await get_real_atr(sym, "15m", 14)
-    high, low, close = df["h"].values, df["l"].values, df["c"].values
-    tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
-    volatility = pd.Series(tr).rolling(14).mean().iloc[-1] / close[-1]
-    return "TREND" if volatility > 0.015 else "CHOP" if volatility < 0.008 else "VOLATILE"
+    try:
+        df = await get_ohlcv(sym, "15m", 50)
+        if df is None or len(df) < 30: return "NORMAL"
+        
+        high, low, close = df["h"].values, df["l"].values, df["c"].values
+        tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
+        volatility = pd.Series(tr).rolling(14).mean().iloc[-1] / close[-1]
+        
+        return "TREND" if volatility > 0.015 else "CHOP" if volatility < 0.005 else "NORMAL"
+    except:
+        return "NORMAL"
 
-FEATURE_COLS = ["rsi_1m", "rsi_5m", "macd_hist", "mom_1m", "mom_5m", "vol_ratio", "atr_1m", "atr_5m", "delta_norm", "delta_momentum", "imbalance", "large_buys", "large_sells", "spread", "depth", "mtf_trend", "reg_trend", "reg_chop", "funding", "poc_dist"]
+# ---------- FEATURES ----------
+FEATURE_COLS = [
+    "rsi_1m", "rsi_5m", "macd_hist", "mom_1m", "mom_5m", "vol_ratio",
+    "atr_1m", "atr_5m", "delta_norm", "delta_momentum", "imbalance",
+    "large_buys", "large_sells", "spread", "depth", "mtf_trend",
+    "reg_trend", "reg_chop", "funding", "poc_dist"
+]
+
 async def extract_features(sym):
     try:
         df_1m = await get_ohlcv(sym, "1m", 100)
         df_5m = await get_ohlcv(sym, "5m", 100)
         if df_1m is None or len(df_1m) < 50: return None
+        
         last = float(df_1m["c"].iloc[-1])
         rsi_1m = calc_rsi(df_1m["c"], 14).iloc[-1]
         rsi_5m = calc_rsi(df_5m["c"], 14).iloc[-1] if df_5m is not None and len(df_5m) > 14 else 50
-        ema12, ema26 = df_1m["c"].ewm(span=12).mean(), df_1m["c"].ewm(span=26).mean()
-        macd_hist = (ema12 - ema26).iloc[-1] - (ema12 - ema26).ewm(span=9).mean().iloc[-1]
+        
+        ema12 = df_1m["c"].ewm(span=12).mean()
+        ema26 = df_1m["c"].ewm(span=26).mean()
+        macd = ema12 - ema26
+        macd_signal = macd.ewm(span=9).mean()
+        macd_hist = macd.iloc[-1] - macd_signal.iloc[-1]
+        
         mom_1m = (df_1m["c"].iloc[-1] - df_1m["c"].iloc[-10]) / df_1m["c"].iloc[-10]
         mom_5m = (df_5m["c"].iloc[-1] - df_5m["c"].iloc[-5]) / df_5m["c"].iloc[-5] if df_5m is not None else 0
+        
         vol_ratio = df_1m["v"].iloc[-10:].mean() / df_1m["v"].iloc[-50:].mean()
-        atr_1m, atr_5m = await get_real_atr(sym, "1m", 14), await get_real_atr(sym, "5m", 14)
+        
+        atr_1m = await get_real_atr(sym, "1m", 14)
+        atr_5m = await get_real_atr(sym, "5m", 14)
+        
         flow = await orderflow_analysis(sym)
         if not flow: return None
-        mtf, reg = await mtf_trend(sym), await regime(sym)
+        
+        mtf = await mtf_trend(sym)
+        reg = await regime(sym)
+        
         return {
-            "rsi_1m": rsi_1m / 100, "rsi_5m": rsi_5m / 100, "macd_hist": np.tanh(macd_hist / last),
-            "mom_1m": np.tanh(mom_1m * 100), "mom_5m": np.tanh(mom_5m * 100), "vol_ratio": min(vol_ratio, 3) / 3,
+            "rsi_1m": rsi_1m / 100, "rsi_5m": rsi_5m / 100,
+            "macd_hist": np.tanh(macd_hist / last),
+            "mom_1m": np.tanh(mom_1m * 100), "mom_5m": np.tanh(mom_5m * 100),
+            "vol_ratio": min(vol_ratio, 3) / 3,
             "atr_1m": min(atr_1m, 0.02) / 0.02, "atr_5m": min(atr_5m, 0.02) / 0.02,
-            "delta_norm": np.tanh(flow["delta"] / 1e6), "delta_momentum": flow["delta_momentum"],
-            "imbalance": (flow["imbalance"] + 1) / 2, "large_buys": min(flow["large_buys"], 5) / 5,
-            "large_sells": min(flow["large_sells"], 5) / 5, "spread": min(flow["spread"], 0.2) / 0.2,
-            "depth": np.tanh(flow["depth_usd"] / 5e6), "mtf_trend": (mtf + 1) / 2,
-            "reg_trend": 1 if reg == "TREND" else 0, "reg_chop": 1 if reg == "CHOP" else 0,
-            "funding": 0.0, "poc_dist": 0.0, "last": last
+            "delta_norm": np.tanh(flow["delta"] / 1e6),
+            "delta_momentum": flow["delta_momentum"],
+            "imbalance": (flow["imbalance"] + 1) / 2,
+            "large_buys": min(flow["large_buys"], 5) / 5,
+            "large_sells": min(flow["large_sells"], 5) / 5,
+            "spread": min(flow["spread"], 0.2) / 0.2,
+            "depth": np.tanh(flow["depth_usd"] / 5e6),
+            "mtf_trend": (mtf + 1) / 2,
+            "reg_trend": 1 if reg == "TREND" else 0,
+            "reg_chop": 1 if reg == "CHOP" else 0,
+            "funding": 0.0, "poc_dist": 0.0,
+            "last": last
         }
-    except Exception as e: log.error(f"Feature {sym}: {e}"); return None
+    except Exception as e:
+        log.error(f"Feature {sym}: {e}")
+        return None
 
 # ---------- ML ----------
 def load_ensemble():
     models = []
     for name in ["gb_model.pkl", "rf_model.pkl", "lr_model.pkl"]:
-        if os.path.exists(name): models.append(joblib.load(name)); log.info(f"✓ Loaded {name}")
+        if os.path.exists(name):
+            models.append(joblib.load(name))
     return models if len(models) == 3 else None
 
-async def ai_review_ensemble(sym, side, score):
+async def ai_review_ensemble(sym, side, score, strategy):
     try:
         features = await extract_features(sym)
-        if not features: return {"allow": False, "confidence": 30, "reason": "no-features"}
+        if not features:
+            return {"allow": False, "confidence": 30, "reason": "no-features"}
+        
         last = features.pop("last")
         X = np.array([features[c] for c in FEATURE_COLS]).reshape(1, -1)
+        
         models = load_ensemble()
-        if not models: return {"allow": True, "confidence": 60, "reason": "no-ml-fallback"}
+        if not models:
+            return {"allow": True, "confidence": 55, "reason": "no-ml"}
+        
         preds = []
         for m in models:
-            try: proba = m.predict_proba(X)[0]; preds.append(proba[1] if len(proba) > 1 else 0.5)
-            except: preds.append(0.5)
+            try:
+                proba = m.predict_proba(X)[0]
+                preds.append(proba[1] if len(proba) > 1 else 0.5)
+            except:
+                preds.append(0.5)
+        
         avg_prob = np.mean(preds)
         confidence = int(abs(avg_prob - 0.5) * 200)
-        ml_side = "long" if avg_prob > 0.58 else "short" if avg_prob < 0.42 else "none"
-        if ml_side != side: return {"allow": False, "confidence": confidence, "reason": "ml-disagree"}
+        
+        ml_side = "long" if avg_prob > 0.52 else "short" if avg_prob < 0.48 else "none"
+        
+        if ml_side == "long" and side == "short":
+            return {"allow": False, "confidence": confidence, "reason": "ml-opposite"}
+        if ml_side == "short" and side == "long":
+            return {"allow": False, "confidence": confidence, "reason": "ml-opposite"}
+        
         flow = await orderflow_analysis(sym)
-        if not flow: return {"allow": False, "confidence": 40, "reason": "no-flow"}
-        if flow["spread"] > 0.12: return {"allow": False, "confidence": confidence, "reason": "spread-wide"}
-        if flow["depth_usd"] < 8e5: return {"allow": False, "confidence": confidence, "reason": "low-liquidity"}
-        mtf = await mtf_trend(sym)
-        if side == "long" and mtf < 0: return {"allow": False, "confidence": confidence, "reason": "mtf-bearish"}
-        if side == "short" and mtf > 0: return {"allow": False, "confidence": confidence, "reason": "mtf-bullish"}
-        if await regime(sym) == "CHOP": return {"allow": False, "confidence": confidence, "reason": "choppy"}
-        if side == "long" and flow["recent_delta"] < 0: return {"allow": False, "confidence": confidence, "reason": "delta-bearish"}
-        if side == "short" and flow["recent_delta"] > 0: return {"allow": False, "confidence": confidence, "reason": "delta-bullish"}
-        if confidence < 65: return {"allow": False, "confidence": confidence, "reason": "low-confidence"}
-        return {"allow": True, "confidence": confidence, "reason": "all-green"}
-    except Exception as e: log.error(f"AI review {sym}: {e}"); return {"allow": False, "confidence": 30, "reason": f"error:{str(e)[:20]}"}
+        if not flow:
+            return {"allow": False, "confidence": 40, "reason": "no-flow"}
+        
+        if flow["spread"] > 0.25:
+            return {"allow": False, "confidence": confidence, "reason": "spread-wide"}
+        
+        if flow["depth_usd"] < 3e5:
+            return {"allow": False, "confidence": confidence, "reason": "low-liquidity"}
+        
+        min_conf = STRATEGY_CONFIG[strategy]["min_conf"]
+        if confidence < min_conf:
+            return {"allow": False, "confidence": confidence, "reason": f"low-conf"}
+        
+        return {"allow": True, "confidence": confidence, "reason": f"{strategy.lower()}-approved"}
+        
+    except Exception as e:
+        log.error(f"AI review {sym}: {e}")
+        return {"allow": False, "confidence": 30, "reason": "error"}
 
 # ---------- SCORING ----------
-async def calculate_advanced_score(sym):
+async def calculate_advanced_score(sym, strategy):
     try:
         features = await extract_features(sym)
-        if not features: return None
+        if not features:
+            return None
+        
         last = features.get("last", 0)
         rsi_1m = features["rsi_1m"] * 100
+        
         scores = {
             "rsi": 3.0 if rsi_1m > 70 else 7.0 if rsi_1m < 30 else 5.0,
-            "momentum": 8.5 if features["mom_1m"] > 0.5 and features["mom_5m"] > 0.5 else 1.5 if features["mom_1m"] < -0.5 and features["mom_5m"] < -0.5 else 5.0,
-            "orderflow": 9.0 if features["delta_momentum"] > 0.6 and (features["imbalance"] - 0.5) * 2 > 0.3 else 1.0 if features["delta_momentum"] < -0.6 and (features["imbalance"] - 0.5) * 2 < -0.3 else 5.0,
-            "mtf": 9.0 if (features["mtf_trend"] * 2 - 1) > 0.8 else 1.0 if (features["mtf_trend"] * 2 - 1) < -0.8 else 5.0,
-            "regime": 8.0 if features["reg_trend"] == 1 else 2.0 if features["reg_chop"] == 1 else 6.0,
-            "volume": 8.0 if features["vol_ratio"] * 3 > 1.5 else 4.0 if features["vol_ratio"] * 3 < 0.7 else 6.0,
+            "momentum": 8.5 if features["mom_1m"] > 0.5 and features["mom_5m"] > 0.5 
+                        else 1.5 if features["mom_1m"] < -0.5 and features["mom_5m"] < -0.5 
+                        else 5.0,
+            "orderflow": 9.0 if features["delta_momentum"] > 0.6 and (features["imbalance"] - 0.5) * 2 > 0.3 
+                         else 1.0 if features["delta_momentum"] < -0.6 and (features["imbalance"] - 0.5) * 2 < -0.3 
+                         else 5.0,
+            "mtf": 9.0 if (features["mtf_trend"] * 2 - 1) > 0.5 
+                   else 1.0 if (features["mtf_trend"] * 2 - 1) < -0.5 
+                   else 5.0,
+            "regime": 8.0 if features["reg_trend"] == 1 
+                      else 2.0 if features["reg_chop"] == 1 
+                      else 6.0,
+            "volume": 8.0 if features["vol_ratio"] * 3 > 1.5 
+                      else 4.0 if features["vol_ratio"] * 3 < 0.7 
+                      else 6.0,
         }
+        
         weights = {"rsi": 2.5, "momentum": 2.0, "orderflow": 3.0, "mtf": 2.5, "regime": 1.5, "volume": 1.5}
         total = sum(scores[k] * weights[k] for k in scores) / sum(weights.values())
-        side = "long" if total >= 7.8 else "short" if total <= 2.2 else "none"
-
-        # >>> DEBUG PRINT <<<
-        print(f"DEBUG: {sym} score = {total:.2f}  side = {side}")
-
-        return {"score": round(total, 2), "side": side, "components": scores, "last": last, "features": features}
-    except Exception as e: log.error(f"Scoring error {sym}: {e}"); return None
-
-# ---------- TP / SL ----------
-async def calc_smart_tp_sl(sym, side, entry):
-    try:
-        atr_1m, atr_5m = await get_real_atr(sym, "1m", 14), await get_real_atr(sym, "5m", 14)
-        atr_avg = (atr_1m + atr_5m) / 2
-        reg = await regime(sym)
-        sl_mult, tp_mult = (1.0, 2.5) if reg == "TREND" else (1.2, 2.0) if reg == "VOLATILE" else (0.8, 1.8)
-        entry = float(entry)
-        if side == "long":
-            sl = entry - (atr_avg * entry * sl_mult)
-            tp = entry + (entry - sl) * tp_mult
+        
+        cfg = STRATEGY_CONFIG[strategy]
+        
+        if total >= cfg["min_score"] and total <= cfg["max_score"]:
+            side = "long" if total >= 5.5 else "short" if total <= 4.5 else "none"
         else:
-            sl = entry + (atr_avg * entry * sl_mult)
-            tp = entry - (sl - entry) * tp_mult
-        return round(tp, 8), round(sl, 8)
-    except Exception as e: log.error(f"TP/SL {sym}: {e}"); return (entry * 1.015, entry * 0.992) if side == "long" else (entry * 0.985, entry * 1.008)
+            side = "none"
+        
+        return {
+            "score": round(total, 2),
+            "side": side,
+            "components": scores,
+            "last": last,
+            "features": features,
+            "strategy": strategy
+        }
+    except Exception as e:
+        log.error(f"Scoring {sym}: {e}")
+        return None
 
-# ---------- POSITION SIZE ----------
-def position_size(equity, entry, sl, risk_pct=0.8):
+# ---------- TP1/TP2/SL with Liquidation Safety ----------
+async def calc_tp1_tp2_sl_liq(sym, side, entry, confidence, strategy):
+    """Calculate TP1, TP2, SL with liquidation buffer"""
     try:
-        risk_usd = equity * risk_pct / 100
+        atr = await get_real_atr(sym, "5m", 14)
+        entry = float(entry)
+        
+        cfg = STRATEGY_CONFIG[strategy]
+        
+        # Leverage from confidence (60-100% → 15-30x)
+        leverage = CFG["min_lev"] + int((confidence - 60) / 40 * (CFG["max_lev"] - CFG["min_lev"]))
+        leverage = max(CFG["min_lev"], min(leverage, CFG["max_lev"]))
+        
+        # Liquidation distance
+        liq_dist_pct = 1 / leverage
+        max_sl_dist = entry * liq_dist_pct * (1 - CFG["liq_buffer"])
+        
+        # Base SL from ATR
+        base_sl_dist = atr * entry * cfg["sl_mult"]
+        sl_dist = min(base_sl_dist, max_sl_dist)
+        
+        if side == "long":
+            sl = entry - sl_dist
+            tp1 = entry + (sl_dist * cfg["tp1_mult"])
+            tp2 = entry + (sl_dist * cfg["tp2_mult"])
+        else:
+            sl = entry + sl_dist
+            tp1 = entry - (sl_dist * cfg["tp1_mult"])
+            tp2 = entry - (sl_dist * cfg["tp2_mult"])
+        
+        # Verify SL safety
+        liq_price = entry * (1 - 1/leverage) if side == "long" else entry * (1 + 1/leverage)
+        
+        if side == "long" and sl <= liq_price:
+            sl = liq_price * 1.02
+        elif side == "short" and sl >= liq_price:
+            sl = liq_price * 0.98
+        
+        return round(tp1, 8), round(tp2, 8), round(sl, 8), leverage, round(liq_price, 8)
+        
+    except Exception as e:
+        log.error(f"TP/SL calc {sym}: {e}")
+        if side == "long":
+            return entry * 1.012, entry * 1.018, entry * 0.992, 15, entry * 0.93
+        return entry * 0.988, entry * 0.982, entry * 1.008, 15, entry * 1.07
+
+# ---------- POSITION SIZE with Iceberg ----------
+def position_size_iceberg(equity, entry, sl, leverage):
+    """Calculate position size + iceberg splits"""
+    try:
+        risk_usd = equity * CFG["risk_perc"] / 100
         entry, sl = float(entry), float(sl)
-        price_risk = abs(entry - sl) or entry * 0.008
-        qty = risk_usd / price_risk
-        max_qty = (equity * 0.2) / entry
-        return round(min(qty, max_qty), 6)
-    except Exception as e: log.error(f"Position size: {e}"); return 0.001
+        price_risk = abs(entry - sl)
+        
+        qty = (risk_usd / price_risk) / leverage
+        max_qty = (equity * 0.3) / entry
+        total_qty = round(min(qty, max_qty), 6)
+        
+        # Iceberg: Split into 3-5 orders
+        num_orders = 4
+        iceberg_qty = round(total_qty / num_orders, 6)
+        
+        return {
+            "total_qty": total_qty,
+            "iceberg_qty": iceberg_qty,
+            "num_orders": num_orders
+        }
+    except Exception as e:
+        log.error(f"Position size: {e}")
+        return {"total_qty": 0.001, "iceberg_qty": 0.0003, "num_orders": 3}
+
+# ---------- COOLDOWN ----------
+async def check_cooldown(sym, strategy):
+    try:
+        r = await redis()
+        key = f"cooldown:{sym}:{strategy}"
+        last_trade = await r.get(key)
+        
+        if last_trade:
+            last_time = datetime.fromisoformat(last_trade)
+            elapsed = (datetime.utcnow() - last_time).total_seconds() / 60
+            
+            if elapsed < CFG["cooldown_min"]:
+                return False, f"cooldown-{int(CFG['cooldown_min'] - elapsed)}min"
+        
+        return True, "ok"
+    except Exception as e:
+        return True, "ok"
+
+async def set_cooldown(sym, strategy):
+    try:
+        r = await redis()
+        key = f"cooldown:{sym}:{strategy}"
+        await r.set(key, datetime.utcnow().isoformat(), ex=CFG["cooldown_min"] * 60)
+    except Exception as e:
+        log.error(f"Cooldown set: {e}")
 
 # ---------- RISK ----------
-async def check_risk_limits(equity, open_positions):
+async def check_daily_signal_limit():
+    """Check if daily signal limit reached"""
     try:
-        if len(open_positions) >= 3: return False, "max-positions"
-        exposure = sum(abs(p["size"]) * p["entry"] for p in open_positions.values())
-        if exposure > equity * 0.6: return False, "max-exposure"
         r = await redis()
-        daily = float(await r.get("daily_pnl") or 0)
-        if daily < -equity * 0.05: return False, "daily-loss-limit"
+        count = await r.get("daily_signal_count")
+        
+        if count and int(count) >= 30:
+            return False, "daily-limit-30"
+        
         return True, "ok"
-    except Exception as e: log.error(f"Risk check: {e}"); return False, "error"
+    except:
+        return True, "ok"
 
-async def update_daily_pnl(pnl):
+async def increment_signal_count():
     try:
         r = await redis()
-        current = float(await r.get("daily_pnl") or 0)
-        await r.set("daily_pnl", current + pnl)
-        now = datetime.utcnow()
-        if now.hour == 0 and now.minute < 5: await r.set("daily_pnl", 0)
-    except Exception as e: log.error(f"PnL update: {e}")
+        await r.incr("daily_signal_count")
+        await r.expire("daily_signal_count", 86400)  # Reset after 24h
+    except:
+        pass
 
-# ---------- TELEGRAM ----------
+# ---------- TELEGRAM (Enhanced) ----------
 async def send_telegram(txt):
-    if not CFG["tg_token"] or not CFG["tg_chat"]: return
+    if not CFG["tg_token"] or not CFG["tg_chat"]:
+        return
+    
     url = f"https://api.telegram.org/bot{CFG['tg_token']}/sendMessage"
+    
     for attempt in range(3):
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-                async with s.post(url, json={"chat_id": CFG["tg_chat"], "text": txt, "parse_mode": "HTML"}) as r:
-                    if r.status == 200: return
-        except Exception as e: log.warning(f"Telegram attempt {attempt+1}: {e}"); await asyncio.sleep(1)
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.post(url, json={
+                    "chat_id": CFG["tg_chat"],
+                    "text": txt,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                }) as resp:
+                    if resp.status == 200:
+                        log.info("✓ Telegram sent")
+                        return
+        except Exception as e:
+            await asyncio.sleep(1)
 
-# ---------- EXCHANGE ----------
+# ---------- EXCHANGE (Placeholder) ----------
 class Exchange:
     def __init__(self):
-        self.ex = ccxt.binance({
-            "apiKey": CFG["key"], "secret": CFG["secret"],
-            "options": {"defaultType": "future", "testnet": CFG["testnet"]},
-            "enableRateLimit": True, "timeout": 30000,
+        self.ex = ccxt.coindcx({
+            "apiKey": CFG["key"],
+            "secret": CFG["secret"],
+            "options": {"defaultType": "swap"},
+            "enableRateLimit": True,
+            "timeout": 30000,
         })
-    async def limit(self, sym, side, qty, price, post_only=True):
-        try: order = await self.ex.create_order(sym, "LIMIT", side, qty, price, params={"postOnly": post_only}); log.info(f"✓ Limit: {sym} {side} {qty} @ {price}"); return order
-        except Exception as e: log.error(f"❌ Limit {sym}: {e}"); return None
-    async def market(self, sym, side, qty):
-        try: order = await self.ex.create_order(sym, "MARKET", side, qty); log.info(f"✓ Market: {sym} {side} {qty}"); return order
-        except Exception as e: log.error(f"❌ Market {sym}: {e}"); return None
-    async def set_leverage(self, sym, leverage):
-        try: await self.ex.fapiPrivate_post_leverage({"symbol": sym.replace("/", ""), "leverage": leverage}); log.info(f"✓ Leverage: {sym} {leverage}x")
-        except Exception as e: log.warning(f"Leverage {sym}: {e}")
-    async def set_sl_tp(self, sym, side, sl, tp):
-        try:
-            sl_side = "SELL" if side == "long" else "BUY"
-            await self.ex.create_order(sym, "STOP_MARKET", sl_side, None, params={"stopPrice": sl, "closePosition": True})
-            tp_side = "SELL" if side == "long" else "BUY"
-            await self.ex.create_order(sym, "TAKE_PROFIT_MARKET", tp_side, None, params={"stopPrice": tp, "closePosition": True})
-            log.info(f"✓ SL/TP: {sym} SL={sl} TP={tp}")
-        except Exception as e: log.error(f"❌ SL/TP {sym}: {e}")
-    async def get_position(self, sym):
-        try:
-            positions = await self.ex.fapiPrivate_get_positionrisk({"symbol": sym.replace("/", "")})
-            for p in positions:
-                if float(p["positionAmt"]) != 0: return {"size": float(p["positionAmt"]), "entry": float(p["entryPrice"]), "unrealizedPnl": float(p["unRealizedProfit"]), "leverage": int(p["leverage"])}
-            return None
-        except Exception as e: log.error(f"Position {sym}: {e}"); return None
-    async def close(self): await self.ex.close()
+        log.info("✓ CoinDCX initialized (manual trading mode)")
+    
+    async def close(self):
+        await self.ex.close()
 
 # ---------- CLEANUP ----------
-async def cleanup(): await redis_close(); log.info("✓ Cleanup complete")
+async def cleanup():
+    await redis_close()
+    log.info("✓ Cleanup complete")
