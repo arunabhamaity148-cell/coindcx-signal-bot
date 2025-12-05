@@ -23,7 +23,19 @@ CFG = {
     "max_lev": int(os.getenv("MAX_LEV", 30)),
     "liq_buffer": float(os.getenv("LIQ_BUFFER", 0.15)),  # 15% safety from theoretical liq distance
     "cooldown_min": int(os.getenv("COOLDOWN_MIN", 30)),
-    "top_pairs": json.loads(os.getenv("TOP_PAIRS", "[]")),
+    "top_pairs"= [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","MATICUSDT",
+    "DOTUSDT","AVAXUSDT","LINKUSDT","ATOMUSDT","LTCUSDT","UNIUSDT","ETCUSDT","FILUSDT",
+    "TRXUSDT","NEARUSDT","ARBUSDT","APTUSDT","INJUSDT","STXUSDT","TIAUSDT","SEIUSDT",
+    "OPUSDT","SUIUSDT","FETUSDT","RENDERUSDT","IMXUSDT","RUNEUSDT","XLMUSDT","ALGOUSDT",
+    "SANDUSDT","ICPUSDT","GRTUSDT","AAVEUSDT","LDOUSDT","HBARUSDT","FTMUSDT","VETUSDT",
+    "MANAUSDT","AXSUSDT","THETAUSDT","FLOWUSDT","SNXUSDT","CHZUSDT","ENJUSDT","MKRUSDT",
+    "COMPUSDT","KSMUSDT","XTZUSDT","ZECUSDT","DASHUSDT","BATUSDT","ZILUSDT","ONTUSDT",
+    "IOSTUSDT","IOTAUSDT","QTUMUSDT","WAVESUSDT","ZRXUSDT","OMGUSDT","CRVUSDT","YFIUSDT",
+    "BALUSDT","1INCHUSDT","RLCUSDT","KAVAUSDT","SUSHIUSDT","OCEANUSDT","RSRUSDT","CELOUSDT",
+    "BANDUSDT","STORJUSDT","CELRUSDT","SKLUSDT","ANKRUSDT","BLZUSDT","ARPAUSDT","NMRUSDT"
+]
+ json.loads(os.getenv("TOP_PAIRS", "[]")),
     "liq_alert_pct": float(os.getenv("LIQ_ALERT_PCT", 0.7)),  # alert if SL->LIQ distance % < this
     "daily_max_signals": int(os.getenv("DAILY_MAX_SIGNALS", 30)),
 }
