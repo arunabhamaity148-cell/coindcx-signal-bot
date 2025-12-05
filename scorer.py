@@ -1,5 +1,5 @@
 # ================================================================
-# scorer.py — Optimized (Uses in-memory buffers)
+# scorer.py — FULL Professional Version (Integrated Enhancements)
 # ================================================================
 
 import numpy as np
@@ -13,6 +13,11 @@ from helpers import (
     orderflow_metrics,
     btc_calm_check,
 )
+
+# NEW MODULE IMPORTS
+from signal_confidence import SignalConfidence, enhance_signal
+from price_levels import get_complete_levels
+from volume_analysis import get_volume_insights
 
 log = logging.getLogger("scorer_v10")
 
@@ -86,30 +91,20 @@ def evaluate_logic(params):
 
 
 def aggregate_score(logic_dict):
-    score = 0
-    for k, v in logic_dict.items():
-        score += v
-    return float(score)
+    return float(sum(logic_dict.values()))
 
 
 async def compute_signal(sym: str, strat: str):
-    """
-    Compute signal using in-memory buffers
-    
-    NOTE: This function needs to be called with buffers from main.py
-    Import TRADE_BUFFER, OB_CACHE from main when calling
-    """
-    
-    # Import buffers from main (will be set when main imports this)
+
     from main import TRADE_BUFFER, OB_CACHE
-    
-    # BTC Calm check
+
+    # BTC calm check
     if sym != "BTCUSDT":
         ok = await btc_calm_check(buffer_dict=TRADE_BUFFER)
         if not ok:
             return None
 
-    # Build MTF OHLC
+    # Build OHLC
     o1 = await build_ohlcv_from_trades(sym, "1min", 200, buffer_dict=TRADE_BUFFER)
     if o1 is None or len(o1) < 60:
         return None
@@ -123,14 +118,15 @@ async def compute_signal(sym: str, strat: str):
     # Indicators
     last = float(o1["close"].iloc[-1])
     mom1 = (last - float(o1["close"].iloc[-2])) / last
+
     mom5 = 0
     if o5 is not None and len(o5) > 2:
         mom5 = (last - float(o5["close"].iloc[-2])) / last
 
     rsi = float(calc_rsi(o1["close"]).iloc[-1])
     atr = float(calc_atr(o1))
-
     vwap = await calc_vwap_from_trades(sym, buffer_dict=TRADE_BUFFER)
+
     if vwap is None:
         return None
 
@@ -160,7 +156,8 @@ async def compute_signal(sym: str, strat: str):
 
     side = "long" if params["imb"] > 0 else "short"
 
-    return {
+    # Base Signal
+    signal = {
         "symbol": sym,
         "side": side,
         "score": score,
@@ -169,3 +166,22 @@ async def compute_signal(sym: str, strat: str):
         "logic": L,
         "passed": [k for k, v in L.items() if v == 1]
     }
+
+    # ============================================================
+    # NEW FEATURES
+    # ============================================================
+
+    # Support/Resistance + Pivots + Fibonacci
+    levels = await get_complete_levels(sym, o1)
+
+    # Volume Profile + Smart Money + Absorption
+    volume = await get_volume_insights(o1, TRADE_BUFFER[sym])
+
+    # Confidence Score
+    signal = enhance_signal(signal, params)
+
+    # Attach Data
+    signal["levels"] = levels
+    signal["volume"] = volume
+
+    return signal
