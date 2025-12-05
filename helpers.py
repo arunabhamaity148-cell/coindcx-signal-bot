@@ -1,10 +1,10 @@
-import os, json, asyncio, logging, aiohttp, joblib
+import os, json, asyncio, logging, aiohttp
 import pandas as pd, numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from redis.asyncio import Redis
 import ccxt.async_support as ccxt
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("helpers")
 
 TOP_PAIRS = [
@@ -51,7 +51,9 @@ async def redis():
     return redis_client
 async def redis_close():
     global redis_client
-    if redis_client: await redis_client.close(); redis_client = None
+    if redis_client:
+        await redis_client.close()
+        redis_client = None
 
 def get_exchange(**kwargs):
     cls = getattr(ccxt, "coindcx", None)
@@ -59,7 +61,9 @@ def get_exchange(**kwargs):
     return ccxt.Exchange({"id": "coindcx", "name": "CoinDCX", "enableRateLimit": True, "timeout": 30000, **kwargs})
 
 class Exchange:
-    def __init__(self): self.ex = get_exchange(apiKey=CFG["key"], secret=CFG["secret"]); log.info("✓ CoinDCX Exchange Auth Initialized")
+    def __init__(self):
+        self.ex = get_exchange(apiKey=CFG["key"], secret=CFG["secret"])
+        log.info("✓ CoinDCX Exchange Auth Initialized")
     async def fetch_balance(self):
         try: return await self.ex.fetch_balance()
         except Exception as e: log.error(f"balance error: {e}"); return None
@@ -68,16 +72,41 @@ def log_block(sym, strategy, reason):
     log.info(f"🚫 BLOCK {sym}:{strategy} → {reason}")
 
 # ---------- OHLC / RSI / ATR ----------
-async def build_ohlcv(sym, tf="1m", bars=100): ...
-async def get_ohlcv(sym, tf="1m", limit=100): ...
-def calc_rsi(series, period=14): ...
-async def get_atr(sym, tf="5m", period=14): ...
+async def build_ohlcv(sym, tf="1m", bars=100):
+    r = await redis()
+    raw = await r.lrange(f"tr:{sym}", 0, 600)
+    if not raw: return None
+    trades = [json.loads(x) for x in raw]
+    df = pd.DataFrame(trades)
+    df["p"] = df["p"].astype(float); df["q"] = df["q"].astype(float)
+    df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    df = df.set_index("t").sort_index()
+    ohlc = df["p"].resample(tf).ohlc(); vol = df["q"].resample(tf).sum()
+    o = ohlc.join(vol.rename("v")).dropna()
+    return o.tail(bars)
+async def get_ohlcv(sym, tf="1m", limit=100):
+    df = await build_ohlcv(sym, tf, limit)
+    if df is None or len(df) < 20: return None
+    df = df.reset_index(); df.rename(columns={"open":"o","high":"h","low":"l","close":"c"}, inplace=True)
+    return df
+def calc_rsi(series, period=14):
+    delta = series.diff(); gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean(); rs = gain / (loss + 1e-9)
+    return 100 - (100 / (1 + rs))
+async def get_atr(sym, tf="5m", period=14):
+    df = await get_ohlcv(sym, tf, 100)
+    if df is None: return 0.002
+    h, l, c = df["h"], df["l"], df["c"]; prev_c = c.shift(1)
+    tr = np.maximum(h - l, np.maximum(abs(h - prev_c), abs(l - prev_c)))
+    return tr.rolling(period).mean().iloc[-1]
 
 # ---------- CVD + VWAP ----------
 async def cvd_vwap(sym):
-    r = await redis(); raw = await r.lrange(f"tr:{sym}", 0, 200)
+    r = await redis()
+    raw = await r.lrange(f"tr:{sym}", 0, 200)
     if not raw: return None
-    trades = [json.loads(x) for x in raw]; df = pd.DataFrame(trades)
+    trades = [json.loads(x) for x in raw]
+    df = pd.DataFrame(trades)
     df["p"] = df["p"].astype(float); df["q"] = df["q"].astype(float)
     df["side"] = np.where(df["m"], -1, 1); df["vol"] = df["q"] * df["p"]; df["pv"] = df["p"] * df["vol"]
     vwap = df["pv"].sum() / (df["vol"].sum() + 1e-9); cvd = (df["q"] * df["side"]).sum()
@@ -85,7 +114,8 @@ async def cvd_vwap(sym):
 
 # ---------- ORDERFLOW ----------
 async def orderflow(sym):
-    r = await redis(); raw = await r.lrange(f"tr:{sym}", 0, 200)
+    r = await redis()
+    raw = await r.lrange(f"tr:{sym}", 0, 200)
     if not raw: return None
     t = [json.loads(x) for x in raw]; volumes = [float(x["q"]) for x in t]; avg, std = np.mean(volumes), np.std(volumes)
     delta = sum(float(x["q"]) if not x["m"] else -float(x["q"]) for x in t)
@@ -138,7 +168,7 @@ async def news_guard(sym):
     except Exception as e:
         log.debug(f"news-guard err {e}"); return {"score": 0}
 
-# ---------- DYNAMIC PAIR FILTER (খুলে দেওয়া হলো – 80 coin) ----------
+# ---------- DYNAMIC PAIR FILTER (80 coin) ----------
 async def filtered_pairs():
     r = await redis(); good = []
     for sym in TOP_PAIRS:
@@ -152,13 +182,12 @@ async def filtered_pairs():
             bids = json.loads(depth.get("bids", "[]")); asks = json.loads(depth.get("asks", "[]"))
             if not bids or not asks: continue
             spread = (float(asks[0][0]) - float(bids[0][0])) / last * 100
-            # ভলিউম/স্প্রেড ফিল্টার খুলে দিলাম – শুধু গুরুত্বপূর্ণ চেক
-            if vol24 >= 500000 and spread <= 1.5:  # নরম শর্ত
-                good.append(sym)
+            # নরম শর্ত – 80 কয়েনই পাস করতে চাই
+            if vol24 >= 500000 and spread <= 1.5: good.append(sym)
         except: continue
-    return good  # 80-এর মধ্যে সব পাস করলে 80-ই আসবে
+    return good
 
-# ---------- SCORE + DONE-LIST + LEVERAGE SUGGEST ----------
+# ---------- SCORE + DONE-LIST + LEVERAGE ----------
 async def calculate_advanced_score(sym, strategy):
     try:
         df = await get_ohlcv(sym, "1m", 120)
@@ -174,7 +203,7 @@ async def calculate_advanced_score(sym, strategy):
             log_block(sym, strategy, "no-vwap"); return None
         trend = await mtf(sym); ng = await news_guard(sym)
 
-        # --- লজিক চেক + Done লিস্ট ---
+        # --- Done list ---
         done = []
         if trend != 0: done.append("EMA-MTF ✅")
         if abs(rsi - 50) < 25: done.append("RSI ✅")
@@ -185,7 +214,7 @@ async def calculate_advanced_score(sym, strategy):
         if cv["price"] > cv["vwap"] * 0.999: done.append("VWAP ✅")
         if cv["cvd"] > 0: done.append("CVD ✅")
 
-        # --- স্কোর ক্যালক ---
+        # --- Score ---
         score = 0
         score += (50 - abs(rsi - 50)) / 25 * 2
         score += mom * 4
@@ -206,9 +235,8 @@ async def calculate_advanced_score(sym, strategy):
     except Exception as e:
         log.error(f"score error {sym}: {e}"); return None
 
-# ---------- LEVERAGE SUGGEST (Liq-distance based) ----------
+# ---------- LEVERAGE SUGGEST ----------
 def suggest_leverage(liq_dist, side):
-    # liq_dist in %
     if liq_dist >= 10: return 30
     if liq_dist >= 7: return 25
     if liq_dist >= 5: return 20
@@ -219,7 +247,7 @@ def suggest_leverage(liq_dist, side):
 async def calc_tp_sl(sym, side, entry, strategy):
     atr = await get_atr(sym, "5m", 14)
     cfg = STRATEGY_CONFIG[strategy]
-    lev = 15  # default, dynamic later
+    lev = 15  # default
     sl_dist = atr * entry * cfg["sl_mult"]
     liq = entry * (1 - 1 / lev) if side == "long" else entry * (1 + 1 / lev)
     if side == "long":
@@ -241,11 +269,11 @@ def iceberg_size(equity, entry, sl, lev):
     iq = qty / 4
     return {"total": qty, "each": iq, "orders": 4}
 
-# ---------- TELEGRAM (Premium emoji) ----------
+# ---------- TELEGRAM ----------
 async def send_telegram(text):
     if not CFG["tg_token"] or not CFG["tg_chat"]: return
     url = f"https://api.telegram.org/bot{CFG['tg_token']}/sendMessage"
     async with aiohttp.ClientSession() as s:
         await s.post(url, json={"chat_id": CFG["tg_chat"], "text": text, "parse_mode": "HTML"})
 
-log.info("✓ helpers loaded (FINAL)")
+log.info("✓ helpers loaded (FINAL-RAILWAY)")
