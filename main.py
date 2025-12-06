@@ -1,11 +1,6 @@
 # ------------------------------------------------------------------
-#  main.py  ––  ULTIMATE FINAL v5.1  (Ticker Fixed)  [ERROR-FIXED]
+#  main.py  ––  ULTIMATE FINAL v5.1  (Ticker Fixed + Railway health)
 # ------------------------------------------------------------------
-#  Changes
-#  1. Strip trailing spaces / blank lines
-#  2. await formatter.format_signal_alert(...)  →  was missing await
-# ------------------------------------------------------------------
-
 import os, json, asyncio, logging, signal, sys
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -38,8 +33,12 @@ SEND_CHARTS   = os.getenv("SEND_CHARTS", "true").lower() == "true"
 
 TRADE_BUFFER = {sym: deque(maxlen=500) for sym in PAIRS}
 OB_CACHE, TK_CACHE, cooldown, ACTIVE_ORDERS = {}, {}, {}, {}
-data_received, ws_connected, app_ready, shutdown_requested = 0, False, False, False
-formatter, pos_tracker, signal_history = TelegramFormatter(), PositionTracker(), SignalHistory(max_history=200)
+data_received, ws_connected = 0, False
+server_ready = data_ready = shutdown_requested = False   # Railway flags
+
+formatter = TelegramFormatter()
+pos_tracker = PositionTracker()
+signal_history = SignalHistory(max_history=200)
 ml_filter: MLSignalFilter | None = None
 optimizer: StrategyOptimizer | None = None
 
@@ -72,8 +71,7 @@ async def push_trade(sym: str, data: dict):
     except Exception as e: log.error(f"push_trade error for {sym}: {e}")
 
 async def push_orderbook(sym: str, bid: float, ask: float):
-    try:
-        OB_CACHE[sym] = {"bid": float(bid), "ask": float(ask), "t": int(datetime.now(timezone.utc).timestamp() * 1000)}
+    try: OB_CACHE[sym] = {"bid": float(bid), "ask": float(ask), "t": int(datetime.now(timezone.utc).timestamp() * 1000)}
     except Exception as e: log.error(f"push_orderbook error: {e}")
 
 async def push_ticker(sym: str, last: float, vol: float, ts: int):
@@ -100,7 +98,8 @@ async def ws_worker(pairs_chunk: list, worker_id: int):
                 async for message in ws:
                     if shutdown_requested: break
                     try:
-                        data, stream, payload = json.loads(message), data.get("stream", ""), data.get("data", {})
+                        data = json.loads(message)
+                        stream, payload = data.get("stream", ""), data.get("data", {})
                         sym = payload.get("s")
                         if not sym or sym not in PAIRS: continue
                         if stream.endswith("@aggTrade"): await push_trade(sym, {"p": payload.get("p"), "q": payload.get("q"), "m": payload.get("m"), "t": payload.get("T")})
@@ -146,12 +145,14 @@ async def update_positions():
             await send_telegram(msg)
 
 async def scanner():
+    global data_ready
     log.info("🔍 Scanner starting...")
     await send_telegram("🚀 <b>Bot Started v5.1</b>\n⏳ Waiting for data stream...")
     for i in range(30):
         await asyncio.sleep(2)
         btc_count = len(TRADE_BUFFER.get("BTCUSDT", []))
         if btc_count >= 20:
+            data_ready = True
             log.info(f"✅ Data ready! BTC trades: {btc_count}")
             await send_telegram(f"✅ <b>Data Stream Active!</b>\n📊 {btc_count} BTC trades\n🎯 {len(PAIRS)} pairs\n📈 Charts: {'Enabled' if SEND_CHARTS else 'Disabled'}")
             break
@@ -179,11 +180,8 @@ async def scanner():
                     try:
                         if ml_filter and ml_filter.trained:
                             sig = ml_filter.enhance_signal_with_ml(sig)
-                            if sig.get("ml_recommendation") == "SKIP":
-                                log.info(f"ML filtered {sig['symbol']} (prob {sig.get('ml_probability', 0):.2f})"); continue
-                        # ======  FIX: await the coroutine  ======
+                            if sig.get("ml_recommendation") == "SKIP": log.info(f"ML filtered {sig['symbol']} (prob {sig.get('ml_probability', 0):.2f})"); continue
                         msg, chart_url = await formatter.format_signal_alert(sig, sig.get("levels"), sig.get("volume"), include_chart=SEND_CHARTS)
-                        # =========================================
                         success = await send_telegram(msg, chart_url)
                         if success:
                             signal_history.add_signal(sig)
@@ -206,15 +204,16 @@ async def scanner():
 scan_task = ws_task = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scan_task, ws_task, app_ready, ml_filter, optimizer
-    log.info("=" * 60); log.info("🚀 Bot Starting (v5.1 Ticker Fixed)"); log.info(f"✓ {len(PAIRS)} pairs"); log.info(f"✓ Min confidence: {MIN_CONFIDENCE}%"); log.info(f"✓ Scan interval: {SCAN_INTERVAL}s"); log.info(f"✓ Cooldown: {COOLDOWN_MIN}min"); log.info(f"✓ Charts: {'Enabled' if SEND_CHARTS else 'Disabled'}"); log.info("=" * 60)
+    global scan_task, ws_task, server_ready, ml_filter, optimizer
+    log.info("=" * 60); log.info("🚀 Bot Starting (v5.1 Ticker Fixed + Railway health)"); log.info(f"✓ {len(PAIRS)} pairs"); log.info(f"✓ Min confidence: {MIN_CONFIDENCE}%"); log.info(f"✓ Scan interval: {SCAN_INTERVAL}s"); log.info(f"✓ Cooldown: {COOLDOWN_MIN}min"); log.info(f"✓ Charts: {'Enabled' if SEND_CHARTS else 'Disabled'}"); log.info("=" * 60)
     try: await pos_tracker.load(); log.info("✓ Position tracker loaded")
     except Exception as e: log.warning(f"Position tracker load failed: {e}")
     ml_filter = MLSignalFilter()
     try: ml_filter.load_model("models/signal_filter.pkl"); log.info("✅ ML filter loaded")
     except FileNotFoundError: log.warning("⚠️ ML model not found – running without filter")
     optimizer = StrategyOptimizer(); create_dashboard_routes(app, dashboard_manager)
-    ws_task = asyncio.create_task(start_websockets()); await asyncio.sleep(3); scan_task = asyncio.create_task(scanner()); app_ready = True; log.info("✅ Application ready")
+    ws_task = asyncio.create_task(start_websockets()); await asyncio.sleep(3); scan_task = asyncio.create_task(scanner())
+    server_ready = True; log.info("✅ Server ready – health-check returns 200")
     yield
     log.info("🛑 Shutting down..."); shutdown_requested = True
     if scan_task: scan_task.cancel()
@@ -225,7 +224,7 @@ async def lifespan(app: FastAPI):
     except Exception as e: log.warning(f"Position tracker save failed: {e}")
     log.info("🔴 Shutdown complete")
 
-app = FastAPI(lifespan=lifespan, title="Crypto Trading Bot", version="5.1", description="Advanced trading signal generator - Ticker Fixed")
+app = FastAPI(lifespan=lifespan, title="Crypto Trading Bot", version="5.1", description="Advanced trading signal generator - Ticker Fixed + Railway health")
 @app.post("/api/backtest")
 async def api_backtest(req: dict):
     engine = BacktestEngine(initial_capital=req.get("capital", 10000), risk_per_trade=req.get("risk_per_trade", 2.0))
@@ -236,12 +235,22 @@ async def api_optimize(req: dict):
 @app.get("/")
 async def root():
     btc_trades = len(TRADE_BUFFER.get("BTCUSDT", []))
-    return {"status": "running" if app_ready else "starting", "version": "5.1-ticker-fixed", "ws_connected": ws_connected, "data_received": data_received, "btc_trades": btc_trades, "pairs": len(PAIRS), "active_signals": len(ACTIVE_ORDERS), "open_positions": len(pos_tracker.open_positions), "features": {"charts": SEND_CHARTS, "correlation": True, "volume_profile": True, "smart_money": True, "ml_filter": ml_filter.trained if ml_filter else False, "backtesting": True, "optimizer": True, "dashboard": True}, "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "running" if server_ready else "starting", "version": "5.1-ticker-fixed+railway", "ws_connected": ws_connected, "data_received": data_received, "btc_trades": btc_trades, "pairs": len(PAIRS), "active_signals": len(ACTIVE_ORDERS), "open_positions": len(pos_tracker.open_positions), "features": {"charts": SEND_CHARTS, "correlation": True, "volume_profile": True, "smart_money": True, "ml_filter": ml_filter.trained if ml_filter else False, "backtesting": True, "optimizer": True, "dashboard": True}, "time": datetime.now(timezone.utc).isoformat()}
 @app.get("/health")
 async def health():
-    if not app_ready: return Response(content=json.dumps({"status": "starting"}), status_code=503, media_type="application/json")
-    btc_trades = len(TRADE_BUFFER.get("BTCUSDT", []))
-    return {"status": "healthy" if btc_trades > 0 else "degraded", "btc_trades": btc_trades, "ws_connected": ws_connected, "data_received": data_received}
+    """
+    Railway needs HTTP 200 as soon as the container is listening.
+    Return 200 immediately; optionally add a JSON field that tells
+    the outside world whether trading data is already flowing.
+    """
+    return {
+        "status": "healthy",
+        "server_ready": server_ready,
+        "data_ready"  : data_ready,
+        "btc_trades"  : len(TRADE_BUFFER.get("BTCUSDT", [])),
+        "ws_connected": ws_connected,
+        "data_received": data_received
+    }
 @app.get("/stats")
 async def stats(): return {"trading_stats": pos_tracker.get_statistics(), "open_positions": pos_tracker.get_open_positions_summary(), "recent_signals": len(signal_history.get_recent_signals(10)), "signal_history": signal_history.get_recent_signals(20)}
 @app.get("/signals")
@@ -249,6 +258,6 @@ async def signals(): recent = signal_history.get_recent_signals(20); return {"co
 @app.get("/debug")
 async def debug():
     debug_data = {sym: {"trades": len(TRADE_BUFFER.get(sym, [])), "has_ob": sym in OB_CACHE, "has_ticker": sym in TK_CACHE} for sym in list(PAIRS)[:10]}
-    return {"buffers": debug_data, "ob_cache_size": len(OB_CACHE), "ticker_cache_size": len(TK_CACHE), "ws_connected": ws_connected, "app_ready": app_ready, "shutdown_requested": shutdown_requested, "config": {"scan_interval": SCAN_INTERVAL, "cooldown_min": COOLDOWN_MIN, "min_confidence": MIN_CONFIDENCE, "send_charts": SEND_CHARTS}}
+    return {"buffers": debug_data, "ob_cache_size": len(OB_CACHE), "ticker_cache_size": len(TK_CACHE), "ws_connected": ws_connected, "server_ready": server_ready, "data_ready": data_ready, "shutdown_requested": shutdown_requested, "config": {"scan_interval": SCAN_INTERVAL, "cooldown_min": COOLDOWN_MIN, "min_confidence": MIN_CONFIDENCE, "send_charts": SEND_CHARTS}}
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)), log_level="info", access_log=True, timeout_keep_alive=120)
