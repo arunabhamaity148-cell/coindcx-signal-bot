@@ -1,5 +1,5 @@
 # ================================================================
-# main.py – ULTIMATE FINAL v5.0 (10/10 Features Integrated)
+# main.py – ULTIMATE FINAL v5.1 (Ticker Fixed)
 # ================================================================
 
 import os
@@ -134,14 +134,20 @@ async def push_ticker(sym: str, last: float, vol: float, ts: int):
 WS_BASE = "wss://stream.binance.com:9443/stream"
 
 def build_stream_url(pairs_chunk: list) -> str:
+    """
+    Build WebSocket URL for a chunk of pairs
+    ✅ FIXED: Subscribe kline for ALL pairs (not just BTC)
+    """
     streams = []
+    
     for pair in pairs_chunk:
         p_lower = pair.lower()
         streams.append(f"{p_lower}@aggTrade")
         streams.append(f"{p_lower}@bookTicker")
-    if "BTCUSDT" in pairs_chunk:
-        streams.append("btcusdt@kline_1m")
-    return f"{WS_BASE}?streams={'/'.join(streams)}"
+        streams.append(f"{p_lower}@kline_1m")  # ✅ ADDED FOR ALL PAIRS
+    
+    stream_path = "/".join(streams)
+    return f"{WS_BASE}?streams={stream_path}"
 
 async def ws_worker(pairs_chunk: list, worker_id: int):
     global ws_connected
@@ -232,7 +238,7 @@ async def update_positions():
 
 async def scanner():
     log.info("🔍 Scanner starting...")
-    await send_telegram("🚀 <b>Bot Started v5.0</b>\n⏳ Waiting for data stream...")
+    await send_telegram("🚀 <b>Bot Started v5.1</b>\n⏳ Waiting for data stream...")
     for i in range(30):
         await asyncio.sleep(2)
         btc_count = len(TRADE_BUFFER.get("BTCUSDT", []))
@@ -339,9 +345,9 @@ ws_task = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scan_task, ws_task, app_ready
-    global ml_filter, optimizer  # 10/10
+    global ml_filter, optimizer
     log.info("=" * 60)
-    log.info("🚀 Bot Starting (v5.0 Ultimate)")
+    log.info("🚀 Bot Starting (v5.1 Ticker Fixed)")
     log.info(f"✓ {len(PAIRS)} pairs")
     log.info(f"✓ Min confidence: {MIN_CONFIDENCE}%")
     log.info(f"✓ Scan interval: {SCAN_INTERVAL}s")
@@ -399,8 +405,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="Crypto Trading Bot",
-    version="5.0",
-    description="Advanced trading signal generator with charts and correlation"
+    version="5.1",
+    description="Advanced trading signal generator - Ticker Fixed"
 )
 
 # ========== 10/10 API ROUTES ==========
@@ -410,8 +416,8 @@ async def api_backtest(req: dict):
         initial_capital=req.get("capital", 10000),
         risk_per_trade=req.get("risk_per_trade", 2.0)
     )
-    price_data = req["price_data"]  # dict of DataFrame JSON
-    signals = req["signals"]  # list of signal dict
+    price_data = req["price_data"]
+    signals = req["signals"]
     results = await engine.backtest(
         signals, price_data,
         start_date=datetime.fromisoformat(req["start"]),
@@ -437,7 +443,7 @@ async def root():
     btc_trades = len(TRADE_BUFFER.get("BTCUSDT", []))
     return {
         "status": "running" if app_ready else "starting",
-        "version": "5.0",
+        "version": "5.1-ticker-fixed",
         "ws_connected": ws_connected,
         "data_received": data_received,
         "btc_trades": btc_trades,
