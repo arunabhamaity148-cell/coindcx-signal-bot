@@ -327,3 +327,193 @@ async def scanner():
             break
         except Exception as e:
             log.error(f"Scanner error: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            await asyncio.sleep(5)
+
+    log.info("Scanner stopped")
+
+scan_task = None
+ws_task = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global scan_task, ws_task, app_ready
+    global ml_filter, optimizer  # 10/10
+    log.info("=" * 60)
+    log.info("🚀 Bot Starting (v5.0 Ultimate)")
+    log.info(f"✓ {len(PAIRS)} pairs")
+    log.info(f"✓ Min confidence: {MIN_CONFIDENCE}%")
+    log.info(f"✓ Scan interval: {SCAN_INTERVAL}s")
+    log.info(f"✓ Cooldown: {COOLDOWN_MIN}min")
+    log.info(f"✓ Charts: {'Enabled' if SEND_CHARTS else 'Disabled'}")
+    log.info("=" * 60)
+
+    try:
+        await pos_tracker.load()
+        log.info("✓ Position tracker loaded")
+    except Exception as e:
+        log.warning(f"Position tracker load failed: {e}")
+
+    # ========== 10/10 STARTUP ==========
+    ml_filter = MLSignalFilter()
+    try:
+        ml_filter.load_model("models/signal_filter.pkl")
+        log.info("✅ ML filter loaded")
+    except FileNotFoundError:
+        log.warning("⚠️ ML model not found – running without filter")
+
+    optimizer = StrategyOptimizer()
+    create_dashboard_routes(app, dashboard_manager)
+    # ====================================
+
+    ws_task = asyncio.create_task(start_websockets())
+    await asyncio.sleep(3)
+    scan_task = asyncio.create_task(scanner())
+    app_ready = True
+    log.info("✅ Application ready")
+
+    yield
+
+    log.info("🛑 Shutting down...")
+    shutdown_requested = True
+
+    if scan_task:
+        scan_task.cancel()
+    if ws_task:
+        ws_task.cancel()
+
+    try:
+        await asyncio.gather(scan_task, ws_task, return_exceptions=True)
+    except Exception as e:
+        log.error(f"Shutdown error: {e}")
+
+    try:
+        await pos_tracker.save()
+        log.info("✓ Position tracker saved")
+    except Exception as e:
+        log.warning(f"Position tracker save failed: {e}")
+
+    log.info("🔴 Shutdown complete")
+
+app = FastAPI(
+    lifespan=lifespan,
+    title="Crypto Trading Bot",
+    version="5.0",
+    description="Advanced trading signal generator with charts and correlation"
+)
+
+# ========== 10/10 API ROUTES ==========
+@app.post("/api/backtest")
+async def api_backtest(req: dict):
+    engine = BacktestEngine(
+        initial_capital=req.get("capital", 10000),
+        risk_per_trade=req.get("risk_per_trade", 2.0)
+    )
+    price_data = req["price_data"]  # dict of DataFrame JSON
+    signals = req["signals"]  # list of signal dict
+    results = await engine.backtest(
+        signals, price_data,
+        start_date=datetime.fromisoformat(req["start"]),
+        end_date=datetime.fromisoformat(req["end"])
+    )
+    return results
+
+@app.post("/api/optimize")
+async def api_optimize(req: dict):
+    param_grid = req["param_grid"]
+    signals = req["signals"]
+    price_data = req["price_data"]
+    opt = StrategyOptimizer()
+    res = await opt.grid_search(
+        signals, price_data, param_grid,
+        metric=req.get("metric", "sharpe_ratio")
+    )
+    return res
+# ====================================
+
+@app.get("/")
+async def root():
+    btc_trades = len(TRADE_BUFFER.get("BTCUSDT", []))
+    return {
+        "status": "running" if app_ready else "starting",
+        "version": "5.0",
+        "ws_connected": ws_connected,
+        "data_received": data_received,
+        "btc_trades": btc_trades,
+        "pairs": len(PAIRS),
+        "active_signals": len(ACTIVE_ORDERS),
+        "open_positions": len(pos_tracker.open_positions),
+        "features": {
+            "charts": SEND_CHARTS,
+            "correlation": True,
+            "volume_profile": True,
+            "smart_money": True,
+            "ml_filter": ml_filter.trained if ml_filter else False,
+            "backtesting": True,
+            "optimizer": True,
+            "dashboard": True
+        },
+        "time": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.get("/health")
+async def health():
+    if not app_ready:
+        return Response(content=json.dumps({"status": "starting"}), status_code=503, media_type="application/json")
+    btc_trades = len(TRADE_BUFFER.get("BTCUSDT", []))
+    return {
+        "status": "healthy" if btc_trades > 0 else "degraded",
+        "btc_trades": btc_trades,
+        "ws_connected": ws_connected,
+        "data_received": data_received
+    }
+
+@app.get("/stats")
+async def stats():
+    return {
+        "trading_stats": pos_tracker.get_statistics(),
+        "open_positions": pos_tracker.get_open_positions_summary(),
+        "recent_signals": len(signal_history.get_recent_signals(10)),
+        "signal_history": signal_history.get_recent_signals(20)
+    }
+
+@app.get("/signals")
+async def signals():
+    recent = signal_history.get_recent_signals(20)
+    return {"count": len(recent), "signals": recent}
+
+@app.get("/debug")
+async def debug():
+    debug_data = {}
+    for sym in list(PAIRS)[:10]:
+        debug_data[sym] = {
+            "trades": len(TRADE_BUFFER.get(sym, [])),
+            "has_ob": sym in OB_CACHE,
+            "has_ticker": sym in TK_CACHE
+        }
+    return {
+        "buffers": debug_data,
+        "ob_cache_size": len(OB_CACHE),
+        "ticker_cache_size": len(TK_CACHE),
+        "ws_connected": ws_connected,
+        "app_ready": app_ready,
+        "shutdown_requested": shutdown_requested,
+        "config": {
+            "scan_interval": SCAN_INTERVAL,
+            "cooldown_min": COOLDOWN_MIN,
+            "min_confidence": MIN_CONFIDENCE,
+            "send_charts": SEND_CHARTS
+        }
+    }
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        access_log=True,
+        timeout_keep_alive=120
+    )
