@@ -1,37 +1,42 @@
-# ================================================================
-# helpers.py — Data Utilities (Redis Silent Fallback)
-# ================================================================
+# ============================================================
+# helpers.py — Data Utilities (Redis Optional)
+# ============================================================
 
 import os
 import json
 import numpy as np
 import pandas as pd
-from redis.asyncio import Redis
 from datetime import datetime
 import logging
-import asyncio      # পিং টেস্টের জন্য
 
 log = logging.getLogger("helpers")
 
 # ------------------------------
-# Redis Connection (Silent Fallback)
+# Redis Connection (Optional - Graceful Fallback)
 # ------------------------------
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis = None
+REDIS_AVAILABLE = False
 
 try:
-    redis = Redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_keepalive=True,
-        health_check_interval=30
-    )
-    # পিং টেস্ট – যদি ফেল করে তবে None
-    asyncio.get_event_loop().run_until_complete(redis.ping())
+    from redis.asyncio import Redis
+    REDIS_URL = os.getenv("REDIS_URL", "")
+    
+    if REDIS_URL:
+        redis = Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_keepalive=True,
+            health_check_interval=30
+        )
+        REDIS_AVAILABLE = True
+        log.info("✅ Redis configured")
+    else:
+        log.info("ℹ️ Redis not configured - using memory only")
+except ImportError:
+    log.info("ℹ️ Redis library not available - using memory only")
 except Exception as e:
-    log.warning("Redis not available – using memory only")
-    redis = None
-
+    log.warning(f"⚠️ Redis initialization warning: {e}")
 
 # ------------------------------
 # PAIRS (✅ FIXED: MATICUSDT → POLUSDT)
@@ -49,29 +54,41 @@ PAIRS = [
 
 
 async def fetch_trades(sym: str, buffer_dict: dict = None) -> list:
+    """
+    Fetch trades from in-memory buffer first, fallback to Redis
+    
+    Args:
+        sym: Symbol name
+        buffer_dict: Reference to main.TRADE_BUFFER
+    """
     try:
+        # Use in-memory buffer if available
         if buffer_dict and sym in buffer_dict:
             trades = list(buffer_dict[sym])
             if len(trades) >= 20:
                 return trades
-
-        if redis is None:
-            return []
-
-        data = await redis.lrange(f"tr:{sym}", 0, 500)
-        if not data:
-            return []
-
-        trades = []
-        for item in data:
+        
+        # Fallback to Redis (only if available)
+        if REDIS_AVAILABLE and redis:
             try:
-                trade = json.loads(item)
-                if all(k in trade for k in ["p", "q", "m", "t"]):
-                    trades.append(trade)
-            except:
-                continue
+                data = await redis.lrange(f"tr:{sym}", 0, 500)
+                if not data:
+                    return []
 
-        return trades
+                trades = []
+                for item in data:
+                    try:
+                        trade = json.loads(item)
+                        if all(k in trade for k in ["p", "q", "m", "t"]):
+                            trades.append(trade)
+                    except:
+                        continue
+
+                return trades
+            except:
+                return []
+        
+        return []
     except Exception as e:
         log.error(f"Fetch trades error for {sym}: {e}")
         return []
@@ -90,11 +107,11 @@ async def build_ohlcv_from_trades(sym: str, interval: str, limit: int = 200, buf
         df = df.set_index("t")
 
         rule = {
-            "1min": "1min",     # ✅ 'T' → 'min' (warning-free)
-            "5min": "5min",
-            "15min": "15min",
-            "60min": "60min"
-        }.get(interval, "1min")
+            "1min": "1T",
+            "5min": "5T",
+            "15min": "15T",
+            "60min": "60T"
+        }.get(interval, "1T")
 
         ohlc = df["p"].resample(rule).ohlc()
         vol = df["q"].resample(rule).sum()
@@ -160,6 +177,7 @@ async def orderflow_metrics(sym: str, buffer_dict: dict = None, ob_cache: dict =
         total_delta = df["delta"].sum()
         recent_delta = df["delta"].tail(40).sum()
 
+        # Try in-memory cache first
         if ob_cache and sym in ob_cache:
             ob = ob_cache[sym]
             bid = float(ob["bid"])
@@ -167,8 +185,25 @@ async def orderflow_metrics(sym: str, buffer_dict: dict = None, ob_cache: dict =
             spread_pct = (ask - bid) / bid * 100
             depth_usd = (bid + ask) * 50
         else:
-            spread_pct = 0.15
-            depth_usd = 20000
+            # Fallback to Redis (only if available)
+            if REDIS_AVAILABLE and redis:
+                try:
+                    ob_raw = await redis.get(f"ob:{sym}")
+                    if ob_raw:
+                        ob = json.loads(ob_raw)
+                        bid = float(ob["bid"])
+                        ask = float(ob["ask"])
+                        spread_pct = (ask - bid) / bid * 100
+                        depth_usd = (bid + ask) * 50
+                    else:
+                        spread_pct = 0.15
+                        depth_usd = 20000
+                except:
+                    spread_pct = 0.15
+                    depth_usd = 20000
+            else:
+                spread_pct = 0.15
+                depth_usd = 20000
 
         return {
             "delta": float(total_delta),
@@ -200,16 +235,21 @@ async def btc_calm_check(threshold=0.35, buffer_dict: dict = None):
 
 async def get_last_price(sym: str, ticker_cache: dict = None):
     try:
+        # Try in-memory cache first
         if ticker_cache and sym in ticker_cache:
             return float(ticker_cache[sym]["last"])
-
-        if redis is None:
-            return None
-
-        tk = await redis.get(f"tk:{sym}")
-        if not tk:
-            return None
-        data = json.loads(tk)
-        return float(data["last"])
+        
+        # Fallback to Redis (only if available)
+        if REDIS_AVAILABLE and redis:
+            try:
+                tk = await redis.get(f"tk:{sym}")
+                if not tk:
+                    return None
+                data = json.loads(tk)
+                return float(data["last"])
+            except:
+                return None
+        
+        return None
     except:
         return None
