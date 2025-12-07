@@ -9,6 +9,7 @@ import pandas as pd
 from redis.asyncio import Redis
 from datetime import datetime
 import logging
+import asyncio      # পিং টেস্টের জন্য
 
 log = logging.getLogger("helpers")
 
@@ -89,11 +90,11 @@ async def build_ohlcv_from_trades(sym: str, interval: str, limit: int = 200, buf
         df = df.set_index("t")
 
         rule = {
-            "1min": "1T",
-            "5min": "5T",
-            "15min": "15T",
-            "60min": "60T"
-        }.get(interval, "1T")
+            "1min": "1min",     # ✅ 'T' → 'min' (warning-free)
+            "5min": "5min",
+            "15min": "15min",
+            "60min": "60min"
+        }.get(interval, "1min")
 
         ohlc = df["p"].resample(rule).ohlc()
         vol = df["q"].resample(rule).sum()
