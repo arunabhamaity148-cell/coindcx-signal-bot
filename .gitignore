@@ -1,1 +1,89 @@
- 
+# API Keys & Secrets
+.env
+*.env
+config/api_keys.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+database/
+*.sql
+
+# Logs
+logs/
+*.log
+
+# ML Models
+models/*.h5
+models/*.pkl
+models/*.joblib
+models/checkpoints/
+
+# Data
+data/historical/
+data/raw/
+data/processed/
+*.csv
+*.json
+*.parquet
+
+# Backtest Results
+backtest_results/
+*.png
+*.jpg
+*.jpeg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# Trading Logs
+trade_logs/
+positions/ 
