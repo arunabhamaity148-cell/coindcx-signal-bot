@@ -175,6 +175,10 @@ class TradingBot:
                     user=DATA_CONFIG['db_user'],
                     password=DATA_CONFIG['db_password']
                 )
+import os, psycopg2
+db_url = os.getenv("DATABASE_URL")          # Railway auto-provides
+self.db_conn = psycopg2.connect(db_url) if db_url else None
+
                 logger.info("    ✅ Database connected")
             except Exception as e:
                 logger.warning(f"    ⚠️  Database not available: {e}")
