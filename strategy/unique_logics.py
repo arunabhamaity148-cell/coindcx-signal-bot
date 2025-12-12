@@ -120,7 +120,8 @@ class UniqueLogics:
         if not is_good:
             logger.warning(f"⚠️ Low liquidity hour: {hour}:00 UTC")
         return is_good
-# ==================== B) PRICE ACTION & STRUCTURE (7) ====================
+
+    # ==================== B) PRICE ACTION & STRUCTURE (7) ====================
 
     def check_breakout_confirmation(self, candle: pd.Series) -> bool:
         """9. Breakout confirmation (body > wick)"""
@@ -304,7 +305,8 @@ class UniqueLogics:
             return {'signal': 'bearish', 'k': k.iloc[-1]}
         else:
             return {'signal': 'neutral'}
-def check_obv_divergence(self, df: pd.DataFrame) -> str:
+
+    def check_obv_divergence(self, df: pd.DataFrame) -> str:
         """19. OBV divergence (volume-based)"""
         obv = self._calculate_obv(df)
 
@@ -439,7 +441,7 @@ def check_obv_divergence(self, df: pd.DataFrame) -> str:
         if large_orders:
             logger.info(f"🐋 {len(large_orders)} large orders detected")
         return large_orders
-def detect_spoofing_wall(self, orderbook: Dict) -> Dict:
+    def detect_spoofing_wall(self, orderbook: Dict) -> Dict:
         """28. Spoofing wall detection (fake liquidity)"""
         threshold = self.config.get('spoofing_wall_threshold', 500000)
 
@@ -492,6 +494,7 @@ def detect_spoofing_wall(self, orderbook: Dict) -> Dict:
 
         velocity = spread_now - spread_before
         return velocity
+
     # ==================== E) DERIVATIVES & FUTURES LOGICS (6) ====================
 
     def check_oi_trend(self, oi_history: list) -> str:
@@ -586,7 +589,8 @@ def detect_spoofing_wall(self, orderbook: Dict) -> Dict:
             return position_size * 1.0
         else:
             return position_size * 0.75
-# ==================== F) ANTI-TRAP MECHANISMS (8) ====================
+
+    # ==================== F) ANTI-TRAP MECHANISMS (8) ====================
 
     def avoid_round_numbers(self, price: float) -> bool:
         """38. Avoid round-number trap zones"""
@@ -699,7 +703,7 @@ def detect_spoofing_wall(self, orderbook: Dict) -> Dict:
         return should_trade, consecutive_losses
 
     # ==================== HELPER FUNCTIONS ====================
-def _calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
+    def _calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
         """Calculate ADX indicator"""
         # ensure numeric series
         high = df['high'].astype(float)
@@ -765,6 +769,115 @@ def _calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
         # return last value
         last = adx.iloc[-1] if len(adx) > 0 else 0.0
         return float(last)
+
+    def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average True Range"""
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+        close = df['close'].astype(float)
+        
+        prev_close = close.shift(1)
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        atr = tr.rolling(window=period).mean()
+        return atr
+
+    def _calculate_bollinger_bands(self, df: pd.DataFrame, period: int = 20, std_dev: int = 2) -> Tuple[pd.Series, pd.Series]:
+        """Calculate Bollinger Bands"""
+        sma = df['close'].rolling(window=period).mean()
+        std = df['close'].rolling(window=period).std()
+        
+        upper_band = sma + (std * std_dev)
+        lower_band = sma - (std * std_dev)
+        
+        return upper_band, lower_band
+
+    def _calculate_rsi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate RSI"""
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+
+    def _calculate_macd(self, df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """Calculate MACD"""
+        ema_fast = df['close'].ewm(span=fast).mean()
+        ema_slow = df['close'].ewm(span=slow).mean()
+        
+        macd = ema_fast - ema_slow
+        signal_line = macd.ewm(span=signal).mean()
+        histogram = macd - signal_line
+        
+        return macd, signal_line, histogram
+
+    def _calculate_stochastic(self, df: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> Tuple[pd.Series, pd.Series]:
+        """Calculate Stochastic Oscillator"""
+        low_min = df['low'].rolling(window=k_period).min()
+        high_max = df['high'].rolling(window=k_period).max()
+        
+        k = 100 * ((df['close'] - low_min) / (high_max - low_min))
+        d = k.rolling(window=d_period).mean()
+        
+        return k, d
+
+    def _calculate_obv(self, df: pd.DataFrame) -> pd.Series:
+        """Calculate On-Balance Volume"""
+        obv = pd.Series(index=df.index, dtype=float)
+        obv.iloc[0] = 0
+        
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > df['close'].iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] + df['volume'].iloc[i]
+            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] - df['volume'].iloc[i]
+            else:
+                obv.iloc[i] = obv.iloc[i-1]
+                
+        return obv
+
+    def _calculate_mfi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Money Flow Index"""
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        money_flow = typical_price * df['volume']
+        
+        positive_flow = pd.Series(index=df.index, dtype=float)
+        negative_flow = pd.Series(index=df.index, dtype=float)
+        
+        for i in range(1, len(df)):
+            if typical_price.iloc[i] > typical_price.iloc[i-1]:
+                positive_flow.iloc[i] = money_flow.iloc[i]
+                negative_flow.iloc[i] = 0
+            else:
+                positive_flow.iloc[i] = 0
+                negative_flow.iloc[i] = money_flow.iloc[i]
+        
+        positive_mf = positive_flow.rolling(window=period).sum()
+        negative_mf = negative_flow.rolling(window=period).sum()
+        
+        mfi = 100 - (100 / (1 + (positive_mf / negative_mf)))
+        
+        return mfi
+
+    def _detect_rsi_divergence(self, df: pd.DataFrame, rsi: pd.Series) -> str:
+        """Detect RSI divergence"""
+        # Simplified divergence detection
+        price_trend = df['close'].iloc[-10:].is_monotonic_increasing
+        rsi_trend = rsi.iloc[-10:].is_monotonic_increasing
+        
+        if price_trend and not rsi_trend:
+            return 'bearish_divergence'
+        elif not price_trend and rsi_trend:
+            return 'bullish_divergence'
+        else:
+            return 'no_divergence'
+
 
 # compatibility alias: older code expects LogicEvaluator
 class LogicEvaluator(UniqueLogics):
