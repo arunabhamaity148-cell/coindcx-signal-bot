@@ -1,9 +1,13 @@
 """
-Configuration file for Crypto Trading Bot
+Configuration file for Crypto Trading Bot (FINAL - quick fix)
+- Multi-symbol quick mode (15 symbols)
+- TA-only fallback enabled via ml_required flag
+- Check interval set to 5 minutes (300 seconds)
 """
 import os
 from dotenv import load_dotenv
 
+# load API keys from config/api_keys.env
 load_dotenv('config/api_keys.env')
 
 # ==================== EXCHANGE CONFIG ====================
@@ -31,17 +35,41 @@ EXCHANGES = {
 
 # ==================== TRADING CONFIG ====================
 TRADING_CONFIG = {
-    'symbols': ['BTC/USDT:USDT', 'ETH/USDT:USDT'],
+    # Multi-symbol Quick mode (15 symbols)
+    'symbols': [
+        'BTC/USDT:USDT',
+        'ETH/USDT:USDT',
+        'SOL/USDT:USDT',
+        'BNB/USDT:USDT',
+        'XRP/USDT:USDT',
+        'DOGE/USDT:USDT',
+        'ADA/USDT:USDT',
+        'AVAX/USDT:USDT',
+        'MATIC/USDT:USDT',
+        'DOT/USDT:USDT',
+        'LINK/USDT:USDT',
+        'UNI/USDT:USDT',
+        'ATOM/USDT:USDT',
+        'LTC/USDT:USDT',
+        'BCH/USDT:USDT'
+    ],
     'primary_symbol': 'BTC/USDT:USDT',
+    # interval for checks (in seconds) - 300s = 5 minutes
+    'check_interval': 300,
     'timeframe': '15m',
     'initial_capital': 10000,  # INR
     'max_leverage': 7,
     'min_leverage': 3,
     'position_size_percent': 0.15,  # 15% per trade
-    'max_positions': 3,
-    'max_daily_trades': 8,
+    'max_positions': 5,              # increase for multi-symbol scanning
+    'max_daily_trades': 25,          # allow more trades per day in quick mode
     'max_daily_loss_percent': 0.20,  # 20%
     'max_trade_duration_hours': 4,
+
+    # Quick fix ML toggle: if False -> TA-only (no ML required)
+    'ml_required': False,
+    # minimum ML confidence required (ignored if ml_required=False)
+    'confidence_threshold': 0.0,
 }
 
 # ==================== RISK MANAGEMENT ====================
@@ -61,6 +89,7 @@ ML_CONFIG = {
     'lstm_weight': 0.50,
     'xgboost_weight': 0.30,
     'rf_weight': 0.20,
+    # Note: confidence thresholds here are defaults; TRADING_CONFIG['ml_required'] controls usage
     'confidence_threshold': 0.70,
     'high_confidence_threshold': 0.75,
     'lookback_candles': 60,
@@ -72,7 +101,8 @@ ML_CONFIG = {
 # ==================== DATA CONFIG ====================
 DATA_CONFIG = {
     'historical_years': 5,
-    'data_update_interval': 15,  # seconds
+    # data update interval in seconds when polling (keep small if using websockets)
+    'data_update_interval': 15,
     'use_websocket': True,
     'database_type': 'postgresql',
     'db_host': os.getenv('DB_HOST', 'localhost'),
@@ -86,24 +116,24 @@ DATA_CONFIG = {
 UNIQUE_LOGICS = {
     # Market Health Filters
     'btc_calm_threshold': 0.015,  # 1.5% max volatility
-    'funding_rate_extreme': 0.15,  # 0.15%
+    'funding_rate_extreme': 0.0015,  # 0.15% (decimal)
     'fear_greed_extreme_low': 20,
     'fear_greed_extreme_high': 80,
     'news_skip_minutes': 30,
-    'spread_max_percent': 0.10,  # 0.1%
+    'spread_max_percent': 0.001,  # 0.1% expressed as decimal
     'low_liquidity_hours': [2, 3, 4, 5],  # UTC
-    
+
     # Order Flow
     'orderbook_imbalance_threshold': 1.2,
     'vwap_deviation_percent': 0.005,  # 0.5%
     'large_order_threshold': 100000,  # $100k
     'spoofing_wall_threshold': 500000,  # $500k
     'cross_exchange_divergence': 0.003,  # 0.3%
-    
+
     # Liquidation & Gamma
     'liquidation_proximity_percent': 0.02,  # 2%
     'gamma_exposure_threshold': 0.5,
-    
+
     # Anti-trap
     'round_number_avoid_distance': 0.001,  # 0.1%
     'sl_hunting_zone_percent': 0.005,  # 0.5%
@@ -139,4 +169,4 @@ LOGGING_CONFIG = {
     'log_file': 'logs/trading_bot.log',
     'max_log_size_mb': 100,
     'backup_count': 5,
-} 
+}
