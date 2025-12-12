@@ -1,47 +1,54 @@
-# FINAL Railway-ready Dockerfile (replace existing Dockerfile)
+# ============================
+# FINAL DOCKERFILE – RAILWAY
+# ============================
+
 FROM python:3.11-slim
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
 
-# system deps (minimal but enough for ta-lib, build and PostgreSQL)
+# --------------------------------------------------------
+# System dependencies (TA-Lib compile + ML libs support)
+# --------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential wget curl git ca-certificates libssl-dev libbz2-dev libffi-dev \
-    liblzma-dev libncurses5-dev libncursesw5-dev libreadline-dev libsqlite3-dev \
-    zlib1g-dev libpq-dev gcc g++ make unzip && rm -rf /var/lib/apt/lists/*
+    build-essential wget curl git ca-certificates libssl-dev libbz2-dev \
+    libffi-dev liblzma-dev libncurses5-dev libncursesw5-dev libreadline-dev \
+    libsqlite3-dev zlib1g-dev libpq-dev gcc g++ make unzip \
+    && rm -rf /var/lib/apt/lists/*
 
-# TA-Lib C library (needed by python ta-lib)
-RUN set -eux; \
-    wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz -O /tmp/ta-lib.tar.gz; \
-    cd /tmp; tar -xzf ta-lib.tar.gz; cd ta-lib; ./configure --prefix=/usr && make && make install; \
-    rm -rf /tmp/ta-lib*
+# -------- Install TA-Lib C library --------
+RUN wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz -O /tmp/ta-lib.tar.gz \
+ && cd /tmp && tar -xzf ta-lib.tar.gz && cd ta-lib \
+ && ./configure --prefix=/usr && make && make install \
+ && rm -rf /tmp/ta-lib /tmp/ta-lib.tar.gz
 
-# upgrade pip & tooling
+# -------- Python tooling --------
 RUN python -m pip install --upgrade pip setuptools wheel
 
-WORKDIR /app
-
+# --------------------------------------------------------
 # Copy project
+# --------------------------------------------------------
+WORKDIR /app
 COPY . /app
 
-# Install python deps (no venv, system pip). requirements.txt should NOT contain "python>=..."
+# --------------------------------------------------------
+# Install Python dependencies
+# --------------------------------------------------------
 RUN pip install --no-cache-dir -r requirements.txt
 
-# TRAIN MODELS IF DATA EXISTS (glob all 12 CSVs)
-# - uses shell glob expansion; if files present run training with all CSVs
-# - set EPOCHS build-arg to control epochs
+# --------------------------------------------------------
+# TRAIN MODELS DURING BUILD
+# --------------------------------------------------------
 ARG EPOCHS=3
+
 RUN bash -lc '\
     if ls data/BTCUSDT-15m-*.csv >/dev/null 2>&1; then \
-      echo "Data CSVs found -> training models (this may take time)"; \
-      python scripts/train_models.py --data data/BTCUSDT-15m-*.csv --epochs ${EPOCHS}; \
+      echo "📊 Training ML models using CSV files from /app/data ..."; \
+      python scripts/train_models.py --data_dir data/ --epochs ${EPOCHS}; \
     else \
-      echo "No data CSVs found in /app/data. Skipping model training."; \
+      echo "⚠️ No CSV files found in /app/data - skipping model training."; \
     fi'
 
-# Expose port if any (optional)
-# EXPOSE 8080
-
-# Default start command
+# --------------------------------------------------------
+# START BOT
+# --------------------------------------------------------
 CMD ["python", "main.py"]
