@@ -9,11 +9,10 @@ requests==2.31.0
 # Data Processing
 pandas==2.1.4
 numpy==1.26.3
-ta-lib==0.4.28
 
-# Machine Learning
-tensorflow==2.15.0
-keras==2.15.0
+# Machine Learning (temporarily removed heavy TF/Keras)
+# tensorflow==2.15.0
+# keras==2.15.0
 xgboost==2.0.3
 scikit-learn==1.4.0
 
@@ -42,4 +41,4 @@ cryptography==42.0.0
 
 # Additional Features
 scipy==1.11.4
-joblib==1.3.2 
+joblib==1.3.2
