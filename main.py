@@ -1,27 +1,15 @@
 """
-MAIN TRADING BOT - FINAL VERSION
-Complete integration with all components:
-- 45 unique logics
-- ML ensemble (LSTM + XGBoost + RF)
-- Multi-exchange support
-- Risk management
-- Telegram notifications
-- Database logging
-- Real-time monitoring
+MAIN TRADING BOT – FINAL (Railway-deploy)
+- 45 logics, ML ensemble, multi-exchange, risk, Telegram, DB
 """
-import sys
-import os
-import time
-import logging
-import asyncio
+import os, sys, time, asyncio, logging, signal, argparse
 from datetime import datetime, timedelta
-import argparse
 import pandas as pd
-import signal
+import numpy as np
 
-# Import all components
+# ----------  imports  ----------
 from config.settings import (
-    EXCHANGES, TRADING_CONFIG, RISK_CONFIG, ML_CONFIG, 
+    EXCHANGES, TRADING_CONFIG, RISK_CONFIG, ML_CONFIG,
     UNIQUE_LOGICS, TELEGRAM_CONFIG, DATA_CONFIG
 )
 from data.data_collector import DataCollector
@@ -31,14 +19,15 @@ from ml.xgboost_model import XGBoostModel
 from ml.ensemble import EnsembleModel
 from risk.risk_manager import RiskManager
 from execution.order_executor import OrderExecutor
+from monitoring.telegram_bot import TradingBotNotifier   # lightweight helper
 
-# Setup logging
+# ----------  logging  ----------
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(f'logs/trading_bot_{datetime.now().strftime("%Y%m%d")}.log'),
+        logging.FileHandler(f'logs/trading_bot_{datetime.now():%Y%m%d}.log'),
         logging.StreamHandler()
     ]
 )
@@ -46,1028 +35,544 @@ logger = logging.getLogger(__name__)
 
 
 class TradingBot:
+    """Final bot – Railway ready (no polling, minimal memory)."""
     def __init__(self, mode='paper', capital=10000):
-        """
-        Initialize Trading Bot - FINAL VERSION
-        
-        Args:
-            mode: 'paper' or 'live'
-            capital: Starting capital in INR
-        """
-        self.mode = mode
-        self.capital = capital
-        self.initial_capital = capital
-        
-        logger.info("="*100)
-        logger.info("🤖 ADVANCED CRYPTO TRADING BOT - FINAL VERSION")
-        logger.info("="*100)
-        logger.info(f"Mode: {mode.upper()}")
-        logger.info(f"Capital: ₹{capital:,.2f}")
-        logger.info(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info("="*100)
-        
-        # Initialize components
-        self._initialize_components()
-        
-        # Initialize Telegram (async)
-        self.telegram_notifier = None
-        self._initialize_telegram()
-        
-        # Bot state
+        self.mode, self.capital, self.initial_capital = mode, capital, capital
         self.is_running = False
-        self.is_paused = False
-        self.trades_today = []
-        self.open_positions = []
-        self.last_signal_time = None
-        
-        # Performance tracking
+        self.open_positions: list = []
+        self.trades_today:  list = []
         self.performance = {
-            'total_trades': 0,
-            'wins': 0,
-            'losses': 0,
-            'total_pnl': 0,
-            'win_rate': 0,
-            'daily_pnl': 0,
-            'max_drawdown': 0,
+            'total_trades': 0, 'wins': 0, 'losses': 0, 'total_pnl': 0,
+            'win_rate': 0.0, 'daily_pnl': 0, 'max_drawdown': 0,
             'equity_curve': []
         }
-        
-        # Setup signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-    
-    def _initialize_components(self):
-        """Initialize all bot components"""
-        try:
-            logger.info("\n📊 INITIALIZING COMPONENTS...")
-            logger.info("="*100)
-            
-            # 1. Data Collector
-            logger.info("1/7 📊 Data Collector...")
-            self.data_collector = DataCollector(EXCHANGES)
-            logger.info("    ✅ Multi-exchange data collector ready")
-            
-            # 2. Logic Evaluator (45 unique logics)
-            logger.info("2/7 🧠 Logic Evaluator (45 unique logics)...")
-            self.logic_evaluator = LogicEvaluator(UNIQUE_LOGICS)
-            logger.info("    ✅ 45 unique trading logics loaded")
-            
-            # 3. ML Models
-            logger.info("3/7 🤖 ML Models...")
-            self.lstm_model = LSTMModel(
-                lookback=ML_CONFIG['lookback_candles'],
-                features=ML_CONFIG['features_count'],
-                model_path=ML_CONFIG['model_path']
-            )
-            self.xgboost_model = XGBoostModel(
-                model_path=ML_CONFIG['model_path']
-            )
-            
-            # Load trained models
-            try:
-                self.lstm_model.load('lstm_model.h5')
-                self.xgboost_model.load('xgboost_model.pkl')
-                logger.info("    ✅ Pre-trained ML models loaded")
-            except Exception as e:
-                logger.warning(f"    ⚠️  ML models not found: {e}")
-                logger.warning("    ℹ️  Run: python scripts/train_models.py")
-            
-            # 4. Ensemble Model
-            logger.info("4/7 🎯 Ensemble Model...")
-            self.ensemble = EnsembleModel(
-                lstm_model=self.lstm_model,
-                xgboost_model=self.xgboost_model,
-                lstm_weight=ML_CONFIG['lstm_weight'],
-                xgb_weight=ML_CONFIG['xgboost_weight'],
-                rf_weight=ML_CONFIG['rf_weight'],
-                model_path=ML_CONFIG['model_path']
-            )
-            
-            try:
-                self.ensemble.load_rf('random_forest.pkl')
-                logger.info("    ✅ Ensemble model ready (LSTM + XGBoost + RF)")
-            except:
-                logger.warning("    ⚠️  Random Forest model not found")
-            
-            # 5. Risk Manager
-            logger.info("5/7 🛡️ Risk Manager...")
-            self.risk_manager = RiskManager(RISK_CONFIG)
-            self.risk_manager.initial_daily_capital = self.capital
-            logger.info("    ✅ Risk management system active")
-            
-            # 6. Order Executor
-            logger.info("6/7 ⚡ Order Executor...")
-            if self.mode == 'live':
-                self.executor = OrderExecutor(EXCHANGES)
-                logger.info("    ✅ Live order executor initialized")
-            else:
-                logger.info("    ✅ Paper trading mode (simulation)")
-                self.executor = None
-            
-            # 7. Database Connection (optional)
-            logger.info("7/7 🗄️  Database...")
-            try:
-                import psycopg2
-                self.db_conn = psycopg2.connect(
-                    host=DATA_CONFIG['db_host'],
-                    port=DATA_CONFIG['db_port'],
-                    database=DATA_CONFIG['db_name'],
-                    user=DATA_CONFIG['db_user'],
-                    password=DATA_CONFIG['db_password']
-                )
-import os, psycopg2
-db_url = os.getenv("DATABASE_URL")          # Railway auto-provides
-self.db_conn = psycopg2.connect(db_url) if db_url else None
 
-                logger.info("    ✅ Database connected")
-            except Exception as e:
-                logger.warning(f"    ⚠️  Database not available: {e}")
-                self.db_conn = None
-            
-            logger.info("="*100)
-            logger.info("✅ ALL COMPONENTS INITIALIZED SUCCESSFULLY")
-            logger.info("="*100)
-            
-        except Exception as e:
-            logger.error(f"❌ Initialization failed: {e}")
-            raise
-    
-    def _initialize_telegram(self):
-        """Initialize Telegram bot"""
+        # Banner
+        logger.info("="*100)
+        logger.info("🤖 ADVANCED CRYPTO TRADING BOT – FINAL")
+        logger.info("="*100)
+        logger.info("Mode : %s  |  Capital : ₹%,.2f  |  Date : %s",
+                    mode.upper(), capital, datetime.now())
+        logger.info("="*100)
+
+        self._init_components()
+        self._init_telegram()
+        signal.signal(signal.SIGINT,  self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    # ------------------------------------------------------------------
+    # Component init
+    # ------------------------------------------------------------------
+    def _init_components(self):
+        logger.info("\n📊 INITIALISING COMPONENTS...")
+        logger.info("="*100)
+
+        # 1. Data
+        logger.info("1/7 📊 Data Collector...")
+        self.data_collector = DataCollector(EXCHANGES)
+        logger.info("    ✅ Multi-exchange ready")
+
+        # 2. Logics
+        logger.info("2/7 🧠 Logic Evaluator (45 unique logics)...")
+        self.logic_evaluator = LogicEvaluator(UNIQUE_LOGICS)
+        logger.info("    ✅ 45 unique logics loaded")
+
+        # 3. ML
+        logger.info("3/7 🤖 ML Models...")
+        self.lstm_model   = LSTMModel(ML_CONFIG['lookback_candles'],
+                                      ML_CONFIG['features_count'],
+                                      ML_CONFIG['model_path'])
+        self.xgb_model    = XGBoostModel(ML_CONFIG['model_path'])
         try:
-            if TELEGRAM_CONFIG['enable_notifications']:
-                from monitoring.telegram_bot import TradingBotNotifier
-                
-                bot_token = TELEGRAM_CONFIG['bot_token']
-                chat_id = TELEGRAM_CONFIG['chat_id']
-                
-                if bot_token and chat_id and bot_token != 'YOUR_BOT_TOKEN':
-                    self.telegram_notifier = TradingBotNotifier(bot_token, chat_id)
-                    logger.info("✅ Telegram notifications enabled")
-                else:
-                    logger.warning("⚠️  Telegram not configured")
+            self.lstm_model.load('lstm_model.h5')
+            self.xgb_model.load('xgboost_model.pkl')
+            logger.info("    ✅ Pre-trained ML loaded")
         except Exception as e:
-            logger.warning(f"⚠️  Telegram initialization failed: {e}")
-    
+            logger.warning("    ⚠️  ML models not found: %s", e)
+
+        # 4. Ensemble
+        logger.info("4/7 🎯 Ensemble Model...")
+        self.ensemble = EnsembleModel(self.lstm_model, self.xgb_model,
+                                     ML_CONFIG['lstm_weight'],
+                                     ML_CONFIG['xgboost_weight'],
+                                     ML_CONFIG['rf_weight'],
+                                     ML_CONFIG['model_path'])
+        try:
+            self.ensemble.load_rf('random_forest.pkl')
+            logger.info("    ✅ Ensemble ready")
+        except:
+            logger.warning("    ⚠️  RF model missing")
+
+        # 5. Risk
+        logger.info("5/7 🛡️ Risk Manager...")
+        self.risk_manager = RiskManager(RISK_CONFIG)
+        self.risk_manager.initial_daily_capital = self.capital
+        logger.info("    ✅ Risk system active")
+
+        # 6. Executor
+        logger.info("6/7 ⚡ Order Executor...")
+        if self.mode == 'live':
+            self.executor = OrderExecutor(EXCHANGES)
+            logger.info("    ✅ Live executor")
+        else:
+            self.executor = None
+            logger.info("    ✅ Paper mode")
+
+        # 7. DB (Railway PostgreSQL)
+        logger.info("7/7 🗄️  Database...")
+        try:
+            import psycopg2
+            db_url = os.getenv("DATABASE_URL")      # Railway gives this
+            self.db_conn = psycopg2.connect(db_url) if db_url else None
+            logger.info("    ✅ DB connected" if self.db_conn else "    ⚠️  DB URL not set")
+        except Exception as e:
+            logger.warning("    ⚠️  DB error: %s", e)
+            self.db_conn = None
+
+        logger.info("="*100)
+        logger.info("✅ ALL COMPONENTS INITIALISED")
+        logger.info("="*100)
+
+    # ------------------------------------------------------------------
+    # Telegram
+    # ------------------------------------------------------------------
+    def _init_telegram(self):
+        self.telegram_notifier = None
+        if not TELEGRAM_CONFIG.get('enable_notifications', True):
+            return
+
+        token = os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_CONFIG.get('bot_token')
+        chat  = os.getenv("TELEGRAM_CHAT_ID")   or TELEGRAM_CONFIG.get('chat_id')
+
+        if token and token != "YOUR_BOT_TOKEN" and chat:
+            try:
+                self.telegram_notifier = TradingBotNotifier(token, chat)
+                logger.info("✅ Telegram notifier ready")
+            except Exception as e:
+                logger.warning("⚠️  Telegram init failed: %s", e)
+        else:
+            logger.warning("⚠️  Telegram not configured")
+
+    # ------------------------------------------------------------------
+    // helpers
+    // ------------------------------------------------------------------
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        logger.info("\n⏹️  Shutdown signal received...")
+        logger.info("\n⏹️  Shutdown signal received…")
         self.stop()
         sys.exit(0)
-    
-    async def _send_telegram(self, message):
-        """Send Telegram notification"""
-        if self.telegram_notifier:
-            try:
-                await self.telegram_notifier.send_message(message)
-            except Exception as e:
-                logger.warning(f"Telegram notification failed: {e}")
-    
+
+    async def _telegram(self, coro):
+        """Fire-and-forget telegram call (never blocks trading loop)."""
+        if not self.telegram_notifier:
+            return
+        try:
+            await coro
+        except Exception as e:
+            logger.warning("Telegram send failed: %s", e)
+
+    // ------------------------------------------------------------------
+    // Market data
+    // ------------------------------------------------------------------
     def fetch_market_data(self, symbol='BTC/USDT:USDT', timeframe='15m', limit=200):
-        """Fetch latest market data with all required info"""
         try:
-            # OHLCV data
-            df = self.data_collector.fetch_ohlcv(
-                symbol=symbol,
-                timeframe=timeframe,
-                exchange_name='bybit',
-                limit=limit
-            )
-            
+            df = self.data_collector.fetch_ohlcv(symbol, timeframe, 'bybit', limit)
             if df.empty:
-                logger.error("❌ No OHLCV data received")
                 return None
-            
-            # Orderbook
-            orderbook = self.data_collector.fetch_orderbook(symbol, 'bybit', limit=20)
-            
-            # Funding rate
-            funding_rate = self.data_collector.fetch_funding_rate(symbol, 'bybit')
-            
-            # Open interest
-            open_interest = self.data_collector.fetch_open_interest(symbol, 'bybit')
-            
-            # Large orders
-            large_orders = self.data_collector.detect_large_orders(
-                symbol, 
-                threshold=UNIQUE_LOGICS['large_order_threshold'],
-                exchange_name='bybit'
-            )
-            
-            # Cross-exchange divergence
-            divergence = self.data_collector.calculate_price_divergence(symbol)
-            
+            orderbook   = self.data_collector.fetch_orderbook(symbol, 'bybit', 20)
+            funding     = self.data_collector.fetch_funding_rate(symbol, 'bybit')
+            oi          = self.data_collector.fetch_open_interest(symbol, 'bybit')
+            large_orders= self.data_collector.detect_large_orders(
+                symbol, UNIQUE_LOGICS['large_order_threshold'], 'bybit')
+            divergence  = self.data_collector.calculate_price_divergence(symbol)
             return {
-                'df': df,
-                'orderbook': orderbook,
-                'funding_rate': funding_rate,
-                'open_interest': open_interest,
-                'large_orders': large_orders,
-                'divergence': divergence,
-                'timestamp': datetime.now()
+                'df':df, 'orderbook':orderbook, 'funding_rate':funding,
+                'open_interest':oi, 'large_orders':large_orders,
+                'divergence':divergence, 'timestamp':datetime.now()
             }
-        
         except Exception as e:
-            logger.error(f"❌ Failed to fetch market data: {e}")
+            logger.error("❌ fetch_market_data: %s", e)
             return None
-    
+
+    // ------------------------------------------------------------------
+    // Feature engineering
+    // ------------------------------------------------------------------
     def generate_features(self, df):
-        """Generate features for ML prediction"""
         try:
-            features = pd.DataFrame(index=df.index)
-            
-            # Basic price features
-            features['close'] = df['close']
-            features['high'] = df['high']
-            features['low'] = df['low']
-            features['volume'] = df['volume']
-            features['returns'] = df['close'].pct_change()
-            
-            # Moving averages
-            for period in [5, 10, 20, 50]:
-                features[f'sma_{period}'] = df['close'].rolling(period).mean()
-                features[f'ema_{period}'] = df['close'].ewm(span=period).mean()
-            
-            # Volatility
-            features['volatility'] = df['close'].rolling(20).std()
-            
-            # RSI
+            feats = pd.DataFrame(index=df.index)
+            feats['close']    = df['close']
+            feats['high']     = df['high']
+            feats['low']      = df['low']
+            feats['volume']   = df['volume']
+            feats['returns']  = df['close'].pct_change()
+
+            for p in [5,10,20,50]:
+                feats[f'sma_{p}'] = df['close'].rolling(p).mean()
+                feats[f'ema_{p}'] = df['close'].ewm(span=p).mean()
+
+            feats['volatility'] = df['close'].rolling(20).std()
             delta = df['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            features['rsi'] = 100 - (100 / (1 + rs))
-            
-            # MACD
-            ema_12 = df['close'].ewm(span=12).mean()
-            ema_26 = df['close'].ewm(span=26).mean()
-            features['macd'] = ema_12 - ema_26
-            features['macd_signal'] = features['macd'].ewm(span=9).mean()
-            
-            # Fill NaN
-            features = features.fillna(method='bfill').fillna(0)
-            
-            return features
-        
+            gain  = delta.clip(lower=0).rolling(14).mean()
+            loss  = (-delta.clip(upper=0)).rolling(14).mean()
+            rs    = gain / loss
+            feats['rsi'] = 100 - (100 / (1 + rs))
+
+            ema12 = df['close'].ewm(span=12).mean()
+            ema26 = df['close'].ewm(span=26).mean()
+            feats['macd']        = ema12 - ema26
+            feats['macd_signal'] = feats['macd'].ewm(span=9).mean()
+
+            return feats.bfill().fillna(0)        # Railway-fix: no method=
         except Exception as e:
-            logger.error(f"❌ Feature generation failed: {e}")
+            logger.error("❌ generate_features: %s", e)
             return pd.DataFrame()
-    
+    # ------------------------------------------------------------------
+    // Core analysis
+    // ------------------------------------------------------------------
     def analyze_trade_opportunity(self, symbol='BTC/USDT:USDT'):
-        """
-        MAIN ANALYSIS FUNCTION
-        Combines ML prediction + 45 unique logics
-        """
         logger.info("\n" + "="*100)
-        logger.info(f"🔍 ANALYZING TRADE OPPORTUNITY: {symbol}")
+        logger.info("🔍 ANALYSING: %s", symbol)
         logger.info("="*100)
-        
-        try:
-            # 1. Fetch market data
-            market_data = self.fetch_market_data(symbol)
-            if not market_data:
-                return None
-            
-            df = market_data['df']
-            orderbook = market_data['orderbook']
-            funding_rate = market_data['funding_rate']
-            
-            logger.info(f"📊 Market Data: {len(df)} candles, Price: ₹{df['close'].iloc[-1]:,.2f}")
-            
-            # 2. Generate features for ML
-            features = self.generate_features(df)
-            if features.empty:
-                logger.error("❌ Feature generation failed")
-                return None
-            
-            # 3. ML Prediction
-            logger.info("🤖 ML Prediction...")
-            try:
-                signal, confidence = self.ensemble.generate_signal(
-                    features.tail(100).values,
-                    confidence_threshold=ML_CONFIG['confidence_threshold']
-                )
-                
-                signal_name = ['BUY', 'HOLD', 'SELL'][signal]
-                logger.info(f"   Signal: {signal_name} | Confidence: {confidence:.2%}")
-                
-                if signal == 1:  # HOLD
-                    logger.info("⏸️  ML says HOLD - No trade")
-                    return None
-                
-            except Exception as e:
-                logger.error(f"❌ ML prediction failed: {e}")
-                logger.info("   Falling back to technical analysis only")
-                return None
-            
-            # 4. Apply 45 Unique Logics
-            logger.info("🧠 Evaluating 45 unique trading logics...")
-            
-            logic_result = self.logic_evaluator.evaluate_all_logics(
-                df=df,
-                orderbook=orderbook,
-                funding_rate=funding_rate,
-                oi_history=[market_data['open_interest']] * 20,
-                recent_trades=self.trades_today,
-                fear_greed_index=50,  # Would fetch from API in production
-                news_times=[],  # Would fetch from news API
-                liquidation_clusters=[]  # Would fetch from exchange
-            )
-            
-            logger.info(f"   Logic Score: {logic_result['final_score']:.1f}%")
-            logger.info(f"   Trade Allowed: {logic_result['trade_allowed']}")
-            
-            # 5. Final Decision
-            if not logic_result['trade_allowed']:
-                logger.warning("❌ Trade blocked by logic filters:")
-                for reason in logic_result['reasons']:
-                    logger.warning(f"   • {reason}")
-                return None
-            
-            # 6. Determine trade parameters
-            current_price = df['close'].iloc[-1]
-            side = 'LONG' if signal == 0 else 'SHORT'
-            
-            market_regime = logic_result['market_health']['market_regime']
-            atr = logic_result['price_action']['atr']
-            
-            # Position sizing
-            position_size = self.risk_manager.calculate_position_size(
-                capital=self.capital,
-                signal_confidence=confidence,
-                market_regime=market_regime
-            )
-            
-            # Leverage calculation
-            leverage = self.risk_manager.calculate_leverage(
-                market_regime=market_regime,
-                volatility=atr / current_price if current_price > 0 else 0.02,
-                signal_confidence=confidence
-            )
-            
-            # Stop loss
-            stop_loss = self.risk_manager.calculate_stop_loss(
-                entry_price=current_price,
-                side=side,
-                leverage=leverage,
-                atr=atr
-            )
-            
-            # Take profit
-            take_profit = self.risk_manager.calculate_take_profit(
-                entry_price=current_price,
-                side=side,
-                signal_confidence=confidence
-            )
-            
-            # 7. Validate trade
-            is_valid, reason = self.risk_manager.validate_trade(
-                capital=self.capital,
-                position_size=position_size,
-                leverage=leverage,
-                entry_price=current_price,
-                stop_loss=stop_loss,
-                side=side
-            )
-            
-            if not is_valid:
-                logger.warning(f"❌ Trade validation failed: {reason}")
-                return None
-            
-            # 8. Create trade plan
-            trade_plan = {
-                'symbol': symbol,
-                'side': side,
-                'signal': signal_name,
-                'confidence': confidence,
-                'entry_price': current_price,
-                'position_size': position_size,
-                'leverage': leverage,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'logic_score': logic_result['final_score'],
-                'market_regime': market_regime,
-                'timestamp': datetime.now(),
-                'large_orders_detected': len(market_data['large_orders']),
-                'funding_rate': funding_rate
-            }
-            
-            # 9. Print summary
-            logger.info("\n" + "="*100)
-            logger.info("✅ TRADE OPPORTUNITY FOUND!")
-            logger.info("="*100)
-            logger.info(f"📊 Signal: {signal_name} (ML Confidence: {confidence:.2%})")
-            logger.info(f"🎯 Logic Score: {logic_result['final_score']:.1f}%")
-            logger.info(f"💰 Entry: ₹{current_price:,.2f}")
-            logger.info(f"📈 Size: ₹{position_size:,.2f} ({leverage}x leverage)")
-            logger.info(f"🛑 Stop Loss: ₹{stop_loss:,.2f}")
-            logger.info(f"🎯 Take Profit: ₹{take_profit:,.2f}")
-            logger.info(f"📊 Market: {market_regime}")
-            logger.info(f"🐋 Large Orders: {len(market_data['large_orders'])}")
-            logger.info("="*100)
-            
-            return trade_plan
-        
-        except Exception as e:
-            logger.error(f"❌ Analysis failed: {e}")
+
+        mdata = self.fetch_market_data(symbol)
+        if not mdata:
             return None
-    
-    def execute_trade(self, trade_plan):
-        """Execute the trade (paper or live)"""
+        df, orderbook, funding = mdata['df'], mdata['orderbook'], mdata['funding_rate']
+
+        logger.info("📊 %d candles, Price ₹%,.2f", len(df), df['close'].iloc[-1])
+
+        // 1. ML signal
+        logger.info("🤖 ML Prediction…")
+        features = self.generate_features(df)
+        if features.empty:
+            return None
+        try:
+            signal, conf = self.ensemble.generate_signal(
+                features.tail(100).values,
+                ML_CONFIG['confidence_threshold']
+            )
+            signal_name = ['BUY', 'HOLD', 'SELL'][signal]
+            logger.info("   Signal: %s | Confidence: %.1f%%", signal_name, conf*100)
+            if signal == 1:   // HOLD
+                return None
+        except Exception as e:
+            logger.error("❌ ML failed: %s – fallback to TA only", e)
+            return None
+
+        // 2. 45-logics filter
+        logger.info("🧠 45-logics evaluation…")
+        logic_res = self.logic_evaluator.evaluate_all_logics(
+            df=df, orderbook=orderbook, funding_rate=funding,
+            oi_history=[mdata['open_interest']]*20,
+            recent_trades=self.trades_today,
+            fear_greed_index=50, news_times=[], liquidation_clusters=[]
+        )
+        logger.info("   Logic score: %.1f%% | Trade allowed: %s",
+                    logic_res['final_score'], logic_res['trade_allowed'])
+        if not logic_res['trade_allowed']:
+            logger.warning("❌ Trade blocked by filters")
+            return None
+
+        // 3. Build trade plan
+        curr_p     = df['close'].iloc[-1]
+        side       = 'LONG' if signal == 0 else 'SHORT'
+        regime     = logic_res['market_health']['market_regime']
+        atr        = logic_res['price_action']['atr']
+        pos_size   = self.risk_manager.calculate_position_size(
+            self.capital, conf, regime)
+        leverage   = self.risk_manager.calculate_leverage(
+            regime, atr/curr_p if curr_p else 0.02, conf)
+        stop_loss  = self.risk_manager.calculate_stop_loss(
+            curr_p, side, leverage, atr)
+        take_profit= self.risk_manager.calculate_take_profit(
+            curr_p, side, conf)
+
+        is_valid, reason = self.risk_manager.validate_trade(
+            self.capital, pos_size, leverage, curr_p, stop_loss, side)
+        if not is_valid:
+            logger.warning("❌ Validation failed: %s", reason)
+            return None
+
+        plan = {
+            'symbol':symbol, 'side':side, 'signal':signal_name,
+            'confidence':conf, 'entry_price':curr_p,
+            'position_size':pos_size, 'leverage':leverage,
+            'stop_loss':stop_loss, 'take_profit':take_profit,
+            'logic_score':logic_res['final_score'],
+            'market_regime':regime, 'timestamp':datetime.now(),
+            'large_orders_detected':len(mdata['large_orders']),
+            'funding_rate':funding
+        }
+
+        logger.info("\n" + "="*100)
+        logger.info("✅ TRADE PLAN READY")
+        logger.info("="*100)
+        logger.info("📊 %s (ML %.1f%%) | Logic %.1f%%", signal_name, conf*100,
+                    logic_res['final_score'])
+        logger.info("💰 Entry ₹%,.2f | Size ₹%,.2f (%dx)", curr_p, pos_size, leverage)
+        logger.info("🛑 SL ₹%,.2f | TP ₹%,.2f", stop_loss, take_profit)
+        logger.info("="*100)
+        return plan
+
+    // ------------------------------------------------------------------
+    // Execution
+    // ------------------------------------------------------------------
+    def execute_trade(self, plan):
         try:
             if self.mode == 'paper':
-                logger.info("📝 PAPER TRADE - Simulating execution...")
-                
-                trade = {
-                    **trade_plan,
-                    'id': f"paper_{int(time.time())}",
-                    'status': 'open',
-                    'pnl': 0,
-                    'opened_at': datetime.now()
-                }
-                
+                logger.info("📝 PAPER trade – simulating…")
+                trade = {**plan,
+                         'id': f"paper_{int(time.time())}",
+                         'status':'open','pnl':0,
+                         'opened_at':datetime.now()}
                 self.trades_today.append(trade)
                 self.open_positions.append(trade)
-                
-                # Send Telegram notification
-                if self.telegram_notifier:
-                    asyncio.run(self.telegram_notifier.notify_trade_opened(trade))
-                
-                return trade
-            
-            elif self.mode == 'live':
-                logger.info("⚡ LIVE TRADE - Executing on exchange...")
-                
-                position = self.executor.open_position(
-                    symbol=trade_plan['symbol'],
-                    side=trade_plan['side'],
-                    size=trade_plan['position_size'],
-                    leverage=trade_plan['leverage'],
-                    stop_loss=trade_plan['stop_loss'],
-                    take_profit=trade_plan['take_profit'],
-                    exchange_name='bybit'
+                asyncio.create_task(
+                    self._telegram(self.telegram_notifier.notify_trade_opened(trade))
                 )
-                
-                if 'error' not in position:
-                    self.trades_today.append(position)
-                    self.open_positions.append(position)
-                    self.risk_manager.add_position(position)
-                    
-                    # Send Telegram notification
-                    if self.telegram_notifier:
-                        asyncio.run(self.telegram_notifier.notify_trade_opened(position))
-                    
-                    # Log to database
+                return trade
+
+            elif self.mode == 'live' and self.executor:
+                logger.info("⚡ LIVE trade – executing…")
+                pos = self.executor.open_position(
+                    plan['symbol'], plan['side'], plan['position_size'],
+                    plan['leverage'], plan['stop_loss'], plan['take_profit'],
+                    'bybit')
+                if 'error' not in pos:
+                    self.trades_today.append(pos)
+                    self.open_positions.append(pos)
+                    self.risk_manager.add_position(pos)
+                    asyncio.create_task(
+                        self._telegram(self.telegram_notifier.notify_trade_opened(pos))
+                    )
                     if self.db_conn:
-                        self._log_trade_to_db(position)
+                        self._log_trade_to_db(pos)
                 else:
-                    logger.error(f"❌ Trade execution failed: {position['error']}")
-                
-                return position
-        
+                    logger.error("❌ Live exec failed: %s", pos.get('error'))
+                return pos
         except Exception as e:
-            logger.error(f"❌ Trade execution error: {e}")
-            return {'error': str(e)}
-    
+            logger.error("❌ execute_trade: %s", e)
+            return {'error':str(e)}
+
+    // ------------------------------------------------------------------
+    // Position monitor
+    // ------------------------------------------------------------------
     def monitor_positions(self):
-        """Monitor and manage open positions"""
         if not self.open_positions:
             return
-        
-        logger.info(f"👀 Monitoring {len(self.open_positions)} open position(s)...")
-        
-        for position in self.open_positions[:]:
+        logger.info("👀 Monitoring %d open position(s)…", len(self.open_positions))
+        for pos in self.open_positions[:]:
             try:
-                # Get current price
-                symbol = position['symbol']
-                market_data = self.fetch_market_data(symbol, limit=50)
-                
-                if not market_data:
+                mdata = self.fetch_market_data(pos['symbol'], limit=50)
+                if not mdata:
                     continue
-                
-                current_price = market_data['df']['close'].iloc[-1]
-                
-                # Calculate unrealized P&L
-                if position['side'] == 'LONG':
-                    pnl_pct = (current_price - position['entry_price']) / position['entry_price']
-                else:
-                    pnl_pct = (position['entry_price'] - current_price) / position['entry_price']
-                
-                unrealized_pnl = pnl_pct * position['position_size'] * position['leverage']
-                
-                position['current_price'] = current_price
-                position['unrealized_pnl'] = unrealized_pnl
-                
-                logger.info(f"   {symbol} {position['side']}: "
-                          f"₹{current_price:,.2f} | P&L: ₹{unrealized_pnl:+,.2f}")
-                
-                # Check time limit (4 hours)
-                time_open = (datetime.now() - position['opened_at']).total_seconds() / 3600
-                
-                if time_open >= 4:
-                    logger.warning(f"⏰ Position open for {time_open:.1f}h - Closing...")
-                    self._close_position(position, 'time_limit')
-                
+                curr_p = mdata['df']['close'].iloc[-1]
+                side_mul = 1 if pos['side']=='LONG' else -1
+                pnl_pct  = (curr_p - pos['entry_price'])/pos['entry_price']*side_mul
+                unreal   = pnl_pct * pos['position_size'] * pos['leverage']
+                pos['current_price'] = curr_p
+                pos['unrealized_pnl'] = unreal
+                logger.info("   %s %s: ₹%,.2f | P&L ₹%+,.2f",
+                            pos['symbol'], pos['side'], curr_p, unreal)
+
+                // time-limit close (4 h)
+                hrs_open = (datetime.now()-pos['opened_at']).total_seconds()/3600
+                if hrs_open >= 4:
+                    logger.warning("⏰ Time-limit – closing %s", pos['id'])
+                    self._close_position(pos, 'time_limit')
             except Exception as e:
-                logger.error(f"❌ Position monitoring error: {e}")
-    
-    def _close_position(self, position, reason='manual'):
-        """Close a position"""
-        logger.info(f"📉 Closing position: {position['symbol']} ({reason})")
-        
-        # Simulate close for paper trading
+                logger.error("❌ monitor_positions: %s", e)
+
+    def _close_position(self, pos, reason='manual'):
+        logger.info("📉 Closing %s (%s)", pos['id'], reason)
         if self.mode == 'paper':
-            position['status'] = 'closed'
-            position['exit_price'] = position.get('current_price', position['entry_price'])
-            position['pnl'] = position.get('unrealized_pnl', 0)
-            position['closed_at'] = datetime.now()
-            position['close_reason'] = reason
-            
-            # Update performance
-            self.performance['total_pnl'] += position['pnl']
-            self.performance['daily_pnl'] += position['pnl']
-            self.risk_manager.update_trade_result(position['pnl'])
-            
-            # Remove from open positions
-            self.open_positions = [p for p in self.open_positions if p['id'] != position['id']]
-            
-            # Send notification
-            if self.telegram_notifier:
-                asyncio.run(self.telegram_notifier.notify_trade_closed(position))
-            
-            logger.info(f"   P&L: ₹{position['pnl']:+,.2f}")
-    
+            pos['status']='closed'; pos['exit_price']=pos.get('current_price',pos['entry_price'])
+            pos['pnl']=pos.get('unrealized_pnl',0); pos['closed_at']=datetime.now()
+            pos['close_reason']=reason
+            self.performance['total_pnl'] += pos['pnl']
+            self.performance['daily_pnl'] += pos['pnl']
+            self.risk_manager.update_trade_result(pos['pnl'])
+            self.open_positions = [p for p in self.open_positions if p['id']!=pos['id']]
+            asyncio.create_task(
+                self._telegram(self.telegram_notifier.notify_trade_closed(pos))
+            )
+            logger.info("   P&L ₹%+,.2f", pos['pnl'])
+
     def _log_trade_to_db(self, trade):
-        """Log trade to database"""
         if not self.db_conn:
             return
-        
         try:
-            cursor = self.db_conn.cursor()
-            cursor.execute("""
-                INSERT INTO trades (
-                    trade_id, symbol, side, entry_time, entry_price,
-                    size, leverage, stop_loss, take_profit,
-                    ml_confidence, logic_score, status, exchange
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                trade['id'], trade['symbol'], trade['side'], trade['opened_at'],
-                trade['entry_price'], trade['position_size'], trade['leverage'],
-                trade['stop_loss'], trade['take_profit'], trade['confidence'],
-                trade['logic_score'], 'open', 'bybit'
-            ))
+            cur = self.db_conn.cursor()
+            cur.execute("""
+                INSERT INTO trades (trade_id,symbol,side,entry_time,entry_price,size,leverage,stop_loss,take_profit,ml_confidence,logic_score,status,exchange)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (trade['id'], trade['symbol'], trade['side'], trade['opened_at'],
+                  trade['entry_price'], trade['position_size'], trade['leverage'],
+                  trade['stop_loss'], trade['take_profit'], trade['confidence'],
+                  trade['logic_score'], 'open', 'bybit'))
             self.db_conn.commit()
         except Exception as e:
-            logger.warning(f"Database logging failed: {e}")
-    
+            logger.warning("DB log fail: %s", e)
+
+    // ------------------------------------------------------------------
+    // Daily summary
+    // ------------------------------------------------------------------
     def _update_performance(self):
-        """Update performance metrics"""
-        if self.trades_today:
-            closed = [t for t in self.trades_today if t.get('status') == 'closed']
-            
-            if closed:
-                wins = [t for t in closed if t.get('pnl', 0) > 0]
-                self.performance['wins'] = len(wins)
-                self.performance['losses'] = len(closed) - len(wins)
-                self.performance['win_rate'] = len(wins) / len(closed) if closed else 0
-                self.performance['total_trades'] = len(closed)
-    
+        closed = [t for t in self.trades_today if t.get('status')=='closed']
+        if closed:
+            wins = [t for t in closed if t.get('pnl',0)>0]
+            self.performance.update({
+                'wins':len(wins), 'losses':len(closed)-len(wins),
+                'win_rate':len(wins)/len(closed) if closed else 0,
+                'total_trades':len(closed)
+            })
+
     def _print_daily_summary(self):
-        """Print daily performance summary"""
         logger.info("\n" + "="*100)
         logger.info("📊 DAILY SUMMARY")
         logger.info("="*100)
-        logger.info(f"Date: {datetime.now().strftime('%Y-%m-%d')}")
-        logger.info(f"Total Trades: {self.performance['total_trades']}")
-        logger.info(f"Wins: {self.performance['wins']} | Losses: {self.performance['losses']}")
-        logger.info(f"Win Rate: {self.performance['win_rate']:.1%}")
-        logger.info(f"Daily P&L: ₹{self.performance['daily_pnl']:+,.2f}")
-        logger.info(f"Total P&L: ₹{self.performance['total_pnl']:+,.2f}")
-        logger.info(f"Current Capital: ₹{self.capital:,.2f}")
-        logger.info(f"ROI: {(self.capital - self.initial_capital) / self.initial_capital:.2%}")
+        logger.info("Date : %s", datetime.now().date())
+        logger.info("Trades : %d  (W %d | L %d)  Win-rate %.1f%%",
+                    self.performance['total_trades'],
+                    self.performance['wins'], self.performance['losses'],
+                    self.performance['win_rate']*100)
+        logger.info("Daily P&L : ₹%+,.2f", self.performance['daily_pnl'])
+        logger.info("Total P&L : ₹%+,.2f", self.performance['total_pnl'])
+        logger.info("Capital   : ₹%,.2f", self.capital)
+        logger.info("ROI       : %+.2f%%",
+                    (self.capital-self.initial_capital)/self.initial_capital*100)
         logger.info("="*100)
-    
+
+    // ------------------------------------------------------------------
+    // Main loop
+    // ------------------------------------------------------------------
     def run(self, symbol='BTC/USDT:USDT', interval=900):
-        """
-        MAIN BOT LOOP
-        
-        Args:
-            symbol: Trading pair
-            interval: Check interval in seconds (default 900 = 15 min)
-        """
         self.is_running = True
-        
         logger.info("\n" + "="*100)
-        logger.info("🚀 TRADING BOT STARTED - FINAL VERSION")
+        logger.info("🚀 TRADING BOT STARTED – FINAL")
         logger.info("="*100)
-        logger.info(f"Mode: {self.mode.upper()}")
-        logger.info(f"Symbol: {symbol}")
-        logger.info(f"Interval: {interval}s ({interval/60:.0f} minutes)")
-        logger.info(f"Capital: ₹{self.capital:,.2f}")
-        logger.info(f"45 Unique Logics: ACTIVE")
-        logger.info(f"ML Ensemble: ACTIVE")
-        logger.info(f"Risk Management: ACTIVE")
+        logger.info("Mode : %s | Symbol : %s | Interval : %ds (%d min)",
+                    self.mode.upper(), symbol, interval, interval//60)
+        logger.info("Capital : ₹%,.2f | Logics : 45 | ML : ON | Risk : ON",
+                    self.capital)
         logger.info("="*100)
-        
-        # Send start notification
-        if self.telegram_notifier:
-            asyncio.run(self.telegram_notifier.notify_bot_started(self.capital, self.mode))
-        
-        try:
-            iteration = 0
-            while self.is_running:
-                iteration += 1
-                
-                try:
-                    logger.info(f"\n{'='*100}")
-                    logger.info(f"🔄 ITERATION #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                    logger.info(f"{'='*100}")
-                    
-                    # Skip if paused
-                    if self.is_paused:
-                        logger.info("⏸️  Bot paused - Waiting...")
-                        time.sleep(interval)
-                        continue
-                    
-                    # 1. Check daily limits
-                    can_trade, reason = self.risk_manager.check_daily_limits()
-                    if not can_trade:
-                        logger.warning(f"⏸️  Trading paused: {reason}")
-                        
-                        if self.telegram_notifier:
-                            asyncio.run(self.telegram_notifier.notify_daily_loss_limit(
-                                self.risk_manager.daily_pnl,
-                                self.initial_capital * RISK_CONFIG['max_daily_loss_percent']
-                            ))
-                        
-                        time.sleep(interval)
-                        continue
-                    
-                    # 2. Monitor existing positions
-                    if self.open_positions:
-                        self.monitor_positions()
-                    
-                    # 3. Check for new trade opportunity (if no open positions)
-                    max_positions = TRADING_CONFIG['max_positions']
-                    if len(self.open_positions) < max_positions:
-                        trade_plan = self.analyze_trade_opportunity(symbol)
-                        
-                        # 4. Execute if opportunity found
-                        if trade_plan:
-                            trade = self.execute_trade(trade_plan)
-                            
-                            if 'error' not in trade:
-                                logger.info(f"✅ Trade executed: {trade['id']}")
-                                self.last_signal_time = datetime.now()
-                            else:
-                                logger.error(f"❌ Trade failed: {trade.get('error')}")
+
+        // Notify Telegram
+        asyncio.run(self._telegram(
+            self.telegram_notifier.notify_bot_started(self.capital, self.mode)))
+
+        iteration = 0
+        while self.is_running:
+            iteration +=1
+            try:
+                logger.info("\n" + "="*100)
+                logger.info("🔄 ITERATION #%d – %s", iteration, datetime.now())
+                logger.info("="*100)
+
+                // Daily limit check
+                can_trade, reason = self.risk_manager.check_daily_limits()
+                if not can_trade:
+                    logger.warning("⏸️  Trading paused: %s", reason)
+                    asyncio.run(self._telegram(
+                        self.telegram_notifier.notify_daily_loss_limit(
+                            self.risk_manager.daily_pnl,
+                            self.initial_capital * RISK_CONFIG['max_daily_loss_percent'])))
+                    time.sleep(interval); continue
+
+                // Monitor existing
+                if self.open_positions:
+                    self.monitor_positions()
+
+                // New trade?
+                max_pos = TRADING_CONFIG['max_positions']
+                if len(self.open_positions) < max_pos:
+                    plan = self.analyze_trade_opportunity(symbol)
+                    if plan:
+                        trade = self.execute_trade(plan)
+                        if 'error' not in trade:
+                            self.last_signal_time = datetime.now()
                         else:
-                            logger.info("⏭️  No trade opportunity - Waiting for next cycle...")
+                            logger.error("❌ Trade failed: %s", trade.get('error'))
                     else:
-                        logger.info(f"⏸️  Max positions ({max_positions}) reached - No new trades")
-                    
-                    # 5. Update performance
-                    self._update_performance()
-                    
-                    # 6. Print summary every 10 iterations
-                    if iteration % 10 == 0:
-                        self._print_daily_summary()
-                    
-                    # 7. Sleep until next check
-                    logger.info(f"\n😴 Sleeping for {interval}s ({interval/60:.0f} minutes)...")
-                    logger.info(f"Next check: {(datetime.now() + timedelta(seconds=interval)).strftime('%H:%M:%S')}")
-                    time.sleep(interval)
-                
-                except KeyboardInterrupt:
-                    logger.info("\n⏹️  Keyboard interrupt received")
-                    break
-                
-                except Exception as e:
-                    logger.error(f"❌ Error in main loop: {e}")
-                    
-                    if self.telegram_notifier:
-                        asyncio.run(self.telegram_notifier.notify_error(str(e)))
-                    
-                    logger.info("⏳ Waiting 60s before retry...")
-                    time.sleep(60)
-        
-        finally:
-            self.stop()
-    
+                        logger.info("⏭️  No opportunity – waiting…")
+                else:
+                    logger.info("⏸️  Max positions (%d) reached", max_pos)
+
+                self._update_performance()
+                if iteration % 10 == 0:
+                    self._print_daily_summary()
+
+                logger.info("\n😴 Sleeping %d s – next : %s",
+                            interval, (datetime.now()+timedelta(seconds=interval)).strftime('%H:%M:%S'))
+                time.sleep(interval)
+
+            except KeyboardInterrupt:
+                logger.info("\n⏹️  Keyboard interrupt"); break
+            except Exception as e:
+                logger.error("❌ Main-loop error: %s", e)
+                asyncio.run(self._telegram(
+                    self.telegram_notifier.notify_error(str(e))))
+                time.sleep(60)
+
+        self.stop()
+
+    // ------------------------------------------------------------------
+    // Graceful stop
+    // ------------------------------------------------------------------
     def stop(self):
-        """Stop the bot gracefully"""
         logger.info("\n" + "="*100)
-        logger.info("⏹️  STOPPING BOT...")
+        logger.info("⏹️  STOPPING BOT…")
         logger.info("="*100)
-        
         self.is_running = False
-        
-        # Close any open positions (optional - you might want to keep them)
+
         if self.open_positions:
-            logger.warning(f"⚠️  {len(self.open_positions)} position(s) still open!")
-            
-            response = input("Close all positions before stopping? (y/n): ")
-            if response.lower() == 'y':
-                for position in self.open_positions[:]:
-                    self._close_position(position, 'bot_shutdown')
-        
-        # Print final performance
+            logger.warning("⚠️  %d position(s) still open!", len(self.open_positions))
         self._print_daily_summary()
-        
-        # Send stop notification
-        if self.telegram_notifier:
-            asyncio.run(self.telegram_notifier.notify_bot_stopped())
-        
-        # Close database connection
+
+        asyncio.run(self._telegram(self.telegram_notifier.notify_bot_stopped()))
         if self.db_conn:
-            self.db_conn.close()
-            logger.info("🗄️  Database connection closed")
-        
-        logger.info("\n" + "="*100)
-        logger.info("👋 BOT STOPPED SUCCESSFULLY")
-        logger.info("="*100)
-        logger.info(f"Total Runtime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"Final Capital: ₹{self.capital:,.2f}")
-        logger.info(f"Total P&L: ₹{self.performance['total_pnl']:+,.2f}")
-        logger.info(f"Total Trades: {self.performance['total_trades']}")
-        logger.info(f"Win Rate: {self.performance['win_rate']:.1%}")
-        logger.info("="*100)
-        logger.info("\nThank you for using Advanced Crypto Trading Bot!")
-        logger.info("Trade safely and responsibly! 🚀")
-        logger.info("="*100)
+            self.db_conn.close(); logger.info("🗄️  DB closed")
+
+        logger.info("👋 BOT STOPPED – FINAL"); logger.info("="*100)
 
 
-# ==================== MAIN ====================
+// ==========================================================================
+// Entry-point
+// ==========================================================================
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(
-        description='Advanced Crypto Trading Bot - Final Version',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Paper trading (recommended first)
-  python main.py --mode paper --capital 10000
-  
-  # Live trading with custom settings
-  python main.py --mode live --capital 2000 --symbol BTC/USDT:USDT --interval 900
-  
-  # Quick test with short interval
-  python main.py --mode paper --capital 5000 --interval 300
-  
-Features:
-  ✅ 45 Unique Trading Logics
-  ✅ ML Ensemble (LSTM + XGBoost + RF)
-  ✅ Multi-Exchange Support
-  ✅ Advanced Risk Management
-  ✅ Telegram Notifications
-  ✅ Database Logging
-  ✅ Real-time Monitoring
-        """
-    )
-    
-    parser.add_argument(
-        '--mode',
-        type=str,
-        default='paper',
-        choices=['paper', 'live'],
-        help='Trading mode (paper=simulation, live=real trading)'
-    )
-    
-    parser.add_argument(
-        '--capital',
-        type=float,
-        default=10000,
-        help='Starting capital in INR (default: 10000)'
-    )
-    
-    parser.add_argument(
-        '--symbol',
-        type=str,
-        default='BTC/USDT:USDT',
-        help='Trading symbol (default: BTC/USDT:USDT)'
-    )
-    
-    parser.add_argument(
-        '--interval',
-        type=int,
-        default=900,
-        help='Check interval in seconds (default: 900 = 15 minutes)'
-    )
-    
-    parser.add_argument(
-        '--validate',
-        action='store_true',
-        help='Run configuration validation before starting'
-    )
-    
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug logging'
-    )
-    
+    parser = argparse.ArgumentParser(description="Advanced Crypto Trading Bot – Final")
+    parser.add_argument('--mode',    default='paper', choices=['paper','live'])
+    parser.add_argument('--capital', type=float, default=10_000)
+    parser.add_argument('--symbol',  default='BTC/USDT:USDT')
+    parser.add_argument('--interval',type=int,  default=900, help="sec (default 900)")
+    parser.add_argument('--validate',action='store_true')
+    parser.add_argument('--debug',  action='store_true')
     args = parser.parse_args()
-    
-    # Set debug logging if requested
+
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("🐛 Debug logging enabled")
-    
-    # Run validation if requested
+
     if args.validate:
-        logger.info("🔍 Running configuration validation...")
+        logger.info("🔍 Running validation…")
         try:
             from scripts.validate_config import ConfigValidator
-            validator = ConfigValidator()
-            success = validator.run_all_checks()
-            
-            if not success:
-                logger.error("❌ Configuration validation failed!")
-                logger.error("Please fix the errors before starting the bot")
-                sys.exit(1)
-            
-            logger.info("✅ Configuration validation passed!")
+            if not ConfigValidator().run_all_checks():
+                logger.error("❌ Validation failed"); sys.exit(1)
+            logger.info("✅ Validation passed")
         except Exception as e:
-            logger.warning(f"⚠️  Validation check failed: {e}")
-            response = input("Continue anyway? (y/n): ")
-            if response.lower() != 'y':
-                sys.exit(1)
-    
-    # Warning for live mode
+            logger.warning("⚠️  Validation skip: %s", e)
+
     if args.mode == 'live':
         logger.warning("\n" + "="*100)
-        logger.warning("⚠️  WARNING: LIVE TRADING MODE")
+        logger.warning("⚠️  LIVE MODE – REAL MONEY AT RISK")
+        logger.warning("Capital : ₹%,.2f", args.capital)
         logger.warning("="*100)
-        logger.warning("You are about to start LIVE TRADING with REAL MONEY!")
-        logger.warning(f"Capital at risk: ₹{args.capital:,.2f}")
-        logger.warning("")
-        logger.warning("Please confirm:")
-        logger.warning("1. You have tested thoroughly in paper trading mode")
-        logger.warning("2. You understand the risks involved")
-        logger.warning("3. You can afford to lose this capital")
-        logger.warning("4. You have proper API keys configured")
-        logger.warning("="*100)
-        
-        confirmation = input("\nType 'I UNDERSTAND THE RISKS' to continue: ")
-        
-        if confirmation != 'I UNDERSTAND THE RISKS':
-            logger.info("❌ Live trading cancelled")
-            sys.exit(0)
-        
-        # Double confirmation
-        final_confirm = input(f"\nFinal confirmation: Start live trading with ₹{args.capital:,.2f}? (yes/no): ")
-        
-        if final_confirm.lower() != 'yes':
-            logger.info("❌ Live trading cancelled")
-            sys.exit(0)
-    
-    # Print banner
-    print("\n" + "="*100)
-    print("     █████╗ ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗ ██████╗███████╗██████╗ ")
-    print("    ██╔══██╗██╔══██╗██║   ██║██╔══██╗████╗  ██║██╔════╝██╔════╝██╔══██╗")
-    print("    ███████║██║  ██║██║   ██║███████║██╔██╗ ██║██║     █████╗  ██║  ██║")
-    print("    ██╔══██║██║  ██║╚██╗ ██╔╝██╔══██║██║╚██╗██║██║     ██╔══╝  ██║  ██║")
-    print("    ██║  ██║██████╔╝ ╚████╔╝ ██║  ██║██║ ╚████║╚██████╗███████╗██████╔╝")
-    print("    ╚═╝  ╚═╝╚═════╝   ╚═══╝  ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝╚══════╝╚═════╝ ")
-    print("")
-    print("                   CRYPTO TRADING BOT - FINAL VERSION")
-    print("                        45 Unique Logics | ML Ensemble")
-    print("="*100)
-    print("")
-    
-    # Create and run bot
-    try:
-        bot = TradingBot(mode=args.mode, capital=args.capital)
-        bot.run(symbol=args.symbol, interval=args.interval)
-    
-    except KeyboardInterrupt:
-        logger.info("\n⏹️  Interrupted by user")
-    
-    except Exception as e:
-        logger.error(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        confirm = input("Type 'LIVE' to continue: ")
+        if confirm != 'LIVE':
+            logger.info("❌ Live cancelled"); sys.exit(0)
+
+    bot = TradingBot(mode=args.mode, capital=args.capital)
+    bot.run(symbol=args.symbol, interval=args.interval)
 
 
 if __name__ == "__main__":
     main()
-
-
-# ==================== USAGE EXAMPLES ====================
-"""
-═══════════════════════════════════════════════════════════════════════════════
-                              USAGE EXAMPLES
-═══════════════════════════════════════════════════════════════════════════════
-
-1. PAPER TRADING (Recommended first!)
-   python main.py --mode paper --capital 10000
-   
-   - Simulates real trading
-   - No real money risk
-   - Tests all systems
-   - Builds confidence
-
-2. PAPER TRADING WITH VALIDATION
-   python main.py --mode paper --capital 10000 --validate
-   
-   - Runs pre-flight checks
-   - Validates configuration
-   - Checks API keys
-   - Verifies ML models
-
-3. CUSTOM INTERVAL
-   python main.py --mode paper --capital 5000 --interval 300
-   
-   - Check every 5 minutes (300 seconds)
-   - Good for testing
-   - More active trading
-
-4. DIFFERENT SYMBOL
-   python main.py --mode paper --symbol ETH/USDT:USDT --capital 10000
-   
-   - Trade Ethereum instead of Bitcoin
-   - Same logic applies
-   - Works with any futures pair
-
-5. LIVE TRADING (After paper success)
-   python main.py --mode live --capital 2000
-   
-   ⚠️ WARNING: Real money!
-   - Start with small capital
-   - Use 3x leverage max initially
-   - Monitor closely
-   - Scale gradually
-
-6. LIVE TRADING WITH ALL OPTIONS
-   python main.py --mode live --capital 5000 --symbol BTC/USDT:USDT --interval 900 --validate
-   
-   - Full configuration
-   - Pre-flight checks
-   - 15-minute intervals
-   - Real trading
-
-7. DEBUG MODE
-   python main.py --mode paper --capital 10000 --debug
-   
-   - Detailed logging
-   - Useful for troubleshooting
-   - Shows all calculations
-
-═══════════════════════════════════════════════════════════════════════════════
-                           MONITORING COMMANDS
-═══════════════════════════════════════════════════════════════════════════════
-
-While bot is running:
-- Ctrl+C to stop gracefully
-- Check logs in: logs/trading_bot_YYYYMMDD.log
-- Monitor Telegram bot for real-time updates
-
-Telegram commands:
-/status  - Check current status
-/balance - Show P&L
-/trades  - Today's trades
-/pause   - Pause trading
-/resume  - Resume trading
-/emergency - Close all positions
-
-═══════════════════════════════════════════════════════════════════════════════
-                              IMPORTANT NOTES
-═══════════════════════════════════════════════════════════════════════════════
-
-✅ BEFORE LIVE TRADING:
-   1. Run paper trading for at least 1-2 weeks
-   2. Verify win rate is 60%+
-   3. Check all systems work properly
-   4. Start with minimal capital (₹2,000)
-   5. Use conservative settings (3x leverage)
-   6. Monitor closely for first week
-
-✅ BEST PRACTICES:
-   - Never risk more than you can afford to lose
-   - Set daily loss limits and respect them
-   - Take profits regularly (50% withdrawal rule)
-   - Keep detailed records
-   - Update software regularly
-   - Monitor bot daily
-   - Have emergency procedures ready
-
-✅ RISK WARNINGS:
-   - Cryptocurrency trading is highly risky
-   - Past performance ≠ future results
-   - Bot can fail due to technical issues
-   - Markets can be unpredictable
-   - Always use proper risk management
-   - Never trade with borrowed money
-
-✅ SUPPORT:
-   - Documentation: README.md
-   - Quick start: QUICKSTART.md
-   - Validation: python scripts/validate_config.py
-   - Issues: GitHub Issues
-   - Logs: logs/trading_bot_*.log
-
-═══════════════════════════════════════════════════════════════════════════════
-                           GOOD LUCK & TRADE SAFELY! 🚀
-═══════════════════════════════════════════════════════════════════════════════
-"""
