@@ -51,8 +51,8 @@ class TradingBot:
         logger.info("="*100)
         logger.info("🤖 ADVANCED CRYPTO TRADING BOT – FINAL")
         logger.info("="*100)
-        logger.info("Mode : %s  |  Capital : ₹%,.2f  |  Date : %s",
-                    mode.upper(), capital, datetime.now())
+        logger.info("Mode : {}  |  Capital : ₹{:,.2f}  |  Date : {}".format(
+            mode.upper(), capital, datetime.now()))
         logger.info("="*100)
 
         self._init_components()
@@ -238,7 +238,7 @@ class TradingBot:
             return None
         df, orderbook, funding = mdata['df'], mdata['orderbook'], mdata['funding_rate']
 
-        logger.info("📊 %d candles, Price ₹%,.2f", len(df), df['close'].iloc[-1])
+        logger.info("📊 {} candles, Price ₹{:,.2f}".format(len(df), df['close'].iloc[-1]))
 
         # 1. ML signal
         logger.info("🤖 ML Prediction…")
@@ -251,11 +251,11 @@ class TradingBot:
                 ML_CONFIG['confidence_threshold']
             )
             signal_name = ['BUY', 'HOLD', 'SELL'][signal]
-            logger.info("   Signal: %s | Confidence: %.1f%%", signal_name, conf*100)
+            logger.info("   Signal: {} | Confidence: {:.1f}%".format(signal_name, conf*100))
             if signal == 1:   # HOLD
                 return None
         except Exception as e:
-            logger.error("❌ ML failed: %s – fallback to TA only", e)
+            logger.error("❌ ML failed: {} – fallback to TA only".format(e))
             return None
 
         # 2. 45-logics filter
@@ -266,8 +266,8 @@ class TradingBot:
             recent_trades=self.trades_today,
             fear_greed_index=50, news_times=[], liquidation_clusters=[]
         )
-        logger.info("   Logic score: %.1f%% | Trade allowed: %s",
-                    logic_res['final_score'], logic_res['trade_allowed'])
+        logger.info("   Logic Score: {:.1f}% | Trade allowed: {}".format(
+            logic_res['final_score'], logic_res['trade_allowed']))
         if not logic_res['trade_allowed']:
             logger.warning("❌ Trade blocked by filters")
             return None
@@ -289,7 +289,7 @@ class TradingBot:
         is_valid, reason = self.risk_manager.validate_trade(
             self.capital, pos_size, leverage, curr_p, stop_loss, side)
         if not is_valid:
-            logger.warning("❌ Validation failed: %s", reason)
+            logger.warning("❌ Validation failed: {}".format(reason))
             return None
 
         plan = {
@@ -306,10 +306,11 @@ class TradingBot:
         logger.info("\n" + "="*100)
         logger.info("✅ TRADE PLAN READY")
         logger.info("="*100)
-        logger.info("📊 %s (ML %.1f%%) | Logic %.1f%%", signal_name, conf*100,
-                    logic_res['final_score'])
-        logger.info("💰 Entry ₹%,.2f | Size ₹%,.2f (%dx)", curr_p, pos_size, leverage)
-        logger.info("🛑 SL ₹%,.2f | TP ₹%,.2f", stop_loss, take_profit)
+        logger.info("📊 {} (ML {:.1f}%) | Logic {:.1f}%".format(
+            signal_name, conf*100, logic_res['final_score']))
+        logger.info("💰 Entry ₹{:,.2f} | Size ₹{:,.2f} ({:d}x)".format(
+            curr_p, pos_size, int(leverage)))
+        logger.info("🛑 SL ₹{:,.2f} | TP ₹{:,.2f}".format(stop_loss, take_profit))
         logger.info("="*100)
         return plan
 
@@ -371,8 +372,8 @@ class TradingBot:
                 unreal   = pnl_pct * pos['position_size'] * pos['leverage']
                 pos['current_price'] = curr_p
                 pos['unrealized_pnl'] = unreal
-                logger.info("   %s %s: ₹%,.2f | P&L ₹%+,.2f",
-                            pos['symbol'], pos['side'], curr_p, unreal)
+                logger.info("   {} {}: ₹{:,.2f} | P&L ₹{:+,.2f}".format(
+                    pos['symbol'], pos['side'], curr_p, unreal))
 
                 # time-limit close (4 h)
                 hrs_open = (datetime.now()-pos['opened_at']).total_seconds()/3600
@@ -395,7 +396,7 @@ class TradingBot:
             asyncio.create_task(
                 self._telegram(self.telegram_notifier.notify_trade_closed(pos))
             )
-            logger.info("   P&L ₹%+,.2f", pos['pnl'])
+            logger.info("   P&L ₹{:+,.2f}".format(pos['pnl']))
 
     def _log_trade_to_db(self, trade):
         if not self.db_conn:
@@ -430,16 +431,16 @@ class TradingBot:
         logger.info("\n" + "="*100)
         logger.info("📊 DAILY SUMMARY")
         logger.info("="*100)
-        logger.info("Date : %s", datetime.now().date())
-        logger.info("Trades : %d  (W %d | L %d)  Win-rate %.1f%%",
-                    self.performance['total_trades'],
-                    self.performance['wins'], self.performance['losses'],
-                    self.performance['win_rate']*100)
-        logger.info("Daily P&L : ₹%+,.2f", self.performance['daily_pnl'])
-        logger.info("Total P&L : ₹%+,.2f", self.performance['total_pnl'])
-        logger.info("Capital   : ₹%,.2f", self.capital)
-        logger.info("ROI       : %+.2f%%",
-                    (self.capital-self.initial_capital)/self.initial_capital*100)
+        logger.info("Date : {}".format(datetime.now().date()))
+        logger.info("Trades : {}  (W {} | L {})  Win-rate {:.1f}%".format(
+            self.performance['total_trades'],
+            self.performance['wins'], self.performance['losses'],
+            self.performance['win_rate']*100))
+        logger.info("Daily P&L : ₹{:+,.2f}".format(self.performance['daily_pnl']))
+        logger.info("Total P&L : ₹{:+,.2f}".format(self.performance['total_pnl']))
+        logger.info("Capital   : ₹{:,.2f}".format(self.capital))
+        logger.info("ROI       : {:+.2f}%".format(
+            (self.capital-self.initial_capital)/self.initial_capital*100))
         logger.info("="*100)
 
     # ------------------------------------------------------------------
@@ -450,10 +451,10 @@ class TradingBot:
         logger.info("\n" + "="*100)
         logger.info("🚀 TRADING BOT STARTED – FINAL")
         logger.info("="*100)
-        logger.info("Mode : %s | Symbol : %s | Interval : %ds (%d min)",
-                    self.mode.upper(), symbol, interval, interval//60)
-        logger.info("Capital : ₹%,.2f | Logics : 45 | ML : ON | Risk : ON",
-                    self.capital)
+        logger.info("Mode : {} | Symbol : {} | Interval : {}s ({} min)".format(
+            self.mode.upper(), symbol, interval, interval//60))
+        logger.info("Capital : ₹{:,.2f} | Logics : 45 | ML : ON | Risk : ON".format(
+            self.capital))
         logger.info("="*100)
 
         # Notify Telegram
@@ -465,13 +466,13 @@ class TradingBot:
             iteration +=1
             try:
                 logger.info("\n" + "="*100)
-                logger.info("🔄 ITERATION #%d – %s", iteration, datetime.now())
+                logger.info("🔄 ITERATION #{} – {}".format(iteration, datetime.now()))
                 logger.info("="*100)
 
                 # Daily limit check
                 can_trade, reason = self.risk_manager.check_daily_limits()
                 if not can_trade:
-                    logger.warning("⏸️  Trading paused: %s", reason)
+                    logger.warning("⏸️  Trading paused: {}".format(reason))
                     asyncio.run(self._telegram(
                         self.telegram_notifier.notify_daily_loss_limit(
                             self.risk_manager.daily_pnl,
@@ -491,24 +492,24 @@ class TradingBot:
                         if 'error' not in trade:
                             self.last_signal_time = datetime.now()
                         else:
-                            logger.error("❌ Trade failed: %s", trade.get('error'))
+                            logger.error("❌ Trade failed: {}".format(trade.get('error')))
                     else:
                         logger.info("⏭️  No opportunity – waiting…")
                 else:
-                    logger.info("⏸️  Max positions (%d) reached", max_pos)
+                    logger.info("⏸️  Max positions ({}) reached".format(max_pos))
 
                 self._update_performance()
                 if iteration % 10 == 0:
                     self._print_daily_summary()
 
-                logger.info("\n😴 Sleeping %d s – next : %s",
-                            interval, (datetime.now()+timedelta(seconds=interval)).strftime('%H:%M:%S'))
+                logger.info("\n😴 Sleeping {} s – next : {}".format(
+                    interval, (datetime.now()+timedelta(seconds=interval)).strftime('%H:%M:%S')))
                 time.sleep(interval)
 
             except KeyboardInterrupt:
                 logger.info("\n⏹️  Keyboard interrupt"); break
             except Exception as e:
-                logger.error("❌ Main-loop error: %s", e)
+                logger.error("❌ Main-loop error: {}".format(e))
                 asyncio.run(self._telegram(
                     self.telegram_notifier.notify_error(str(e))))
                 time.sleep(60)
@@ -525,7 +526,7 @@ class TradingBot:
         self.is_running = False
 
         if self.open_positions:
-            logger.warning("⚠️  %d position(s) still open!", len(self.open_positions))
+            logger.warning("⚠️  {} position(s) still open!".format(len(self.open_positions)))
         self._print_daily_summary()
 
         asyncio.run(self._telegram(self.telegram_notifier.notify_bot_stopped()))
@@ -564,7 +565,7 @@ def main():
     if args.mode == 'live':
         logger.warning("\n" + "="*100)
         logger.warning("⚠️  LIVE MODE – REAL MONEY AT RISK")
-        logger.warning("Capital : ₹%,.2f", args.capital)
+        logger.warning("Capital : ₹{:,.2f}".format(args.capital))
         logger.warning("="*100)
         confirm = input("Type 'LIVE' to continue: ")
         if confirm != 'LIVE':
