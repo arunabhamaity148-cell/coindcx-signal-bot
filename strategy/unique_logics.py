@@ -1,885 +1,486 @@
 """
-UNIQUE TRADING LOGICS - 45 Advanced Strategies
-Includes: Liquidation, Gamma, Funding, OB, CVD, VWAP + More
+UNIQUE TRADING LOGICS - 45 Advanced Strategies  
+(Part 1 of 3)
 """
+
 import pandas as pd
 import numpy as np
-from datetime import datetime, time
-from typing import Dict, Tuple
+from datetime import datetime
+from typing import Dict, Tuple, List, Any
 import logging
 
 logger = logging.getLogger(__name__)
 
-
 class UniqueLogics:
-    def __init__(self, config: Dict):
-        self.config = config
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config or {}
 
-    # ==================== A) MARKET HEALTH FILTERS (8) ====================
+    # ==================== A) MARKET HEALTH FILTERS ====================
 
     def check_btc_calm(self, df: pd.DataFrame) -> bool:
-        """1. BTC calm check - no sudden spikes"""
-        if len(df) < 20:
+        if df is None or len(df) < 20:
             return True
-
         recent = df.tail(20)
-        volatility = (recent['high'] - recent['low']) / recent['close']
-        avg_volatility = volatility.mean()
-
-        is_calm = avg_volatility < self.config.get('btc_calm_threshold', 0.015)
-        logger.info(f"BTC Calm: {is_calm} (volatility: {avg_volatility:.4f})")
-        return is_calm
+        vol = (recent['high'] - recent['low']) / recent['close'].replace(0, np.nan)
+        v = float(vol.mean() or 0)
+        return v < float(self.config.get("btc_calm_threshold", 0.015))
 
     def detect_market_regime(self, df: pd.DataFrame) -> str:
-        """2. Market regime detection (trend/range/volatile)"""
-        if len(df) < 50:
-            return 'unknown'
-
-        # ADX calculation for trend strength
-        adx = self._calculate_adx(df, period=14)
-        atr = df['high'].rolling(14).max() - df['low'].rolling(14).min()
-        atr_percent = (atr / df['close']).iloc[-1]
-
+        if df is None or len(df) < 50:
+            return "unknown"
+        adx = self._calculate_adx(df)
+        atr = self._calculate_atr(df)
+        last = df['close'].iloc[-1]
+        atr_pct = float(atr.iloc[-1] / last)
         if adx > 25:
-            regime = 'trending'
-        elif atr_percent > 0.03:
-            regime = 'volatile'
-        else:
-            regime = 'ranging'
+            return "trending"
+        if atr_pct > 0.03:
+            return "volatile"
+        return "ranging"
 
-        logger.info(f"Market regime: {regime} (ADX: {adx:.1f})")
-        return regime
+    def check_funding_rate_normal(self, rate: float) -> bool:
+        return abs(rate) < float(self.config.get("funding_rate_extreme", 0.0015))
 
-    def check_funding_rate_normal(self, funding_rate: float) -> bool:
-        """3. Funding rate normal check"""
-        threshold = self.config.get('funding_rate_extreme', 0.0015)
-        is_normal = abs(funding_rate) < threshold
-        logger.info(f"Funding normal: {is_normal} (rate: {funding_rate:.4f})")
-        return is_normal
-
-    def check_fear_greed_index(self, index_value: int) -> bool:
-        """4. Fear & Greed Index filter"""
-        low = self.config.get('fear_greed_extreme_low', 20)
-        high = self.config.get('fear_greed_extreme_high', 80)
-
-        is_safe = low < index_value < high
-        logger.info(f"Fear/Greed safe: {is_safe} (value: {index_value})")
-        return is_safe
+    def check_fear_greed_index(self, v: int) -> bool:
+        low = int(self.config.get("fear_greed_extreme_low", 20))
+        high = int(self.config.get("fear_greed_extreme_high", 80))
+        return low < v < high
 
     def fragile_btc_mode(self, df: pd.DataFrame) -> Tuple[bool, str]:
-        """5. Fragile BTC market detection - auto conservative mode"""
-        if len(df) < 30:
-            return False, 'normal'
-
+        if df is None or len(df) < 30:
+            return False, "normal"
         recent = df.tail(30)
-
-        # Check for rapid price swings
-        price_changes = recent['close'].pct_change()
-        large_moves = (abs(price_changes) > 0.02).sum()  # >2% moves
-
-        # Check volume spikes
+        moves = (abs(recent['close'].pct_change()) > 0.02).sum()
         vol_avg = recent['volume'].mean()
-        vol_recent = recent['volume'].tail(5).mean()
-        vol_spike = vol_recent > vol_avg * 2
+        vol_last = recent['volume'].tail(5).mean()
+        fragile = moves > 5 or vol_last > vol_avg * 2
+        return fragile, ("conservative" if fragile else "normal")
 
-        is_fragile = large_moves > 5 or vol_spike
-        mode = 'conservative' if is_fragile else 'normal'
-
-        logger.warning(f"🚨 Fragile mode: {is_fragile} -> {mode}")
-        return is_fragile, mode
-
-    def check_news_filter(self, current_time: datetime, news_times: list) -> bool:
-        """6. High-impact news filter"""
-        skip_minutes = self.config.get('news_skip_minutes', 30)
-
-        for news_time in news_times:
-            time_diff = abs((current_time - news_time).total_seconds() / 60)
-            if time_diff < skip_minutes:
-                logger.warning(f"⚠️ News in {time_diff:.0f} min - SKIP TRADE")
+    def check_news_filter(self, now: datetime, news_times: List[datetime]) -> bool:
+        skip = int(self.config.get("news_skip_minutes", 30))
+        for t in news_times:
+            if abs((now - t).total_seconds()) / 60 < skip:
                 return False
         return True
 
-    def check_spread_slippage(self, orderbook: Dict) -> bool:
-        """7. Spread & slippage safety filter"""
-        spread = orderbook.get('spread', 0)
-        mid_price = (orderbook['bids'][0][0] + orderbook['asks'][0][0]) / 2
-        spread_percent = spread / mid_price
+    def check_spread_slippage(self, ob: Dict[str, Any]) -> bool:
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        if not bids or not asks:
+            return True
+        mid = (bids[0][0] + asks[0][0]) / 2
+        spread = ob.get("spread", 0)
+        pct = spread / mid
+        return pct < float(self.config.get("spread_max_percent", 0.001))
 
-        max_spread = self.config.get('spread_max_percent', 0.001)
-        is_safe = spread_percent < max_spread
+    def check_liquidity_window(self, now: datetime) -> bool:
+        bad = self.config.get("low_liquidity_hours", [2,3,4,5])
+        return now.hour not in bad
 
-        logger.info(f"Spread safe: {is_safe} ({spread_percent:.4f}%)")
-        return is_safe
+    # ==================== B) PRICE ACTION & STRUCTURE ====================
 
-    def check_liquidity_window(self, current_time: datetime) -> bool:
-        """8. Time-of-day liquidity window"""
-        hour = current_time.hour
-        low_liquidity_hours = self.config.get('low_liquidity_hours', [2, 3, 4, 5])
-
-        is_good = hour not in low_liquidity_hours
-        if not is_good:
-            logger.warning(f"⚠️ Low liquidity hour: {hour}:00 UTC")
-        return is_good
-
-    # ==================== B) PRICE ACTION & STRUCTURE (7) ====================
-
-    def check_breakout_confirmation(self, candle: pd.Series) -> bool:
-        """9. Breakout confirmation (body > wick)"""
-        body = abs(candle['close'] - candle['open'])
-        total_range = candle['high'] - candle['low']
-
-        if total_range == 0:
+    def check_breakout_confirmation(self, c):
+        body = abs(c['close'] - c['open'])
+        rng = c['high'] - c['low']
+        if rng == 0:
             return False
+        return (body / rng) > 0.6
 
-        body_ratio = body / total_range
-        is_valid = body_ratio > 0.6  # Body is 60%+ of candle
+    def detect_market_structure_shift(self, df):
+        if df is None or len(df) < 20:
+            return "neutral"
+        h = df['high'].tail(20)
+        l = df['low'].tail(20)
+        if h.iloc[-5:].max() > h.iloc[-15:-5].max() and \
+           l.iloc[-5:].min() > l.iloc[-15:-5].min():
+            return "bullish"
+        if h.iloc[-5:].max() < h.iloc[-15:-5].max() and \
+           l.iloc[-5:].min() < l.iloc[-15:-5].min():
+            return "bearish"
+        return "neutral"
 
-        logger.info(f"Breakout valid: {is_valid} (body ratio: {body_ratio:.2f})")
-        return is_valid
-
-    def detect_market_structure_shift(self, df: pd.DataFrame) -> str:
-        """10. Market structure shift (HH/HL or LH/LL)"""
-        if len(df) < 20:
-            return 'neutral'
-
-        highs = df['high'].tail(20)
-        lows = df['low'].tail(20)
-
-        # Simple structure detection
-        recent_high = highs.iloc[-5:].max()
-        previous_high = highs.iloc[-15:-5].max()
-        recent_low = lows.iloc[-5:].min()
-        previous_low = lows.iloc[-15:-5].min()
-
-        if recent_high > previous_high and recent_low > previous_low:
-            return 'bullish'  # Higher highs, higher lows
-        elif recent_high < previous_high and recent_low < previous_low:
-            return 'bearish'  # Lower highs, lower lows
-        else:
-            return 'neutral'
-
-    def check_orderblock_retest(self, df: pd.DataFrame, current_price: float) -> Dict:
-        """11. Orderblock retest confirmation"""
-        # Simplified orderblock logic
-        if len(df) < 50:
+    def check_orderblock_retest(self, df, price):
+        if df is None or len(df) < 50:
             return {'found': False}
-
-        # Find significant price zones (high volume candles)
-        df_copy = df.copy()
-        df_copy['vol_rank'] = df_copy['volume'].rank(pct=True)
-        high_vol_zones = df_copy[df_copy['vol_rank'] > 0.9].tail(10)
-
-        for idx, zone in high_vol_zones.iterrows():
-            distance = abs(current_price - zone['close']) / current_price
-            if distance < 0.005:  # Within 0.5%
+        x = df.copy()
+        x['v'] = x['volume'].rank(pct=True)
+        zones = x[x['v'] > 0.9].tail(10)
+        for _, z in zones.iterrows():
+            if abs(price - z['close']) / price < 0.005:
                 return {
                     'found': True,
-                    'price': zone['close'],
-                    'type': 'bullish' if zone['close'] > zone['open'] else 'bearish'
+                    'price': float(z['close']),
+                    'type': ("bullish" if z['close'] > z['open'] else "bearish")
                 }
-
         return {'found': False}
 
-    def detect_fair_value_gap(self, df: pd.DataFrame) -> Dict:
-        """12. Fair value gap detection"""
+    def detect_fair_value_gap(self, df):
         if len(df) < 3:
             return {'found': False}
-
-        recent = df.tail(3)
-        candles = recent.to_dict('records')
-
-        # Check for gap between candle 1 and candle 3
-        gap_up = candles[0]['high'] < candles[2]['low']
-        gap_down = candles[0]['low'] > candles[2]['high']
-
-        if gap_up:
-            return {
-                'found': True,
-                'type': 'bullish',
-                'gap_low': candles[0]['high'],
-                'gap_high': candles[2]['low']
-            }
-        elif gap_down:
-            return {
-                'found': True,
-                'type': 'bearish',
-                'gap_low': candles[2]['high'],
-                'gap_high': candles[0]['low']
-            }
-
+        a, b, c = df.tail(3).to_dict('records')
+        if a['high'] < c['low']:
+            return {'found': True, 'type': 'bullish'}
+        if a['low'] > c['high']:
+            return {'found': True, 'type': 'bearish'}
         return {'found': False}
 
-    def check_ema_alignment(self, df: pd.DataFrame) -> str:
-        """13. EMA/SMA trend alignment"""
+    def check_ema_alignment(self, df):
         if len(df) < 200:
-            return 'neutral'
+            return "neutral"
+        e20 = df['close'].ewm(span=20).mean().iloc[-1]
+        e50 = df['close'].ewm(span=50).mean().iloc[-1]
+        e200 = df['close'].ewm(span=200).mean().iloc[-1]
+        if e20 > e50 > e200:
+            return "bullish"
+        if e20 < e50 < e200:
+            return "bearish"
+        return "neutral"
 
-        ema_20 = df['close'].ewm(span=20).mean().iloc[-1]
-        ema_50 = df['close'].ewm(span=50).mean().iloc[-1]
-        ema_200 = df['close'].ewm(span=200).mean().iloc[-1]
+    def calculate_atr_filter(self, df):
+        atr = self._calculate_atr(df)
+        return float(atr.iloc[-1])
 
-        if ema_20 > ema_50 > ema_200:
-            return 'bullish'
-        elif ema_20 < ema_50 < ema_200:
-            return 'bearish'
-        else:
-            return 'neutral'
-
-    def calculate_atr_filter(self, df: pd.DataFrame) -> float:
-        """14. ATR volatility filter"""
-        atr = self._calculate_atr(df, period=14)
-        return atr
-
-    def detect_bollinger_squeeze(self, df: pd.DataFrame) -> bool:
-        """15. Bollinger band squeeze/expansion"""
+    def detect_bollinger_squeeze(self, df):
         if len(df) < 20:
             return False
+        up, lo = self._calculate_bollinger_bands(df)
+        w = (up - lo) / df['close']
+        return w.iloc[-1] < w.rolling(50).mean().iloc[-1] * 0.8
+# ==================== C) MOMENTUM ====================
 
-        bb_upper, bb_lower = self._calculate_bollinger_bands(df)
-        bb_width = (bb_upper - bb_lower) / df['close']
-
-        # Squeeze = narrow bands
-        is_squeeze = bb_width.iloc[-1] < bb_width.rolling(50).mean().iloc[-1] * 0.8
-        logger.info(f"BB Squeeze: {is_squeeze}")
-        return is_squeeze
-
-    # ==================== C) MOMENTUM (6) ====================
-
-    def check_rsi_conditions(self, df: pd.DataFrame) -> Dict:
-        """16. RSI oversold/overbought + divergence"""
+    def check_rsi_conditions(self, df):
         rsi = self._calculate_rsi(df)
-
-        if len(rsi) < 14:
-            return {'signal': 'neutral'}
-
-        current_rsi = rsi.iloc[-1]
-
-        if current_rsi < 30:
-            signal = 'oversold'
-        elif current_rsi > 70:
-            signal = 'overbought'
+        v = float(rsi.iloc[-1])
+        if v < 30:
+            sig = "oversold"
+        elif v > 70:
+            sig = "overbought"
         else:
-            signal = 'neutral'
+            sig = "neutral"
+        return {"signal": sig, "value": v}
 
-        # Divergence detection (simplified)
-        divergence = self._detect_rsi_divergence(df, rsi)
-
-        return {
-            'signal': signal,
-            'value': current_rsi,
-            'divergence': divergence
-        }
-
-    def check_macd_cross(self, df: pd.DataFrame) -> Dict:
-        """17. MACD cross + momentum slope"""
-        macd, signal, hist = self._calculate_macd(df)
-
+    def check_macd_cross(self, df):
+        macd, sig, hist = self._calculate_macd(df)
         if len(hist) < 2:
-            return {'signal': 'neutral'}
+            return {"signal": "neutral"}
+        if hist.iloc[-2] < 0 and hist.iloc[-1] > 0:
+            return {"signal": "bullish"}
+        if hist.iloc[-2] > 0 and hist.iloc[-1] < 0:
+            return {"signal": "bearish"}
+        return {"signal": "neutral"}
 
-        cross_up = hist.iloc[-2] < 0 and hist.iloc[-1] > 0
-        cross_down = hist.iloc[-2] > 0 and hist.iloc[-1] < 0
-
-        if cross_up:
-            return {'signal': 'bullish', 'macd': macd.iloc[-1], 'hist': hist.iloc[-1]}
-        elif cross_down:
-            return {'signal': 'bearish', 'macd': macd.iloc[-1], 'hist': hist.iloc[-1]}
-        else:
-            return {'signal': 'neutral'}
-
-    def check_stochastic(self, df: pd.DataFrame) -> Dict:
-        """18. Stochastic reversal confirmation"""
+    def check_stochastic(self, df):
         k, d = self._calculate_stochastic(df)
-
         if len(k) < 2:
-            return {'signal': 'neutral'}
+            return {"signal": "neutral"}
+        if k.iloc[-1] < 20 and k.iloc[-1] > d.iloc[-1]:
+            return {"signal": "bullish"}
+        if k.iloc[-1] > 80 and k.iloc[-1] < d.iloc[-1]:
+            return {"signal": "bearish"}
+        return {"signal": "neutral"}
 
-        oversold = k.iloc[-1] < 20
-        overbought = k.iloc[-1] > 80
-        cross_up = k.iloc[-2] < d.iloc[-2] and k.iloc[-1] > d.iloc[-1]
-        cross_down = k.iloc[-2] > d.iloc[-2] and k.iloc[-1] < d.iloc[-1]
-
-        if oversold and cross_up:
-            return {'signal': 'bullish', 'k': k.iloc[-1]}
-        elif overbought and cross_down:
-            return {'signal': 'bearish', 'k': k.iloc[-1]}
-        else:
-            return {'signal': 'neutral'}
-
-    def check_obv_divergence(self, df: pd.DataFrame) -> str:
-        """19. OBV divergence (volume-based)"""
+    def check_obv_divergence(self, df):
         obv = self._calculate_obv(df)
+        if len(obv) < 10:
+            return "neutral"
+        p_up = df['close'].iloc[-10:].is_monotonic_increasing
+        o_up = obv.iloc[-10:].is_monotonic_increasing
+        if p_up and not o_up:
+            return "bearish_divergence"
+        if not p_up and o_up:
+            return "bullish_divergence"
+        return "neutral"
 
-        if len(obv) < 20:
-            return 'neutral'
-
-        # Simple divergence check
-        price_trend = df['close'].iloc[-10:].is_monotonic_increasing
-        obv_trend = obv.iloc[-10:].is_monotonic_increasing
-
-        if price_trend and not obv_trend:
-            return 'bearish_divergence'
-        elif not price_trend and obv_trend:
-            return 'bullish_divergence'
-        else:
-            return 'neutral'
-
-    def check_mfi(self, df: pd.DataFrame) -> Dict:
-        """20. MFI (Money Flow) direction"""
+    def check_mfi(self, df):
         mfi = self._calculate_mfi(df)
+        v = float(mfi.iloc[-1])
+        if v > 80:
+            return {"signal": "overbought", "value": v}
+        if v < 20:
+            return {"signal": "oversold", "value": v}
+        return {"signal": "neutral", "value": v}
 
-        if len(mfi) < 14:
-            return {'signal': 'neutral'}
-
-        current_mfi = mfi.iloc[-1]
-
-        if current_mfi > 80:
-            return {'signal': 'overbought', 'value': current_mfi}
-        elif current_mfi < 20:
-            return {'signal': 'oversold', 'value': current_mfi}
-        else:
-            return {'signal': 'neutral', 'value': current_mfi}
-
-    def check_roc(self, df: pd.DataFrame) -> float:
-        """21. ROC (Rate of Change) momentum"""
+    def check_roc(self, df):
         if len(df) < 20:
-            return 0
+            return 0.0
+        return float((df['close'].iloc[-1] - df['close'].iloc[-20]) /
+                     df['close'].iloc[-20] * 100)
 
-        roc = ((df['close'].iloc[-1] - df['close'].iloc[-20]) / 
-               df['close'].iloc[-20]) * 100
-        return roc
+# ==================== D) ORDERFLOW ====================
 
-    # ==================== D) ORDER FLOW & DEPTH (10) ====================
+    def check_orderbook_imbalance(self, ob):
+        r = float(ob.get("imbalance", 1))
+        th = float(self.config.get("orderbook_imbalance_threshold", 1.2))
+        if r > th: return {"signal": "bullish", "ratio": r}
+        if r < 1/th: return {"signal": "bearish", "ratio": r}
+        return {"signal": "neutral", "ratio": r}
 
-    def check_orderbook_imbalance(self, orderbook: Dict) -> Dict:
-        """22. Orderbook imbalance check"""
-        imbalance = orderbook.get('imbalance', 1.0)
-        threshold_high = self.config.get('orderbook_imbalance_threshold', 1.2)
-        threshold_low = 1 / threshold_high
+    def calculate_vwap(self, df):
+        tp = (df['high'] + df['low'] + df['close']) / 3
+        return (tp * df['volume']).cumsum() / df['volume'].cumsum()
 
-        if imbalance > threshold_high:
-            signal = 'bullish'
-        elif imbalance < threshold_low:
-            signal = 'bearish'
-        else:
-            signal = 'neutral'
-
-        logger.info(f"OB Imbalance: {imbalance:.2f} -> {signal}")
-        return {'signal': signal, 'ratio': imbalance}
-
-    def calculate_vwap(self, df: pd.DataFrame) -> pd.Series:
-        """23. VWAP calculation"""
-        typical_price = (df['high'] + df['low'] + df['close']) / 3
-        vwap = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
-        return vwap
-
-    def check_vwap_deviation(self, df: pd.DataFrame) -> Dict:
-        """24. VWAP fair-value deviation check"""
+    def check_vwap_deviation(self, df):
         vwap = self.calculate_vwap(df)
-        current_price = df['close'].iloc[-1]
-        current_vwap = vwap.iloc[-1]
+        price = df['close'].iloc[-1]
+        dv = (price - vwap.iloc[-1]) / vwap.iloc[-1]
+        th = float(self.config.get("vwap_deviation_percent", 0.005))
+        if abs(dv) > th:
+            return {"signal": ("far" if dv > 0 else "near"), "deviation": dv}
+        return {"signal": "normal", "deviation": dv}
 
-        deviation = (current_price - current_vwap) / current_vwap
-        threshold = self.config.get('vwap_deviation_percent', 0.005)
+    def check_vwap_logic(self, df):
+        v = self.calculate_vwap(df)
+        r = df.tail(5)
+        c = 0
+        for i in range(1, 5):
+            if (r['close'].iloc[i] > v.iloc[-5+i]) != (r['close'].iloc[i-1] > v.iloc[-5+i-1]):
+                c += 1
+        if c >= 2:
+            return "bounce"
+        return "reclaim" if r['close'].iloc[-1] > v.iloc[-1] else "rejection"
 
-        if abs(deviation) > threshold:
-            signal = 'far' if deviation > 0 else 'near'
-        else:
-            signal = 'normal'
+    def calculate_cvd(self, trades):
+        buy = sum(t['amount'] for t in trades if t['side']=="buy")
+        sell = sum(t['amount'] for t in trades if t['side']=="sell")
+        return float(buy - sell)
 
-        return {
-            'signal': signal,
-            'deviation': deviation,
-            'vwap': current_vwap,
-            'price': current_price
-        }
+    def detect_large_order(self, ob):
+        th = float(self.config.get("large_order_threshold", 100000))
+        L=[]
+        for b in ob.get("bids",[])[:20]:
+            if b[0]*b[1] >= th: L.append({"side":"bid","price":b[0]})
+        for a in ob.get("asks",[])[:20]:
+            if a[0]*a[1] >= th: L.append({"side":"ask","price":a[0]})
+        return L
 
-    def check_vwap_logic(self, df: pd.DataFrame) -> str:
-        """25. VWAP bounce/reclaim/rejection logic"""
-        vwap = self.calculate_vwap(df)
-        recent = df.tail(5)
+    def detect_spoofing_wall(self, ob):
+        th = float(self.config.get("spoofing_wall_threshold", 500000))
+        bids = [b for b in ob.get("bids",[]) if b[0]*b[1] > th]
+        asks = [a for a in ob.get("asks",[]) if a[0]*a[1] > th]
+        return {"bid_walls":len(bids),"ask_walls":len(asks),"suspicious":bool(bids or asks)}
 
-        # Check if price bouncing off VWAP
-        crosses = 0
-        for i in range(1, len(recent)):
-            prev_above = recent['close'].iloc[i-1] > vwap.iloc[-len(recent)+i-1]
-            curr_above = recent['close'].iloc[i] > vwap.iloc[-len(recent)+i]
-            if prev_above != curr_above:
-                crosses += 1
+    def calculate_true_liquidity(self, ob):
+        total=0
+        for b in ob.get("bids",[])[:20]:
+            total += b[0]*b[1]
+        for a in ob.get("asks",[])[:20]:
+            total += a[0]*a[1]
+        return float(total)
 
-        if crosses >= 2:
-            return 'bounce'
-        elif recent['close'].iloc[-1] > vwap.iloc[-1]:
-            return 'reclaim'
-        else:
-            return 'rejection'
+    def calculate_aggression_ratio(self, trades):
+        b = sum(1 for t in trades if t["side"]=="buy")
+        s = sum(1 for t in trades if t["side"]=="sell")
+        if s==0: return 999
+        return float(b/s)
 
-    def calculate_cvd(self, trades: list) -> float:
-        """26. CVD (Cumulative Volume Delta) direction"""
-        buy_volume = sum([t['amount'] for t in trades if t['side'] == 'buy'])
-        sell_volume = sum([t['amount'] for t in trades if t['side'] == 'sell'])
-        cvd = buy_volume - sell_volume
-        return cvd
+    def check_spread_velocity(self, hist):
+        if len(hist)<2: return 0
+        return float(hist[-1].get("spread",0) - hist[-2].get("spread",0))
 
-    def detect_large_order(self, orderbook: Dict) -> list:
-        """27. Large order detection"""
-        threshold = self.config.get('large_order_threshold', 100000)
-        large_orders = []
+# ==================== E) DERIVATIVES ====================
 
-        # Check bids
-        for bid in orderbook.get('bids', []):
-            value = bid[0] * bid[1]
-            if value >= threshold:
-                large_orders.append({'side': 'bid', 'price': bid[0], 'value': value})
+    def check_oi_trend(self, oi):
+        if len(oi)<10: return "neutral"
+        if np.mean(oi[-5:]) > np.mean(oi[-10:-5])*1.1: return "increasing"
+        if np.mean(oi[-5:]) < np.mean(oi[-10:-5])*0.9: return "decreasing"
+        return "stable"
 
-        # Check asks
-        for ask in orderbook.get('asks', []):
-            value = ask[0] * ask[1]
-            if value >= threshold:
-                large_orders.append({'side': 'ask', 'price': ask[0], 'value': value})
+    def check_oi_divergence(self, df, oi):
+        if len(oi)<10 or len(df)<10: return "neutral"
+        p_up = df['close'].iloc[-10:].is_monotonic_increasing
+        oi_up = oi[-10] > oi[-20] if len(oi)>=20 else False
+        if p_up and not oi_up: return "bearish_divergence"
+        if not p_up and oi_up: return "bullish_divergence"
+        return "neutral"
 
-        if large_orders:
-            logger.info(f"🐋 {len(large_orders)} large orders detected")
-        return large_orders
-    def detect_spoofing_wall(self, orderbook: Dict) -> Dict:
-        """28. Spoofing wall detection (fake liquidity)"""
-        threshold = self.config.get('spoofing_wall_threshold', 500000)
+    def check_liquidation_proximity(self, price, clusters):
+        out=[]
+        th = float(self.config.get("liquidation_proximity_percent",0.02))
+        for c in clusters:
+            if abs(price - c['price'])/price < th:
+                out.append(c)
+        return {"nearby":bool(out),"clusters":out}
 
-        # Check for abnormally large orders
-        bids = orderbook.get('bids', [])
-        asks = orderbook.get('asks', [])
+    def check_funding_arbitrage(self, fr):
+        vals = list(fr.values())
+        if len(vals)<2:
+            return {"opportunity":False}
+        sp = max(vals)-min(vals)
+        return {"opportunity":sp>0.0005, "spread":sp}
 
-        bid_walls = [b for b in bids if b[0] * b[1] > threshold]
-        ask_walls = [a for a in asks if a[0] * a[1] > threshold]
+    def check_gamma_exposure(self, opt):
+        g = float(opt.get("gamma",0))
+        th=float(self.config.get("gamma_exposure_threshold",0.5))
+        if g>th: return "positive"
+        if g<-th: return "negative"
+        return "neutral"
 
-        return {
-            'bid_walls': len(bid_walls),
-            'ask_walls': len(ask_walls),
-            'suspicious': len(bid_walls) + len(ask_walls) > 0
-        }
+    def gamma_adjusted_sizing(self, size, gamma):
+        if gamma=="negative": return size*0.5
+        if gamma=="positive": return size
+        return size*0.75
 
-    def calculate_true_liquidity(self, orderbook: Dict) -> float:
-        """29. True liquidity depth (top 20 levels)"""
-        total_liquidity = 0
+# ==================== F) ANTI-TRAP ====================
 
-        for bid in orderbook.get('bids', [])[:20]:
-            total_liquidity += bid[0] * bid[1]
+    def avoid_round_numbers(self, price):
+        r = round(price, -3)
+        return abs(price-r)/price > float(self.config.get("round_number_avoid_distance",0.001))
 
-        for ask in orderbook.get('asks', [])[:20]:
-            total_liquidity += ask[0] * ask[1]
-
-        return total_liquidity
-
-    def calculate_aggression_ratio(self, trades: list) -> float:
-        """30. Aggression ratio (market buy vs sell pressure)"""
-        if not trades:
-            return 0
-
-        market_buys = sum([1 for t in trades if t['side'] == 'buy'])
-        market_sells = sum([1 for t in trades if t['side'] == 'sell'])
-
-        if market_sells == 0:
-            return 999  # All buys
-
-        ratio = market_buys / market_sells
-        return ratio
-
-    def check_spread_velocity(self, orderbook_history: list) -> float:
-        """31. Spread velocity check (microstructure shift)"""
-        if len(orderbook_history) < 2:
-            return 0
-
-        spread_now = orderbook_history[-1].get('spread', 0)
-        spread_before = orderbook_history[-2].get('spread', 0)
-
-        velocity = spread_now - spread_before
-        return velocity
-
-    # ==================== E) DERIVATIVES & FUTURES LOGICS (6) ====================
-
-    def check_oi_trend(self, oi_history: list) -> str:
-        """32. Open interest trend"""
-        if len(oi_history) < 10:
-            return 'neutral'
-
-        recent_oi = oi_history[-5:]
-        older_oi = oi_history[-10:-5]
-
-        avg_recent = np.mean(recent_oi)
-        avg_older = np.mean(older_oi)
-
-        if avg_recent > avg_older * 1.1:
-            return 'increasing'
-        elif avg_recent < avg_older * 0.9:
-            return 'decreasing'
-        else:
-            return 'stable'
-
-    def check_oi_divergence(self, df: pd.DataFrame, oi_history: list) -> str:
-        """33. OI divergence (price vs OI conflict)"""
-        if len(oi_history) < 10 or len(df) < 10:
-            return 'neutral'
-
-        price_trend = df['close'].iloc[-10:].is_monotonic_increasing
-        oi_trend = oi_history[-10:] > oi_history[-20:-10]
-
-        if price_trend and not oi_trend.mean() > 0.5:
-            return 'bearish_divergence'
-        elif not price_trend and oi_trend.mean() > 0.5:
-            return 'bullish_divergence'
-        else:
-            return 'neutral'
-
-    def check_liquidation_proximity(self, current_price: float, 
-                                     liquidation_clusters: list) -> Dict:
-        """34. Liquidation cluster proximity check"""
-        proximity_threshold = self.config.get('liquidation_proximity_percent', 0.02)
-
-        nearby_liq = []
-        for cluster in liquidation_clusters:
-            distance = abs(current_price - cluster['price']) / current_price
-            if distance < proximity_threshold:
-                nearby_liq.append(cluster)
-
-        if nearby_liq:
-            logger.warning(f"⚠️ {len(nearby_liq)} liquidation clusters nearby")
-            return {'nearby': True, 'clusters': nearby_liq}
-
-        return {'nearby': False}
-
-    def check_funding_arbitrage(self, funding_rates: Dict) -> Dict:
-        """35. Funding arbitrage opportunity"""
-        # Check if funding rates differ significantly across exchanges
-        rates = list(funding_rates.values())
-
-        if len(rates) < 2:
-            return {'opportunity': False}
-
-        max_rate = max(rates)
-        min_rate = min(rates)
-        spread = max_rate - min_rate
-
-        opportunity = abs(spread) > 0.0005  # 0.05%
-
-        return {
-            'opportunity': opportunity,
-            'spread': spread,
-            'rates': funding_rates
-        }
-
-    def check_gamma_exposure(self, options_data: Dict) -> str:
-        """36. Gamma exposure direction"""
-        # Simplified gamma logic (requires options data)
-        gamma = options_data.get('gamma', 0)
-        threshold = self.config.get('gamma_exposure_threshold', 0.5)
-
-        if gamma > threshold:
-            return 'positive'  # Bullish gamma
-        elif gamma < -threshold:
-            return 'negative'  # Bearish gamma
-        else:
-            return 'neutral'
-
-    def gamma_adjusted_sizing(self, position_size: float, gamma: str) -> float:
-        """37. Gamma-adjusted risk sizing"""
-        if gamma == 'negative':
-            # Reduce risk in negative gamma environment
-            return position_size * 0.5
-        elif gamma == 'positive':
-            return position_size * 1.0
-        else:
-            return position_size * 0.75
-
-    # ==================== F) ANTI-TRAP MECHANISMS (8) ====================
-
-    def avoid_round_numbers(self, price: float) -> bool:
-        """38. Avoid round-number trap zones"""
-        avoid_distance = self.config.get('round_number_avoid_distance', 0.001)
-
-        # Check if price near round numbers (50000, 51000, etc.)
-        rounded = round(price, -3)  # Round to nearest 1000
-        distance = abs(price - rounded) / price
-
-        is_safe = distance > avoid_distance
-        if not is_safe:
-            logger.warning(f"⚠️ Price near round number: {rounded}")
-        return is_safe
-
-    def avoid_obvious_sr(self, price: float, support_resistance: list) -> bool:
-        """39. Avoid obvious support/resistance entries"""
-        for sr in support_resistance:
-            distance = abs(price - sr) / price
-            if distance < 0.005:  # Within 0.5%
-                logger.warning(f"⚠️ Price near S/R: {sr}")
+    def avoid_obvious_sr(self, price, sr):
+        for s in sr:
+            if abs(price-s)/price < 0.005:
                 return False
         return True
 
-    def detect_sl_hunting_zone(self, df: pd.DataFrame) -> bool:
-        """40. SL-hunting zone detection"""
-        if len(df) < 20:
-            return False
+    def detect_sl_hunting_zone(self, df):
+        if len(df)<20: return False
+        c=0
+        for _,x in df.tail(20).iterrows():
+            body = abs(x['close']-x['open'])
+            uw = x['high']-max(x['close'],x['open'])
+            lw = min(x['close'],x['open'])-x['low']
+            if uw>body*2 or lw>body*2: c+=1
+        return c>3
 
-        # Check for wicks that hunt stops
-        recent = df.tail(20)
-        large_wicks = 0
+    def check_odd_time_entry(self, now):
+        bad=[9,10,17]
+        return now.minute not in [0,15,30,45] or now.hour not in bad
 
-        for _, candle in recent.iterrows():
-            body = abs(candle['close'] - candle['open'])
-            upper_wick = candle['high'] - max(candle['close'], candle['open'])
-            lower_wick = min(candle['close'], candle['open']) - candle['low']
+    def filter_sudden_wick(self, df):
+        if len(df)<2: return True
+        x=df.iloc[-1]
+        pct = (x['high']-x['low'])/x['close']
+        return pct<0.01
 
-            if upper_wick > body * 2 or lower_wick > body * 2:
-                large_wicks += 1
+    def avoid_bot_rush_time(self, now):
+        return now.hour not in [9,10,17]
 
-        is_hunting_zone = large_wicks > 3
-        if is_hunting_zone:
-            logger.warning("⚠️ SL hunting zone detected")
-        return is_hunting_zone
+    def filter_manipulation_candle(self, c):
+        body=abs(c['close']-c['open'])
+        rng=c['high']-c['low']
+        if rng==0: return False
+        return (body/rng)>0.2
 
-    def check_odd_time_entry(self, current_time: datetime) -> bool:
-        """41. Odd-time entries (avoid round hours)"""
-        avoid_hours = self.config.get('avoid_round_hours', [9, 10, 17])
-        minute = current_time.minute
-        hour = current_time.hour
+    def check_consecutive_losses(self, trades):
+        c=0
+        for t in reversed(trades):
+            if t['pnl']<0: c+=1
+            else: break
+        return c<2, c
+# ==================== HELPER INDICATORS ====================
 
-        # Avoid entries at exact hours
-        is_odd_time = minute not in [0, 15, 30, 45] or hour not in avoid_hours
-        return is_odd_time
+    def _calculate_adx(self, df, period=14):
+        h=df['high']; l=df['low']; c=df['close']
+        pc=c.shift(1)
+        tr = pd.concat([
+            h-l,
+            (h-pc).abs(),
+            (l-pc).abs()
+        ],axis=1).max(axis=1)
+        atr=tr.rolling(period).mean()
+        up=h.diff(); dn=l.shift(1)-l
+        plus=np.where((up>dn)&(up>0),up,0)
+        minus=np.where((dn>up)&(dn>0),dn,0)
+        plus=pd.Series(plus).rolling(period).mean()
+        minus=pd.Series(minus).rolling(period).mean()
+        di_p = 100*(plus/atr)
+        di_m = 100*(minus/atr)
+        dx = 100*(abs(di_p-di_m)/(di_p+di_m))
+        return float(dx.rolling(period).mean().iloc[-1])
 
-    def filter_sudden_wick(self, df: pd.DataFrame) -> bool:
-        """42. Avoid sudden 1-min wick shocks"""
-        if len(df) < 2:
-            return True
+    def _calculate_atr(self, df, period=14):
+        h=df['high']; l=df['low']; c=df['close']
+        pc=c.shift(1)
+        tr = pd.concat([
+            h-l,
+            (h-pc).abs(),
+            (l-pc).abs()
+        ],axis=1).max(axis=1)
+        return tr.rolling(period).mean()
 
-        last_candle = df.iloc[-1]
-        range_pct = (last_candle['high'] - last_candle['low']) / last_candle['close']
+    def _calculate_bollinger_bands(self, df, p=20, k=2):
+        ma=df['close'].rolling(p).mean()
+        sd=df['close'].rolling(p).std()
+        return ma+k*sd, ma-k*sd
 
-        # If range > 1% in 1 minute, suspicious
-        is_normal = range_pct < 0.01
-        if not is_normal:
-            logger.warning(f"⚠️ Sudden wick detected: {range_pct:.2%}")
-        return is_normal
+    def _calculate_rsi(self, df, p=14):
+        d=df['close'].diff()
+        g=d.where(d>0,0).rolling(p).mean()
+        l=(-d.where(d<0,0)).rolling(p).mean()
+        rs=g/l.replace(0,np.nan)
+        return 100-(100/(1+rs))
 
-    def avoid_bot_rush_time(self, current_time: datetime) -> bool:
-        """43. Avoid bot-rush time"""
-        rush_hours = [9, 10, 17]  # UTC
-        hour = current_time.hour
+    def _calculate_macd(self, df, f=12, s=26, sig=9):
+        e1=df['close'].ewm(span=f).mean()
+        e2=df['close'].ewm(span=s).mean()
+        m=e1-e2
+        sl=m.ewm(span=sig).mean()
+        return m, sl, m-sl
 
-        is_safe = hour not in rush_hours
-        return is_safe
-
-    def filter_manipulation_candle(self, candle: pd.Series) -> bool:
-        """44. Manipulation candle filter"""
-        body = abs(candle['close'] - candle['open'])
-        total_range = candle['high'] - candle['low']
-
-        if total_range == 0:
-            return False
-
-        # Very small body with huge wicks = manipulation
-        body_ratio = body / total_range
-        is_normal = body_ratio > 0.2
-
-        if not is_normal:
-            logger.warning("⚠️ Manipulation candle detected")
-        return is_normal
-
-    def check_consecutive_losses(self, recent_trades: list) -> Tuple[bool, int]:
-        """45. No-trade after 2 consecutive losses (cooldown)"""
-        if len(recent_trades) < 2:
-            return True, 0
-
-        consecutive_losses = 0
-        for trade in reversed(recent_trades):
-            if trade['pnl'] < 0:
-                consecutive_losses += 1
-            else:
-                break
-
-        should_trade = consecutive_losses < 2
-        if not should_trade:
-            logger.warning(f"🛑 Cooldown: {consecutive_losses} consecutive losses")
-
-        return should_trade, consecutive_losses
-
-    # ==================== HELPER FUNCTIONS ====================
-    def _calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
-        """Calculate ADX indicator"""
-        # ensure numeric series
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-        close = df['close'].astype(float)
-
-        # True Range components
-        prev_close = close.shift(1)
-        tr1 = high - low
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-        # Directional movements
-        up_move = high.diff()
-        down_move = low.shift(1) - low
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-        plus_dm = pd.Series(plus_dm, index=df.index)
-        minus_dm = pd.Series(minus_dm, index=df.index)
-
-        # Wilder smoothing
-        tr_smt = tr.copy()
-        if len(tr) >= period:
-            tr_smt.iloc[period-1] = tr.iloc[:period].sum()
-            for i in range(period, len(tr)):
-                tr_smt.iloc[i] = tr_smt.iloc[i-1] - (tr_smt.iloc[i-1] / period) + tr.iloc[i]
-        else:
-            tr_smt = tr_smt.rolling(window=period).sum()
-
-        plus_dm_smt = plus_dm.copy()
-        minus_dm_smt = minus_dm.copy()
-        if len(plus_dm) >= period:
-            plus_dm_smt.iloc[period-1] = plus_dm.iloc[:period].sum()
-            minus_dm_smt.iloc[period-1] = minus_dm.iloc[:period].sum()
-            for i in range(period, len(plus_dm)):
-                plus_dm_smt.iloc[i] = plus_dm_smt.iloc[i-1] - (plus_dm_smt.iloc[i-1] / period) + plus_dm.iloc[i]
-                minus_dm_smt.iloc[i] = minus_dm_smt.iloc[i-1] - (minus_dm_smt.iloc[i-1] / period) + minus_dm.iloc[i]
-        else:
-            plus_dm_smt = plus_dm.rolling(window=period).sum()
-            minus_dm_smt = minus_dm.rolling(window=period).sum()
-
-        # Avoid division by zero
-        tr_smt = tr_smt.replace(0, np.nan)
-
-        plus_di = 100 * (plus_dm_smt / tr_smt)
-        minus_di = 100 * (minus_dm_smt / tr_smt)
-
-        dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-        if len(dx) == 0:
-            return 0.0
-
-        # ADX smoothing
-        adx = dx.copy()
-        if len(dx) >= period:
-            adx.iloc[period-1] = dx.iloc[:period].mean()
-            for i in range(period, len(dx)):
-                adx.iloc[i] = ((adx.iloc[i-1] * (period - 1)) + dx.iloc[i]) / period
-        else:
-            adx = dx.rolling(window=period).mean()
-
-        # return last value
-        last = adx.iloc[-1] if len(adx) > 0 else 0.0
-        return float(last)
-
-    def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Calculate Average True Range"""
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-        close = df['close'].astype(float)
-        
-        prev_close = close.shift(1)
-        tr1 = high - low
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        
-        atr = tr.rolling(window=period).mean()
-        return atr
-
-    def _calculate_bollinger_bands(self, df: pd.DataFrame, period: int = 20, std_dev: int = 2) -> Tuple[pd.Series, pd.Series]:
-        """Calculate Bollinger Bands"""
-        sma = df['close'].rolling(window=period).mean()
-        std = df['close'].rolling(window=period).std()
-        
-        upper_band = sma + (std * std_dev)
-        lower_band = sma - (std * std_dev)
-        
-        return upper_band, lower_band
-
-    def _calculate_rsi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Calculate RSI"""
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        return rsi
-
-    def _calculate_macd(self, df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """Calculate MACD"""
-        ema_fast = df['close'].ewm(span=fast).mean()
-        ema_slow = df['close'].ewm(span=slow).mean()
-        
-        macd = ema_fast - ema_slow
-        signal_line = macd.ewm(span=signal).mean()
-        histogram = macd - signal_line
-        
-        return macd, signal_line, histogram
-
-    def _calculate_stochastic(self, df: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> Tuple[pd.Series, pd.Series]:
-        """Calculate Stochastic Oscillator"""
-        low_min = df['low'].rolling(window=k_period).min()
-        high_max = df['high'].rolling(window=k_period).max()
-        
-        k = 100 * ((df['close'] - low_min) / (high_max - low_min))
-        d = k.rolling(window=d_period).mean()
-        
+    def _calculate_stochastic(self, df, kp=14, dp=3):
+        lo=df['low'].rolling(kp).min()
+        hi=df['high'].rolling(kp).max()
+        k = 100*((df['close']-lo)/(hi-lo))
+        d = k.rolling(dp).mean()
         return k, d
 
-    def _calculate_obv(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate On-Balance Volume"""
-        obv = pd.Series(index=df.index, dtype=float)
-        obv.iloc[0] = 0
-        
-        for i in range(1, len(df)):
-            if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                obv.iloc[i] = obv.iloc[i-1] + df['volume'].iloc[i]
-            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                obv.iloc[i] = obv.iloc[i-1] - df['volume'].iloc[i]
+    def _calculate_obv(self, df):
+        obv=[0]
+        for i in range(1,len(df)):
+            if df['close'].iloc[i]>df['close'].iloc[i-1]:
+                obv.append(obv[-1]+df['volume'].iloc[i])
+            elif df['close'].iloc[i]<df['close'].iloc[i-1]:
+                obv.append(obv[-1]-df['volume'].iloc[i])
             else:
-                obv.iloc[i] = obv.iloc[i-1]
-                
-        return obv
+                obv.append(obv[-1])
+        return pd.Series(obv,index=df.index)
 
-    def _calculate_mfi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Calculate Money Flow Index"""
-        typical_price = (df['high'] + df['low'] + df['close']) / 3
-        money_flow = typical_price * df['volume']
-        
-        positive_flow = pd.Series(index=df.index, dtype=float)
-        negative_flow = pd.Series(index=df.index, dtype=float)
-        
-        for i in range(1, len(df)):
-            if typical_price.iloc[i] > typical_price.iloc[i-1]:
-                positive_flow.iloc[i] = money_flow.iloc[i]
-                negative_flow.iloc[i] = 0
-            else:
-                positive_flow.iloc[i] = 0
-                negative_flow.iloc[i] = money_flow.iloc[i]
-        
-        positive_mf = positive_flow.rolling(window=period).sum()
-        negative_mf = negative_flow.rolling(window=period).sum()
-        
-        mfi = 100 - (100 / (1 + (positive_mf / negative_mf)))
-        
-        return mfi
+    def _calculate_mfi(self, df, p=14):
+        tp=(df['high']+df['low']+df['close'])/3
+        mf=tp*df['volume']
+        pos=[0]; neg=[0]
+        for i in range(1,len(df)):
+            if tp.iloc[i]>tp.iloc[i-1]: pos.append(mf.iloc[i]); neg.append(0)
+            else: neg.append(mf.iloc[i]); pos.append(0)
+        pos=pd.Series(pos).rolling(p).sum()
+        neg=pd.Series(neg).rolling(p).sum()
+        return 100-(100/(1+(pos/neg)))
 
-    def _detect_rsi_divergence(self, df: pd.DataFrame, rsi: pd.Series) -> str:
-        """Detect RSI divergence"""
-        # Simplified divergence detection
-        price_trend = df['close'].iloc[-10:].is_monotonic_increasing
-        rsi_trend = rsi.iloc[-10:].is_monotonic_increasing
-        
-        if price_trend and not rsi_trend:
-            return 'bearish_divergence'
-        elif not price_trend and rsi_trend:
-            return 'bullish_divergence'
-        else:
-            return 'no_divergence'
+# ==================== LogicEvaluator Wrapper ====================
 
+class LogicEvaluator:
+    def __init__(self, config: Dict[str,Any]):
+        self.engine = UniqueLogics(config)
 
-# compatibility alias: older code expects LogicEvaluator
-class LogicEvaluator(UniqueLogics):
-    """Compatibility alias so `from strategy.unique_logics import LogicEvaluator` works."""
-    pass
+    def evaluate_all_logics(self, df, orderbook, funding_rate, oi_history,
+                            trades, fear=50, news=None, liq=None):
+
+        news = news or []
+        liq = liq or []
+
+        # Market section
+        checks = [
+            self.engine.check_btc_calm(df),
+            self.engine.check_funding_rate_normal(funding_rate),
+            self.engine.check_fear_greed_index(fear),
+            self.engine.check_liquidity_window(datetime.utcnow()),
+            self.engine.check_spread_slippage(orderbook),
+            self.engine.check_news_filter(datetime.utcnow(), news)
+        ]
+        base = (sum(checks)/len(checks))*100
+
+        atr = self.engine.calculate_atr_filter(df)
+        price = df['close'].iloc[-1]
+        if (atr/price) > 0.05:
+            base -= 20
+
+        final = round(base,2)
+        allowed = final >= 50 and all(checks)
+
+        return {
+            "final_score": final,
+            "trade_allowed": allowed,
+            "market_regime": self.engine.detect_market_regime(df),
+            "ema": self.engine.check_ema_alignment(df),
+            "atr": atr
+        }
