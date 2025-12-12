@@ -1,54 +1,54 @@
-# ============================
-# FINAL DOCKERFILE – RAILWAY
-# ============================
-
+# Dockerfile (final, railway-ready)
 FROM python:3.11-slim
 
+ARG EPOCHS=3
+ARG TRAIN_IN_BUILD=false
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# --------------------------------------------------------
-# System dependencies (TA-Lib compile + ML libs support)
-# --------------------------------------------------------
+# system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential wget curl git ca-certificates libssl-dev libbz2-dev \
-    libffi-dev liblzma-dev libncurses5-dev libncursesw5-dev libreadline-dev \
-    libsqlite3-dev zlib1g-dev libpq-dev gcc g++ make unzip \
-    && rm -rf /var/lib/apt/lists/*
+    build-essential wget curl git ca-certificates libssl-dev libbz2-dev libffi-dev \
+    liblzma-dev libncurses5-dev libncursesw5-dev libreadline-dev libsqlite3-dev \
+    zlib1g-dev libpq-dev gcc g++ make unzip && rm -rf /var/lib/apt/lists/*
 
-# -------- Install TA-Lib C library --------
+# TA-Lib C library (needed by python ta-lib) - optional; keep if using ta-lib
 RUN wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz -O /tmp/ta-lib.tar.gz \
- && cd /tmp && tar -xzf ta-lib.tar.gz && cd ta-lib \
- && ./configure --prefix=/usr && make && make install \
- && rm -rf /tmp/ta-lib /tmp/ta-lib.tar.gz
+    && cd /tmp && tar -xzf ta-lib.tar.gz && cd ta-lib \
+    && ./configure --prefix=/usr && make && make install \
+    && rm -rf /tmp/ta-lib /tmp/ta-lib.tar.gz
 
-# -------- Python tooling --------
+# upgrade pip
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# --------------------------------------------------------
-# Copy project
-# --------------------------------------------------------
 WORKDIR /app
+
+# copy project
 COPY . /app
 
-# --------------------------------------------------------
-# Install Python dependencies
-# --------------------------------------------------------
+# install python deps (use --no-cache-dir to keep image smaller)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --------------------------------------------------------
-# TRAIN MODELS DURING BUILD
-# --------------------------------------------------------
-ARG EPOCHS=3
+# create models folder and data folder (if not present)
+RUN mkdir -p /app/models /app/data
 
-RUN bash -lc '\
-    if ls data/BTCUSDT-15m-*.csv >/dev/null 2>&1; then \
-      echo "📊 Training ML models using CSV files from /app/data ..."; \
-      python scripts/train_models.py --data_dir data/ --epochs ${EPOCHS}; \
+# Build-time: optional training (controlled by TRAIN_IN_BUILD arg)
+# If TRAIN_IN_BUILD is "true" (string), training will run; otherwise skip.
+RUN bash -lc ' \
+    if [ "${TRAIN_IN_BUILD}" = "true" ]; then \
+      if ls data/BTCUSDT-15m-*.csv >/dev/null 2>&1; then \
+        echo "📊 Data CSVs present — training models during build (epochs=${EPOCHS})"; \
+        python scripts/train_models.py --data_dir data/ --epochs ${EPOCHS}; \
+      else \
+        echo "⚠️ TRAIN_IN_BUILD=true but no CSVs found in /app/data — skipping training"; \
+      fi \
     else \
-      echo "⚠️ No CSV files found in /app/data - skipping model training."; \
+      echo "ℹ️ TRAIN_IN_BUILD=false — skipping training during build"; \
     fi'
 
-# --------------------------------------------------------
-# START BOT
-# --------------------------------------------------------
+# expose port if your app uses one (optional)
+# EXPOSE 8000
+
+# default command
 CMD ["python", "main.py"]
