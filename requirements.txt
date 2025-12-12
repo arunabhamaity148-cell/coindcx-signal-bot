@@ -1,5 +1,4 @@
-# Core Dependencies
-python>=3.10
+
 
 # Data Collection & Exchange APIs
 ccxt==4.2.25
