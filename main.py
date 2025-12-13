@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 MAIN TRADING BOT – FINAL (TA-ONLY READY)
-- If TRADING_CONFIG['ml_required'] == False → skips ML entirely
-- Otherwise tries ML and falls back to TA on failure
+- ENV switch MODE=live/paper
+- Health-check for Railway
+- Contract symbols (OI/funding ready)
+- Premium Telegram msgs
 """
 import os
 import sys
@@ -14,6 +16,7 @@ import argparse
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
+from aiohttp import web      # ← health server
 
 # ---------- project imports ----------
 from config.settings import (
@@ -38,10 +41,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ---------- health-check server (Railway keeps alive) ----------
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get('/health', lambda req: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
+    await site.start()
+    logger.info("Health-check server started on port %s", os.getenv("PORT", 8080))
+
+
 # ---------- TradingBot ----------
 class TradingBot:
-    def __init__(self, mode='paper', capital=None):
-        self.mode = mode
+    def __init__(self, mode=None, capital=None):
+        # ENV preference → fallback arg
+        self.mode = mode or os.getenv("MODE", "paper")
         self.capital = capital if capital is not None else TRADING_CONFIG.get('initial_capital', 10000)
         self.initial_capital = self.capital
         self.is_running = False
@@ -54,10 +70,9 @@ class TradingBot:
         }
 
         logger.info("="*100)
-        logger.info("🤖 ADVANCED CRYPTO TRADING BOT – FINAL (TA-ONLY READY)")
+        logger.info("🤖 ADVANCED CRYPTO TRADING BOT – FINAL")
         logger.info("Mode : %s  |  Capital : ₹%0.2f  |  Date : %s",
                     self.mode.upper(), self.capital, datetime.now())
-        logger.info("ML required: %s", TRADING_CONFIG.get('ml_required', True))
         logger.info("="*100)
 
         self._init_components()
@@ -425,6 +440,7 @@ class TradingBot:
 
     # ---------- run loop ----------
     async def _run_loop(self):
+        await start_health_server()   # ← health-check start
         self.is_running = True
         symbols = TRADING_CONFIG.get('symbols', [TRADING_CONFIG.get('primary_symbol', 'BTC/USDT:USDT')])
         interval = TRADING_CONFIG.get('check_interval', 900)
@@ -435,9 +451,9 @@ class TradingBot:
 
         if self.telegram_notifier:
             try:
-                await self.telegram_notifier.initialize()
+                await self.telegram_notifier.notify_bot_started(self.capital, self.mode)
             except Exception as e:
-                logger.warning("Telegram initialize failed: %s", e)
+                logger.warning("Telegram start msg failed: %s", e)
 
         while self.is_running:
             start_cycle = datetime.now()
@@ -499,10 +515,10 @@ class TradingBot:
             self.is_running = False
 
 
-# ---------- CLI ----------
+# ---------- CLI (ENV preference) ----------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['paper','live'], default='paper')
+    parser.add_argument('--mode', choices=['paper','live'], default=os.getenv("MODE", "paper"))
     parser.add_argument('--capital', type=float, default=None)
     args = parser.parse_args()
 
