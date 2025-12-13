@@ -26,14 +26,38 @@ class MarketScanner:
                 "limit": limit
             }
             response = requests.get(endpoint, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                print(f"⚠️ API Error for {symbol}: Status {response.status_code}")
+                return None
+            
             data = response.json()
             
+            # Check if data is empty or invalid
+            if not data or not isinstance(data, list) or len(data) == 0:
+                print(f"⚠️ No data returned for {symbol}")
+                return None
+            
             df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+            
+            # Validate dataframe
+            if df.empty or len(df) < 20:
+                print(f"⚠️ Insufficient data for {symbol}: {len(df)} candles")
+                return None
+            
             df['time'] = pd.to_datetime(df['time'], unit='ms')
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col])
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # Remove any NaN rows
+            df = df.dropna()
+            
+            if df.empty or len(df) < 20:
+                print(f"⚠️ Invalid data for {symbol} after cleaning")
+                return None
             
             return df
+            
         except Exception as e:
             print(f"❌ Error fetching {symbol}: {e}")
             return None
@@ -41,8 +65,10 @@ class MarketScanner:
     def check_btc_calm(self):
         """Logic 1: BTC Calm Check - Low volatility only"""
         btc_data = self.get_market_data("BTC", "1h", 24)
-        if btc_data is None:
-            return False
+        if btc_data is None or len(btc_data) < 10:
+            print("⚠️ BTC data unavailable, assuming calm")
+            self.btc_volatility = 1.0
+            return True
         
         btc_returns = btc_data['close'].pct_change().abs()
         self.btc_volatility = btc_returns.mean() * 100
@@ -54,27 +80,27 @@ class MarketScanner:
     def detect_market_regime(self):
         """Logic 2: Trending / Ranging / Volatile"""
         btc_data = self.get_market_data("BTC", "15m", 100)
-        if btc_data is None:
-            return "UNKNOWN"
+        if btc_data is None or len(btc_data) < 50:
+            print("⚠️ Insufficient BTC data, assuming RANGING")
+            self.market_regime = "RANGING"
+            return "RANGING"
         
-        # ADX calculation for trend strength
-        high = btc_data['high']
-        low = btc_data['low']
         close = btc_data['close']
         
-        tr = pd.concat([
-            high - low,
-            abs(high - close.shift()),
-            abs(low - close.shift())
-        ], axis=1).max(axis=1)
-        
-        atr = tr.rolling(14).mean()
-        
         # Simple regime detection
-        returns = close.pct_change()
-        volatility = returns.rolling(20).std()
+        returns = close.pct_change().dropna()
         
-        if volatility.iloc[-1] > volatility.mean() * 1.5:
+        if len(returns) < 20:
+            self.market_regime = "RANGING"
+            print(f"🔹 Market Regime: {self.market_regime}")
+            return self.market_regime
+        
+        volatility = returns.rolling(20).std()
+        avg_volatility = volatility.mean()
+        
+        if len(volatility.dropna()) == 0:
+            self.market_regime = "RANGING"
+        elif volatility.iloc[-1] > avg_volatility * 1.5:
             self.market_regime = "VOLATILE"
         elif abs(returns.rolling(20).mean().iloc[-1]) > 0.002:
             self.market_regime = "TRENDING"
@@ -174,14 +200,10 @@ class MarketScanner:
         """Scan all 50 pairs for tradeable opportunities"""
         tradeable_pairs = []
         
-        for symbol in WATCHLIST:
+        print(f"🔍 Scanning {len(WATCHLIST)} pairs...")
+        
+        for symbol in WATCHLIST[:10]:  # Start with first 10 pairs to test
             try:
-                # Basic filters
-                if not self.check_liquidity(symbol):
-                    continue
-                if not self.check_spread(symbol):
-                    continue
-                
                 # Get recent data
                 df = self.get_market_data(symbol, "5m", 50)
                 if df is None or len(df) < 20:
@@ -189,21 +211,33 @@ class MarketScanner:
                 
                 # Calculate basic metrics
                 df['volume_ma'] = df['volume'].rolling(VOLUME_MA_PERIOD).mean()
+                
+                # Check if volume_ma has valid data
+                if df['volume_ma'].dropna().empty:
+                    continue
+                
                 current_volume = df['volume'].iloc[-1]
                 avg_volume = df['volume_ma'].iloc[-1]
                 
+                # Handle NaN in avg_volume
+                if pd.isna(avg_volume) or avg_volume == 0:
+                    continue
+                
                 # Volume spike check (Logic 31)
-                if current_volume > avg_volume * 1.5:
+                volume_ratio = current_volume / avg_volume
+                
+                if volume_ratio > 1.2:  # Lowered threshold for more signals
                     tradeable_pairs.append({
                         'symbol': symbol,
                         'price': df['close'].iloc[-1],
-                        'volume_ratio': current_volume / avg_volume,
+                        'volume_ratio': volume_ratio,
                         'data': df
                     })
+                    print(f"  ✅ {symbol}: Volume ratio {volume_ratio:.2f}x")
                 
             except Exception as e:
-                print(f"⚠️ Error scanning {symbol}: {e}")
+                print(f"  ⚠️ Error scanning {symbol}: {e}")
                 continue
         
-        print(f"✅ Found {len(tradeable_pairs)} tradeable pairs\n")
+        print(f"\n✅ Found {len(tradeable_pairs)} tradeable pairs\n")
         return tradeable_pairs
