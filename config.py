@@ -1,26 +1,27 @@
 """
 🔐 CoinDCX Futures Trading Bot - Configuration
 Bangla Version for Best Friend 🇧🇩
+FIXED & STABLE VERSION ✅
 """
 
 import os
-from datetime import time
+from datetime import datetime  # ✅ FIX: time import removed
 
 # ========================
 # 🔑 API CREDENTIALS
 # ========================
-COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "your_api_key_here")
-COINDCX_SECRET = os.getenv("COINDCX_SECRET", "your_secret_here")
+COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
+COINDCX_SECRET = os.getenv("COINDCX_SECRET", "")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "your_telegram_token")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "your_chat_id")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ========================
 # 💰 TRADING PARAMETERS
 # ========================
-MARGIN_PER_TRADE = 3000  # ₹3000 per trade
-LEVERAGE = 5  # 5x leverage
-TARGET_DAILY_PROFIT = 2000  # ₹2000/day
+MARGIN_PER_TRADE = 3000        # ₹3000 per trade
+LEVERAGE = 5                  # 5x leverage
+TARGET_DAILY_PROFIT = 2000    # ₹2000/day
 MAX_DAILY_SIGNALS = 15
 MIN_DAILY_SIGNALS = 10
 
@@ -30,10 +31,10 @@ MIN_DAILY_SIGNALS = 10
 SIGNAL_MODES = {
     "quick": {
         "timeframe": "5m",
-        "hold_time": 15,  # minutes
-        "tp1": 0.6,  # 0.6% TP1
-        "tp2": 1.2,  # 1.2% TP2
-        "sl": 0.4,   # 0.4% SL
+        "hold_time": 15,   # minutes
+        "tp1": 0.6,        # %
+        "tp2": 1.2,
+        "sl": 0.4,
     },
     "mid": {
         "timeframe": "15m",
@@ -52,47 +53,46 @@ SIGNAL_MODES = {
 }
 
 # ========================
-# 📊 WATCHLIST (50 PAIRS)
+# 📊 COINDCX WATCHLIST (20 PAIRS – CORRECT FORMAT)
 # ========================
 WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "MATICUSDT", "DOTUSDT",
-    "LINKUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT", "FILUSDT",
-    "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT",
-    "SUIUSDT", "TIAUSDT", "WLDUSDT", "PEPEUSDT", "SHIBUSDT",
-    "RNDRUSDT", "FETUSDT", "TAOUSDT", "JUPUSDT", "PYTHUSDT",
-    "ALGOUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "ICPUSDT",
-    "AAVEUSDT", "MKRUSDT", "GRTUSDT", "LDOUSDT", "STXUSDT",
-    "FTMUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT", "ORDIUSDT",
-    "SEIUSDT", "RUNEUSDT", "CFXUSDT", "PENDLEUSDT", "ZETAUSDT"
+    "B-BTC_USDT",
+    "B-ETH_USDT",
+    "B-BNB_USDT",
+    "B-SOL_USDT",
+    "B-XRP_USDT",
+    "B-ADA_USDT",
+    "B-DOGE_USDT",
+    "B-AVAX_USDT",
+    "B-MATIC_USDT",
+    "B-DOT_USDT",
+    "B-LINK_USDT",
+    "B-LTC_USDT",
+    "B-UNI_USDT",
+    "B-ATOM_USDT",
+    "B-NEAR_USDT",
+    "B-TRX_USDT",
+    "B-SHIB_USDT",
+    "B-FTM_USDT",
+    "B-ALGO_USDT",
+    "B-VET_USDT",
 ]
 
 # ========================
 # ⚙️ RISK MANAGEMENT
 # ========================
-MIN_RR_RATIO = 1.8  # Minimum 1:1.8 Risk-Reward
-MAX_POSITION_SIZE = 0.15  # 15% of total capital
-LIQUIDATION_BUFFER = 0.25  # 25% buffer from liq price
+MIN_RR_RATIO = 1.8
+MAX_POSITION_SIZE = 0.15          # 15% capital
 MAX_CONSECUTIVE_LOSSES = 3
-COOLDOWN_AFTER_LOSS = 30  # minutes
+COOLDOWN_AFTER_LOSS = 30          # minutes
 
 # ========================
 # 🛡️ MARKET HEALTH FILTERS
 # ========================
-BTC_VOLATILITY_THRESHOLD = 2.5  # Max 2.5% hourly movement
-FUNDING_RATE_EXTREME = 0.05  # ±0.05% threshold
-FEAR_GREED_EXTREME = [10, 90]  # Avoid <10 or >90
-MIN_VOLUME_24H = 1000000  # $1M minimum volume
-MAX_SPREAD_PERCENT = 0.15  # 0.15% max spread
-
-# ========================
-# ⏰ TIME FILTERS
-# ========================
-AVOID_NEWS_HOURS = [
-    (time(17, 30), time(18, 30)),  # US Market Open
-    (time(13, 0), time(13, 30)),   # Asian Lunch
-]
-AVOID_WEEKENDS = False  # CoinDCX trades 24/7
+BTC_VOLATILITY_THRESHOLD = 2.5    # %
+FEAR_GREED_EXTREME = (10, 90)
+MIN_VOLUME_24H = 1_000_000        # $1M
+MAX_SPREAD_PERCENT = 0.15         # %
 
 # ========================
 # 📈 TECHNICAL PARAMETERS
@@ -100,12 +100,15 @@ AVOID_WEEKENDS = False  # CoinDCX trades 24/7
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
+
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
+
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+
 BB_PERIOD = 20
 BB_STD = 2
 VOLUME_MA_PERIOD = 20
@@ -114,22 +117,23 @@ VOLUME_MA_PERIOD = 20
 # 📱 TELEGRAM SETTINGS
 # ========================
 SEND_CHART_WITH_SIGNAL = True
-PERFORMANCE_REPORT_INTERVAL = 3600  # Every hour
+PERFORMANCE_REPORT_INTERVAL = 3600  # seconds
+
 EMOJI_CONFIG = {
-    "long": "🟢",
-    "short": "🔴",
-    "tp1": "🎯",
-    "tp2": "💰",
-    "sl": "🛑",
-    "win": "✅",
-    "loss": "❌",
-    "alert": "⚡",
+    "long": "🟢 LONG",
+    "short": "🔴 SHORT",
+    "tp1": "🎯 TP1",
+    "tp2": "💰 TP2",
+    "sl": "🛑 SL",
+    "win": "✅ WIN",
+    "loss": "❌ LOSS",
+    "alert": "⚡ SIGNAL",
 }
 
 # ========================
 # 🚀 SYSTEM SETTINGS
 # ========================
-SCAN_INTERVAL = 60  # Scan every 60 seconds
+SCAN_INTERVAL = 60        # seconds
 LOG_LEVEL = "INFO"
+DRY_RUN = False           # True = paper trading
 ENABLE_BACKTEST_MODE = False
-DRY_RUN = False  # Set True for paper trading
