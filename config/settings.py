@@ -35,36 +35,34 @@ EXCHANGES = {
 
 # ==================== TRADING CONFIG ====================
 TRADING_CONFIG = {
-    # Multi-symbol Quick mode (15 symbols)
     'symbols': [
-        'BTC/USDT:USDT',
-        'ETH/USDT:USDT',
-        'SOL/USDT:USDT',
-        'BNB/USDT:USDT',
-        'XRP/USDT:USDT',
-        'DOGE/USDT:USDT',
-        'ADA/USDT:USDT',
-        'AVAX/USDT:USDT',
-        'MATIC/USDT:USDT',
-        'DOT/USDT:USDT',
-        'LINK/USDT:USDT',
-        'UNI/USDT:USDT',
-        'ATOM/USDT:USDT',
-        'LTC/USDT:USDT',
-        'BCH/USDT:USDT'
+        'BTC/USDT',
+        'ETH/USDT',
+        'SOL/USDT',
+        'BNB/USDT',
+        'XRP/USDT',
+        'DOGE/USDT',
+        'ADA/USDT',
+        'AVAX/USDT',
+        'DOT/USDT',
+        'LINK/USDT',
+        'UNI/USDT',
+        'ATOM/USDT',
+        'LTC/USDT',
+        'BCH/USDT'
     ],
-    'primary_symbol': 'BTC/USDT:USDT',
-    # interval for checks (in seconds) - 300s = 5 minutes
-    'check_interval': 300,
-    'timeframe': '15m',
-    'initial_capital': 10000,  # INR
+
+    'primary_symbol': 'BTC/USDT',
+    'timeframe': '5m',          # ✅ 5 min
+    'initial_capital': 10000,
     'max_leverage': 7,
     'min_leverage': 3,
-    'position_size_percent': 0.15,  # 15% per trade
-    'max_positions': 5,              # increase for multi-symbol scanning
-    'max_daily_trades': 25,          # allow more trades per day in quick mode
-    'max_daily_loss_percent': 0.20,  # 20%
+    'position_size_percent': 0.15,
+    'max_positions': 3,
+    'max_daily_trades': 8,
+    'max_daily_loss_percent': 0.20,
     'max_trade_duration_hours': 4,
+}
 
     # Quick fix ML toggle: if False -> TA-only (no ML required)
     'ml_required': False,
