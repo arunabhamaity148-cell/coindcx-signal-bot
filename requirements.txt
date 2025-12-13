@@ -1,20 +1,27 @@
-# Core Dependencies
-python-dotenv==1.0.0
-aiohttp==3.9.1
+# CoinDCX Futures Trading Bot Dependencies
+# Install: pip install -r requirements.txt
+
+# Core
+requests==2.31.0
+pandas==2.2.0
+numpy==1.26.3
+
+# Technical Analysis
+ta==0.11.0
+scipy==1.12.0
+
+# Charting
+matplotlib==3.8.2
+plotly==5.18.0
+
+# Async & Scheduling (for future upgrades)
 asyncio==3.4.3
-
-# Data Processing
-pandas==2.1.4
-numpy==1.26.2
-
-# Telegram Bot
-python-telegram-bot==20.7
-
-# Database
-sqlite3
+schedule==1.2.0
 
 # Utilities
-logging
+python-dotenv==1.0.0
+pytz==2023.3
 
-# API
-requests==2.31.0
+# Optional: For advanced features
+# websocket-client==1.7.0  # For real-time data
+# ccxt==4.2.0  # Alternative exchange library
