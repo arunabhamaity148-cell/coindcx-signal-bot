@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import logging
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -144,20 +144,23 @@ class DataCollector:
             return 0
     
     def fetch_open_interest(self, symbol: str, exchange_name: str = 'bybit') -> float:
-        """Fetch open interest"""
+        """Fetch open interest - only for contract markets"""
         try:
+            # Skip spot markets (no OI)
+            if not symbol.endswith(':USDT'):
+                logger.debug("OI skipped for spot %s", symbol)
+                return 0.0
+            
             exchange = self.exchanges[exchange_name]
             oi = exchange.fetch_open_interest(symbol)
             return float(oi.get('openInterest', 0))
         except Exception as e:
-            logger.error(f"❌ Open interest error: {e}")
-            return 0
+            logger.debug("OI error for %s: %s", symbol, e)
+            return 0.0
     
     def fetch_liquidations(self, symbol: str, exchange_name: str = 'bybit') -> List:
         """Fetch recent liquidations (if available)"""
         try:
-            # Note: Not all exchanges provide this via API
-            # You may need to use exchange-specific endpoints
             logger.warning("Liquidation data not available via standard API")
             return []
         except Exception as e:
@@ -245,4 +248,4 @@ if __name__ == "__main__":
     
     # Test cross-exchange
     divergence = collector.calculate_price_divergence('BTC/USDT:USDT')
-    print(f"Price divergence: {divergence}") 
+    print(f"Price divergence: {divergence}")
