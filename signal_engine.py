@@ -45,10 +45,21 @@ class SignalEngine:
     
     def check_ema_trend(self, df):
         """Logic 11-12: EMA Trend Alignment"""
+        if len(df) < EMA_SLOW:
+            return "NEUTRAL"
+        
         close = df['close']
         ema20 = self.calculate_ema(close, EMA_FAST)
         ema50 = self.calculate_ema(close, EMA_MID)
         ema200 = self.calculate_ema(close, EMA_SLOW)
+        
+        # Drop NaN values
+        ema20 = ema20.dropna()
+        ema50 = ema50.dropna()
+        ema200 = ema200.dropna()
+        
+        if len(ema20) == 0 or len(ema50) == 0 or len(ema200) == 0:
+            return "NEUTRAL"
         
         df['ema20'] = ema20
         df['ema50'] = ema50
@@ -69,8 +80,14 @@ class SignalEngine:
     
     def check_market_structure(self, df):
         """Logic 13: Higher High / Lower Low Detection"""
-        highs = df['high'].rolling(5).max()
-        lows = df['low'].rolling(5).min()
+        if len(df) < 10:
+            return "NEUTRAL_STRUCTURE"
+        
+        highs = df['high'].rolling(5).max().dropna()
+        lows = df['low'].rolling(5).min().dropna()
+        
+        if len(highs) < 5 or len(lows) < 5:
+            return "NEUTRAL_STRUCTURE"
         
         # Check last 3 swings
         recent_highs = highs.tail(10).values
@@ -227,89 +244,98 @@ class SignalEngine:
         symbol = pair_data['symbol']
         df = pair_data['data'].copy()
         
-        if len(df) < 200:
+        if len(df) < 50:  # Reduced from 200
             return None
         
-        # Apply all filters
-        ema_trend = self.check_ema_trend(df)
-        structure = self.check_market_structure(df)
-        rsi_signals = self.check_rsi_conditions(df)
-        macd_signals = self.check_macd_signals(df)
-        bb_signals = self.check_bollinger_bands(df)
-        volume_status = self.check_volume_confirmation(df)
-        vwap_status = self.check_vwap(df)
-        
-        # Anti-trap filters
-        if not self.check_manipulation_filter(df):
-            return None
-        
-        current_price = df['close'].iloc[-1]
-        if self.check_round_number_trap(current_price):
-            return None
-        
-        # Logic 45: One-side lock (no conflict)
-        if symbol in self.last_signal_time:
-            time_diff = (datetime.now() - self.last_signal_time[symbol]).seconds / 60
-            if time_diff < SIGNAL_MODES[mode]['hold_time']:
+        try:
+            # Apply all filters
+            ema_trend = self.check_ema_trend(df)
+            structure = self.check_market_structure(df)
+            rsi_signals = self.check_rsi_conditions(df)
+            macd_signals = self.check_macd_signals(df)
+            bb_signals = self.check_bollinger_bands(df)
+            volume_status = self.check_volume_confirmation(df)
+            vwap_status = self.check_vwap(df)
+            
+            # Anti-trap filters
+            if not self.check_manipulation_filter(df):
                 return None
-        
-        # Logic 43: Consecutive loss cooldown
-        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            
+            current_price = df['close'].iloc[-1]
+            if self.check_round_number_trap(current_price):
+                return None
+            
+            # Logic 45: One-side lock (no conflict)
+            if symbol in self.last_signal_time:
+                time_diff = (datetime.now() - self.last_signal_time[symbol]).seconds / 60
+                if time_diff < SIGNAL_MODES[mode]['hold_time']:
+                    return None
+            
+            # Logic 43: Consecutive loss cooldown
+            if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                return None
+            
+            # LONG SIGNAL LOGIC
+            long_score = 0
+            if ema_trend == "BULL": long_score += 2
+            if structure == "BULLISH_STRUCTURE": long_score += 2
+            if "RSI_OVERSOLD_REVERSAL" in rsi_signals: long_score += 2
+            if "MACD_BULLISH_CROSS" in macd_signals: long_score += 2
+            if "BB_OVERSOLD" in bb_signals: long_score += 1
+            if volume_status == "VOLUME_SPIKE": long_score += 2
+            if vwap_status == "VWAP_RECLAIM": long_score += 2
+            
+            # SHORT SIGNAL LOGIC
+            short_score = 0
+            if ema_trend == "BEAR": short_score += 2
+            if structure == "BEARISH_STRUCTURE": short_score += 2
+            if "RSI_OVERBOUGHT_REJECTION" in rsi_signals: short_score += 2
+            if "MACD_BEARISH_CROSS" in macd_signals: short_score += 2
+            if "BB_OVERBOUGHT" in bb_signals: short_score += 1
+            if volume_status == "VOLUME_SPIKE": short_score += 2
+            if vwap_status == "VWAP_REJECTION": short_score += 2
+            
+            # Get RSI value safely
+            rsi_value = df.get('rsi', pd.Series([50])).iloc[-1] if 'rsi' in df.columns else 50
+            macd_hist_value = df.get('macd_hist', pd.Series([0])).iloc[-1] if 'macd_hist' in df.columns else 0
+            
+            # Minimum 6/15 score to signal (lowered threshold)
+            if long_score >= 6:
+                self.last_signal_time[symbol] = datetime.now()
+                return {
+                    'symbol': symbol,
+                    'direction': 'LONG',
+                    'entry_price': current_price,
+                    'score': long_score,
+                    'mode': mode,
+                    'timestamp': datetime.now(),
+                    'indicators': {
+                        'ema_trend': ema_trend,
+                        'rsi': rsi_value,
+                        'macd_hist': macd_hist_value,
+                        'volume_ratio': volume_status
+                    }
+                }
+            
+            elif short_score >= 6:
+                self.last_signal_time[symbol] = datetime.now()
+                return {
+                    'symbol': symbol,
+                    'direction': 'SHORT',
+                    'entry_price': current_price,
+                    'score': short_score,
+                    'mode': mode,
+                    'timestamp': datetime.now(),
+                    'indicators': {
+                        'ema_trend': ema_trend,
+                        'rsi': rsi_value,
+                        'macd_hist': macd_hist_value,
+                        'volume_ratio': volume_status
+                    }
+                }
+            
+        except Exception as e:
+            print(f"⚠️ Signal generation error for {symbol}: {e}")
             return None
-        
-        # LONG SIGNAL LOGIC
-        long_score = 0
-        if ema_trend == "BULL": long_score += 2
-        if structure == "BULLISH_STRUCTURE": long_score += 2
-        if "RSI_OVERSOLD_REVERSAL" in rsi_signals: long_score += 2
-        if "MACD_BULLISH_CROSS" in macd_signals: long_score += 2
-        if "BB_OVERSOLD" in bb_signals: long_score += 1
-        if volume_status == "VOLUME_SPIKE": long_score += 2
-        if vwap_status == "VWAP_RECLAIM": long_score += 2
-        
-        # SHORT SIGNAL LOGIC
-        short_score = 0
-        if ema_trend == "BEAR": short_score += 2
-        if structure == "BEARISH_STRUCTURE": short_score += 2
-        if "RSI_OVERBOUGHT_REJECTION" in rsi_signals: short_score += 2
-        if "MACD_BEARISH_CROSS" in macd_signals: short_score += 2
-        if "BB_OVERBOUGHT" in bb_signals: short_score += 1
-        if volume_status == "VOLUME_SPIKE": short_score += 2
-        if vwap_status == "VWAP_REJECTION": short_score += 2
-        
-        # Minimum 8/15 score to signal
-        if long_score >= 8:
-            self.last_signal_time[symbol] = datetime.now()
-            return {
-                'symbol': symbol,
-                'direction': 'LONG',
-                'entry_price': current_price,
-                'score': long_score,
-                'mode': mode,
-                'timestamp': datetime.now(),
-                'indicators': {
-                    'ema_trend': ema_trend,
-                    'rsi': df['rsi'].iloc[-1],
-                    'macd_hist': df['macd_hist'].iloc[-1],
-                    'volume_ratio': volume_status
-                }
-            }
-        
-        elif short_score >= 8:
-            self.last_signal_time[symbol] = datetime.now()
-            return {
-                'symbol': symbol,
-                'direction': 'SHORT',
-                'entry_price': current_price,
-                'score': short_score,
-                'mode': mode,
-                'timestamp': datetime.now(),
-                'indicators': {
-                    'ema_trend': ema_trend,
-                    'rsi': df['rsi'].iloc[-1],
-                    'macd_hist': df['macd_hist'].iloc[-1],
-                    'volume_ratio': volume_status
-                }
-            }
         
         return None
