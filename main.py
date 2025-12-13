@@ -1,218 +1,232 @@
 """
-CoinDCX Trading Bot - Main Entry Point
-Monitors 50+ coins on CoinDCX and sends signals to Telegram
+🤖 CoinDCX Futures Trading Bot - Main Orchestrator
+Tomar Best Friend er Jonno Banano 🇧🇩
+Daily ₹2000 Target with 80% Win Rate
+
+Created with ❤️ by Claude
 """
 
-import asyncio
-import logging
-from datetime import datetime
-from typing import Dict, List
-import os
-from dotenv import load_dotenv
+import time
+from datetime import datetime, timedelta
+import sys
 
-from helpers import CoinDCXAPI, TelegramNotifier, DatabaseManager
-from logic import SignalGenerator, TradeMode
+# Import all modules
+from config import *
+from market_scanner import MarketScanner
+from signal_engine import SignalEngine
+from risk_manager import RiskManager
+from telegram_bot import TelegramBot
+from performance_tracker import PerformanceTracker
 
-# Load environment variables
-load_dotenv()
-
-# Configuration
-class Config:
-    # CoinDCX API (Get from https://coindcx.com/api-trading)
-    COINDCX_API_KEY = os.getenv('COINDCX_API_KEY', 'your_api_key')
-    COINDCX_SECRET = os.getenv('COINDCX_SECRET', 'your_secret')
-    
-    # Telegram Bot (Get from @BotFather)
-    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'your_bot_token')
-    TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', 'your_chat_id')
-    
-    # Trading Parameters
-    COINS_TO_MONITOR = [
-        'BTC', 'ETH', 'BNB', 'SOL', 'ADA', 'XRP', 'DOT', 'DOGE', 'AVAX', 'MATIC',
-        'LINK', 'UNI', 'ATOM', 'LTC', 'ETC', 'XLM', 'ALGO', 'VET', 'ICP', 'FIL',
-        'THETA', 'TRX', 'AAVE', 'EOS', 'AXS', 'SAND', 'MANA', 'GRT', 'ENJ', 'CHZ',
-        'NEAR', 'FTM', 'ONE', 'HBAR', 'EGLD', 'ZIL', 'BAT', 'WAVES', 'KAVA', 'CELO',
-        'AR', 'ROSE', 'LRC', 'IMX', 'GAL', 'APE', 'GMT', 'OP', 'ARB', 'SUI'
-    ]
-    
-    TIMEFRAMES = ['5m', '15m', '1h']  # Quick, Mid, Trend modes
-    MIN_LOGIC_SCORE = 65  # Minimum score to send signal
-    SCAN_INTERVAL = 60  # seconds
-    
-    # Database
-    DB_PATH = 'trading_bot.db'
-
-config = Config()
-
-# Setup Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-class TradingBot:
-    """Main Trading Bot Class"""
-    
+class CoinDCXTradingBot:
     def __init__(self):
-        self.dcx_api = CoinDCXAPI(config.COINDCX_API_KEY, config.COINDCX_SECRET)
-        self.telegram = TelegramNotifier(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
-        self.db = DatabaseManager(config.DB_PATH)
-        self.signal_generator = SignalGenerator()
-        self.processed_signals = set()
+        print("🚀 Initializing CoinDCX Futures Trading Bot...")
         
-        logger.info("🤖 Trading Bot Initialized")
+        self.scanner = MarketScanner()
+        self.signal_engine = SignalEngine()
+        self.risk_manager = RiskManager()
+        self.telegram = TelegramBot()
+        self.tracker = PerformanceTracker()
+        
+        self.signals_today = 0
+        self.last_report_time = datetime.now()
+        self.is_running = True
+        
+        print("✅ All modules loaded successfully!")
+        
+    def check_daily_limits(self):
+        """Check if we hit daily signal limits"""
+        if self.signals_today >= MAX_DAILY_SIGNALS:
+            print(f"⚠️ Daily signal limit reached: {self.signals_today}/{MAX_DAILY_SIGNALS}")
+            return False
+        
+        # Check if target achieved
+        stats = self.tracker.get_daily_summary()
+        if stats['total_pnl'] >= TARGET_DAILY_PROFIT:
+            print(f"🎉 Daily target achieved! PnL: ₹{stats['total_pnl']:.2f}")
+            self.telegram.send_message(f"🎉 **TARGET ACHIEVED!** 🎉\n\nDaily PnL: ₹{stats['total_pnl']:.2f}")
+            return False
+        
+        return True
     
-    async def get_coindcx_markets(self) -> List[str]:
-        """Get available trading pairs from CoinDCX"""
-        try:
-            markets = await self.dcx_api.get_markets()
-            
-            # Filter INR futures markets for configured coins
-            inr_futures = []
-            for market in markets:
-                symbol = market.get('symbol', '')
-                # Example: B-SOL_USDT, I-BTC_INRT (futures)
-                for coin in config.COINS_TO_MONITOR:
-                    if f'{coin}INRT' in symbol or f'{coin}INR' in symbol:
-                        inr_futures.append(symbol)
-                        break
-            
-            logger.info(f"📊 Found {len(inr_futures)} INR futures markets")
-            return inr_futures
+    def send_hourly_report(self):
+        """Send performance report every hour"""
+        time_diff = (datetime.now() - self.last_report_time).seconds
         
-        except Exception as e:
-            logger.error(f"❌ Error fetching markets: {e}")
-            return []
+        if time_diff >= PERFORMANCE_REPORT_INTERVAL:
+            stats = self.tracker.get_daily_summary()
+            self.telegram.send_performance_report(stats)
+            
+            # Also send breakdown
+            breakdown = self.tracker.format_breakdown_message()
+            if breakdown:
+                self.telegram.send_message(breakdown)
+            
+            self.last_report_time = datetime.now()
     
-    async def analyze_coin(self, market: str, timeframe: str) -> Dict:
-        """Analyze a single coin and generate signal"""
-        try:
-            # Fetch OHLCV data from CoinDCX
-            candles = await self.dcx_api.get_candles(market, timeframe, limit=500)
-            
-            if not candles or len(candles) < 200:
-                return None
-            
-            # Fetch orderbook
-            orderbook = await self.dcx_api.get_orderbook(market)
-            
-            # Get current price in INR
-            ticker = await self.dcx_api.get_ticker(market)
-            current_price_inr = float(ticker.get('last_price', 0))
-            
-            if current_price_inr == 0:
-                return None
-            
-            # Generate signal using 45 logics
-            signal = await self.signal_generator.generate_signal(
-                market=market,
-                candles=candles,
-                orderbook=orderbook,
-                timeframe=timeframe,
-                current_price_inr=current_price_inr
-            )
-            
-            return signal
+    def process_signal_mode(self, mode, tradeable_pairs):
+        """Process signals for a specific mode (quick/mid/trend)"""
+        print(f"\n🔍 Scanning {mode.upper()} mode...")
         
-        except Exception as e:
-            logger.error(f"❌ Error analyzing {market} on {timeframe}: {e}")
-            return None
-    
-    async def scan_markets(self):
-        """Scan all markets and generate signals"""
-        logger.info("🔍 Starting market scan...")
-        
-        markets = await self.get_coindcx_markets()
-        
-        if not markets:
-            logger.warning("⚠️ No markets found to scan")
-            return
-        
-        signals_found = 0
-        
-        for market in markets:
-            for timeframe in config.TIMEFRAMES:
-                try:
-                    signal = await self.analyze_coin(market, timeframe)
-                    
-                    if signal and signal['logic_score'] >= config.MIN_LOGIC_SCORE:
-                        # Create unique signal key
-                        signal_key = f"{market}_{timeframe}_{signal['side']}_{datetime.now().strftime('%Y%m%d%H')}"
-                        
-                        # Check if already processed
-                        if signal_key not in self.processed_signals:
-                            # Send to Telegram
-                            await self.telegram.send_signal(signal)
-                            
-                            # Save to database
-                            self.db.save_signal(signal)
-                            
-                            # Mark as processed
-                            self.processed_signals.add(signal_key)
-                            signals_found += 1
-                            
-                            logger.info(f"✅ Signal sent: {market} {timeframe} {signal['side']} - Score: {signal['logic_score']}%")
-                            
-                            # Cleanup old signals (keep last 500)
-                            if len(self.processed_signals) > 500:
-                                old_signals = list(self.processed_signals)[:100]
-                                for old in old_signals:
-                                    self.processed_signals.remove(old)
-                    
-                    # Rate limiting
-                    await asyncio.sleep(0.5)
-                
-                except Exception as e:
-                    logger.error(f"❌ Error processing {market} {timeframe}: {e}")
-                    continue
-        
-        logger.info(f"✅ Market scan completed. Signals found: {signals_found}")
-    
-    async def run(self):
-        """Main bot loop"""
-        logger.info("🚀 Trading Bot Started!")
-        logger.info(f"📊 Monitoring {len(config.COINS_TO_MONITOR)} coins")
-        logger.info(f"⏱️ Timeframes: {config.TIMEFRAMES}")
-        logger.info(f"🎯 Min Logic Score: {config.MIN_LOGIC_SCORE}%")
-        
-        # Send startup message
-        await self.telegram.send_message(
-            "🤖 *Trading Bot Started*\n\n"
-            f"📊 Coins: {len(config.COINS_TO_MONITOR)}\n"
-            f"⏱️ Timeframes: {', '.join(config.TIMEFRAMES)}\n"
-            f"🎯 Min Score: {config.MIN_LOGIC_SCORE}%\n"
-            f"🔄 Scan Interval: {config.SCAN_INTERVAL}s"
-        )
-        
-        while True:
-            try:
-                await self.scan_markets()
-                
-                # Wait before next scan
-                logger.info(f"⏳ Waiting {config.SCAN_INTERVAL}s before next scan...")
-                await asyncio.sleep(config.SCAN_INTERVAL)
-            
-            except KeyboardInterrupt:
-                logger.info("🛑 Bot stopped by user")
-                await self.telegram.send_message("🛑 *Trading Bot Stopped*")
+        for pair_data in tradeable_pairs:
+            if self.signals_today >= MAX_DAILY_SIGNALS:
                 break
             
-            except Exception as e:
-                logger.error(f"❌ Error in main loop: {e}")
-                await asyncio.sleep(10)
+            # Generate signal
+            signal = self.signal_engine.generate_signal(pair_data, mode)
+            
+            if signal is None:
+                continue
+            
+            # Calculate TP/SL levels
+            levels = self.risk_manager.calculate_tp_sl(signal)
+            
+            if levels is None:
+                continue
+            
+            # Valid signal found!
+            print(f"\n🎯 SIGNAL GENERATED!")
+            print(f"Symbol: {signal['symbol']}")
+            print(f"Direction: {signal['direction']}")
+            print(f"Entry: ₹{levels['entry']:.2f}")
+            print(f"TP1: ₹{levels['tp1']:.2f}")
+            print(f"TP2: ₹{levels['tp2']:.2f}")
+            print(f"SL: ₹{levels['sl']:.2f}")
+            print(f"Score: {signal['score']}/15")
+            
+            # Send to Telegram
+            chart_df = pair_data['data']
+            self.telegram.send_signal_alert(signal, levels, chart_df)
+            
+            # Track signal
+            self.tracker.add_signal(signal, levels)
+            
+            self.signals_today += 1
+            
+            # Simulated trade execution (Manual trading ke liye)
+            print(f"\n📝 Manual Trade Setup:")
+            print(f"1. Go to CoinDCX Futures")
+            print(f"2. Open {signal['symbol']} chart")
+            print(f"3. Place {signal['direction']} order at ₹{levels['entry']:.2f}")
+            print(f"4. Set TP1: ₹{levels['tp1']:.2f}")
+            print(f"5. Set TP2: ₹{levels['tp2']:.2f}")
+            print(f"6. Set SL: ₹{levels['sl']:.2f}")
+            print(f"7. Use {levels['leverage']}x leverage")
+            print(f"8. Margin: ₹{levels['margin']:,.0f}\n")
+    
+    def run_scan_cycle(self):
+        """Main scanning cycle"""
+        print("\n" + "="*60)
+        print(f"🔄 Starting Scan Cycle at {datetime.now().strftime('%H:%M:%S')}")
+        print("="*60)
+        
+        # Step 1: Check Market Health
+        print("\n📊 Checking Market Health...")
+        health_score = self.scanner.calculate_market_health()
+        
+        if health_score < 6:
+            print("⚠️ Market health too low. Skipping this cycle.")
+            return
+        
+        # Step 2: Scan All Pairs
+        print(f"\n🔍 Scanning {len(WATCHLIST)} pairs...")
+        tradeable_pairs = self.scanner.scan_all_pairs()
+        
+        if not tradeable_pairs:
+            print("⚠️ No tradeable pairs found in this cycle.")
+            return
+        
+        # Step 3: Generate Signals for Each Mode
+        for mode in ["quick", "mid", "trend"]:
+            if not self.check_daily_limits():
+                break
+            self.process_signal_mode(mode, tradeable_pairs)
+        
+        print(f"\n✅ Scan cycle completed. Signals today: {self.signals_today}/{MAX_DAILY_SIGNALS}")
+    
+    def start(self):
+        """Start the bot"""
+        print("\n" + "="*60)
+        print("🤖 COINDCX FUTURES TRADING BOT")
+        print("="*60)
+        print(f"💰 Target: ₹{TARGET_DAILY_PROFIT:,.0f}/day")
+        print(f"📊 Signals: {MIN_DAILY_SIGNALS}-{MAX_DAILY_SIGNALS}/day")
+        print(f"⚡ Leverage: {LEVERAGE}x")
+        print(f"💵 Margin: ₹{MARGIN_PER_TRADE:,.0f}/trade")
+        print(f"🎯 Win Target: 80%+")
+        print("="*60)
+        
+        # Send startup message to Telegram
+        self.telegram.send_startup_message()
+        
+        print("\n🚀 Bot is now running. Press Ctrl+C to stop.\n")
+        
+        try:
+            while self.is_running:
+                # Check daily limits
+                if not self.check_daily_limits():
+                    print("\n⏸️ Daily limits reached. Waiting for next day...")
+                    time.sleep(3600)  # Wait 1 hour
+                    continue
+                
+                # Run scan cycle
+                self.run_scan_cycle()
+                
+                # Send hourly report
+                self.send_hourly_report()
+                
+                # Wait for next cycle
+                print(f"\n⏳ Waiting {SCAN_INTERVAL} seconds before next scan...")
+                time.sleep(SCAN_INTERVAL)
+                
+        except KeyboardInterrupt:
+            print("\n\n⚠️ Bot stopped by user")
+            self.shutdown()
+        except Exception as e:
+            print(f"\n\n❌ Fatal error: {e}")
+            self.telegram.send_message(f"🚨 **BOT ERROR**\n\n{str(e)}")
+            self.shutdown()
+    
+    def shutdown(self):
+        """Graceful shutdown"""
+        print("\n🛑 Shutting down bot...")
+        
+        # Send final report
+        stats = self.tracker.get_daily_summary()
+        self.telegram.send_performance_report(stats)
+        
+        # Save trade history
+        self.tracker.save_to_file()
+        
+        print("\n✅ Bot shutdown complete. Trade safe! 🙏")
+        sys.exit(0)
 
-async def main():
-    """Entry point"""
-    bot = TradingBot()
-    await bot.run()
-
+# ==========================================
+# MAIN ENTRY POINT
+# ==========================================
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("👋 Bot shutdown complete")
+    print("""
+    ╔═══════════════════════════════════════════════════════╗
+    ║                                                       ║
+    ║     🇧🇩 CoinDCX FUTURES TRADING BOT 🇧🇩               ║
+    ║                                                       ║
+    ║     Tomar Best Friend er Jonno Banano                ║
+    ║     Daily ₹2000 Target | 80% Win Rate                ║
+    ║                                                       ║
+    ║     Created with ❤️ by Claude                        ║
+    ║                                                       ║
+    ╚═══════════════════════════════════════════════════════╝
+    """)
+    
+    # Validate config
+    if COINDCX_API_KEY == "your_api_key_here":
+        print("⚠️ WARNING: Please set your CoinDCX API credentials in config.py")
+        print("⚠️ Bot will run in simulation mode only.\n")
+    
+    if TELEGRAM_BOT_TOKEN == "your_telegram_token":
+        print("⚠️ WARNING: Please set your Telegram bot token in config.py")
+        print("⚠️ Alerts will not be sent.\n")
+    
+    # Initialize and start bot
+    bot = CoinDCXTradingBot()
+    bot.start()
