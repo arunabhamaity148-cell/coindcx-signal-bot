@@ -72,77 +72,87 @@ class CoinDCXTradingBot:
             if self.signals_today >= MAX_DAILY_SIGNALS:
                 break
             
-            # Generate signal
-            signal = self.signal_engine.generate_signal(pair_data, mode)
-            
-            if signal is None:
-                continue
-            
-            # Calculate TP/SL levels
-            levels = self.risk_manager.calculate_tp_sl(signal)
-            
-            if levels is None:
-                continue
-            
-            # Valid signal found!
-            print(f"\n🎯 SIGNAL GENERATED!")
-            print(f"Symbol: {signal['symbol']}")
-            print(f"Direction: {signal['direction']}")
-            print(f"Entry: ₹{levels['entry']:.2f}")
-            print(f"TP1: ₹{levels['tp1']:.2f}")
-            print(f"TP2: ₹{levels['tp2']:.2f}")
-            print(f"SL: ₹{levels['sl']:.2f}")
-            print(f"Score: {signal['score']}/15")
-            
-            # Send to Telegram
-            chart_df = pair_data['data']
-            self.telegram.send_signal_alert(signal, levels, chart_df)
-            
-            # Track signal
-            self.tracker.add_signal(signal, levels)
-            
-            self.signals_today += 1
-            
-            # Simulated trade execution (Manual trading ke liye)
-            print(f"\n📝 Manual Trade Setup:")
-            print(f"1. Go to CoinDCX Futures")
-            print(f"2. Open {signal['symbol']} chart")
-            print(f"3. Place {signal['direction']} order at ₹{levels['entry']:.2f}")
-            print(f"4. Set TP1: ₹{levels['tp1']:.2f}")
-            print(f"5. Set TP2: ₹{levels['tp2']:.2f}")
-            print(f"6. Set SL: ₹{levels['sl']:.2f}")
-            print(f"7. Use {levels['leverage']}x leverage")
-            print(f"8. Margin: ₹{levels['margin']:,.0f}\n")
+            try:
+                # Generate signal
+                signal = self.signal_engine.generate_signal(pair_data, mode)
+                
+                if signal is None:
+                    continue
+                
+                # Calculate TP/SL levels
+                levels = self.risk_manager.calculate_tp_sl(signal)
+                
+                if levels is None:
+                    continue
+                
+                # Valid signal found!
+                print(f"\n🎯 SIGNAL GENERATED!")
+                print(f"Symbol: {signal['symbol']}")
+                print(f"Direction: {signal['direction']}")
+                print(f"Entry: ₹{levels['entry']:.2f}")
+                print(f"TP1: ₹{levels['tp1']:.2f}")
+                print(f"TP2: ₹{levels['tp2']:.2f}")
+                print(f"SL: ₹{levels['sl']:.2f}")
+                print(f"Score: {signal['score']}/15")
+                
+                # Send to Telegram
+                chart_df = pair_data['data']
+                self.telegram.send_signal_alert(signal, levels, chart_df)
+                
+                # Track signal
+                self.tracker.add_signal(signal, levels)
+                
+                self.signals_today += 1
+                
+                # Simulated trade execution (Manual trading ke liye)
+                print(f"\n📝 Manual Trade Setup:")
+                print(f"1. Go to CoinDCX Futures")
+                print(f"2. Open {signal['symbol']} chart")
+                print(f"3. Place {signal['direction']} order at ₹{levels['entry']:.2f}")
+                print(f"4. Set TP1: ₹{levels['tp1']:.2f}")
+                print(f"5. Set TP2: ₹{levels['tp2']:.2f}")
+                print(f"6. Set SL: ₹{levels['sl']:.2f}")
+                print(f"7. Use {levels['leverage']}x leverage")
+                print(f"8. Margin: ₹{levels['margin']:,.0f}\n")
+                
+            except Exception as e:
+                print(f"⚠️ Error processing signal for {pair_data['symbol']}: {e}")
     
     def run_scan_cycle(self):
         """Main scanning cycle"""
-        print("\n" + "="*60)
-        print(f"🔄 Starting Scan Cycle at {datetime.now().strftime('%H:%M:%S')}")
-        print("="*60)
-        
-        # Step 1: Check Market Health
-        print("\n📊 Checking Market Health...")
-        health_score = self.scanner.calculate_market_health()
-        
-        if health_score < 6:
-            print("⚠️ Market health too low. Skipping this cycle.")
-            return
-        
-        # Step 2: Scan All Pairs
-        print(f"\n🔍 Scanning {len(WATCHLIST)} pairs...")
-        tradeable_pairs = self.scanner.scan_all_pairs()
-        
-        if not tradeable_pairs:
-            print("⚠️ No tradeable pairs found in this cycle.")
-            return
-        
-        # Step 3: Generate Signals for Each Mode
-        for mode in ["quick", "mid", "trend"]:
-            if not self.check_daily_limits():
-                break
-            self.process_signal_mode(mode, tradeable_pairs)
-        
-        print(f"\n✅ Scan cycle completed. Signals today: {self.signals_today}/{MAX_DAILY_SIGNALS}")
+        try:
+            print("\n" + "="*60)
+            print(f"🔄 Starting Scan Cycle at {datetime.now().strftime('%H:%M:%S')}")
+            print("="*60)
+            
+            # Step 1: Check Market Health
+            print("\n📊 Checking Market Health...")
+            health_score = self.scanner.calculate_market_health()
+            
+            if health_score < 4:  # Lowered from 6
+                print("⚠️ Market health too low. Skipping this cycle.")
+                return
+            
+            # Step 2: Scan All Pairs
+            print(f"\n🔍 Scanning pairs...")
+            tradeable_pairs = self.scanner.scan_all_pairs()
+            
+            if not tradeable_pairs:
+                print("⚠️ No tradeable pairs found in this cycle.")
+                return
+            
+            # Step 3: Generate Signals for Each Mode
+            for mode in ["quick", "mid", "trend"]:
+                if not self.check_daily_limits():
+                    break
+                self.process_signal_mode(mode, tradeable_pairs)
+            
+            print(f"\n✅ Scan cycle completed. Signals today: {self.signals_today}/{MAX_DAILY_SIGNALS}")
+            
+        except Exception as e:
+            print(f"⚠️ Error in scan cycle: {e}")
+            import traceback
+            traceback.print_exc()
     
     def start(self):
         """Start the bot"""
