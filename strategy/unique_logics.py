@@ -1,10 +1,6 @@
 """
-UNIQUE TRADING LOGICS - 45 Advanced Strategies
+UNIQUE TRADING LOGICS – 45 Advanced Strategies
 Includes: Liquidation, Gamma, Funding, OB, CVD, VWAP + More
-
-This is the original code you provided, with one non-invasive addition:
- - evaluate_all_logics(...) method added (aggregates all checks and returns a summary)
-All original functions and logic are kept intact and unmodified.
 """
 import pandas as pd
 import numpy as np
@@ -126,6 +122,7 @@ class UniqueLogics:
         return is_good
 
     # ==================== B) PRICE ACTION & STRUCTURE (7) ====================
+
     def check_breakout_confirmation(self, candle: pd.Series) -> bool:
         """9. Breakout confirmation (body > wick)"""
         body = abs(candle['close'] - candle['open'])
@@ -167,8 +164,7 @@ class UniqueLogics:
         if len(df) < 50:
             return {'found': False}
 
-    # (part 1 ends here — parts 2 & 3 contain the rest unchanged plus evaluate_all_logics)
-# Find significant price zones (high volume candles)
+        # Find significant price zones (high volume candles)
         df_copy = df.copy()
         df_copy['vol_rank'] = df_copy['volume'].rank(pct=True)
         high_vol_zones = df_copy[df_copy['vol_rank'] > 0.9].tail(10)
@@ -349,7 +345,7 @@ class UniqueLogics:
         if len(df) < 20:
             return 0
 
-        roc = ((df['close'].iloc[-1] - df['close'].iloc[-20]) / 
+        roc = ((df['close'].iloc[-1] - df['close'].iloc[-20]) /
                df['close'].iloc[-20]) * 100
         return roc
 
@@ -501,6 +497,7 @@ class UniqueLogics:
         return velocity
 
     # ==================== E) DERIVATIVES & FUTURES LOGICS (6) ====================
+
     def check_oi_trend(self, oi_history: list) -> str:
         """32. Open interest trend"""
         if len(oi_history) < 10:
@@ -518,7 +515,8 @@ class UniqueLogics:
             return 'decreasing'
         else:
             return 'stable'
-def check_oi_divergence(self, df: pd.DataFrame, oi_history: list) -> str:
+
+    def check_oi_divergence(self, df: pd.DataFrame, oi_history: list) -> str:
         """33. OI divergence (price vs OI conflict)"""
         if len(oi_history) < 10 or len(df) < 10:
             return 'neutral'
@@ -850,11 +848,9 @@ def check_oi_divergence(self, df: pd.DataFrame, oi_history: list) -> str:
         return result
 
     # ----------------- Helper indicator functions (repeated for completeness) -----------------
-    # (these methods exist earlier in file — kept to ensure Part3 is standalone if needed)
     def _calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
-        # duplicate-safe simple wrapper to earlier implementation (kept small)
         try:
-            return super()._calculate_adx(df, period)  # use parent if present
+            return super()._calculate_adx(df, period)
         except Exception:
             # fallback: simple approximation
             return 0.0
