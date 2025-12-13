@@ -62,7 +62,6 @@ TRADING_CONFIG = {
     'max_daily_trades': 8,
     'max_daily_loss_percent': 0.20,
     'max_trade_duration_hours': 4,
-}
 
     # Quick fix ML toggle: if False -> TA-only (no ML required)
     'ml_required': False,
