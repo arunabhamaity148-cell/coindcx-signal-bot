@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """
-MAIN TRADING BOT – FINAL (split part 1 of 2)
-Contains class, init, helpers, fetch, features, analyze_trade_opportunity (ML/TA-fallback)
+MAIN TRADING BOT – FINAL (TA-ONLY READY)
+- If TRADING_CONFIG['ml_required'] == False → skips ML entirely
+- Otherwise tries ML and falls back to TA on failure
 """
-import os, sys, time, asyncio, logging, signal, argparse
+import os
+import sys
+import time
+import asyncio
+import logging
+import signal
+import argparse
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 
-# project config + modules
+# ---------- project imports ----------
 from config.settings import (
     EXCHANGES, TRADING_CONFIG, RISK_CONFIG, ML_CONFIG,
     UNIQUE_LOGICS, TELEGRAM_CONFIG, DATA_CONFIG
 )
 from data.data_collector import DataCollector
 from strategy.unique_logics import LogicEvaluator
-from ml.lstm_model import LSTMModel
-from ml.xgboost_model import XGBoostModel
-from ml.ensemble import EnsembleModel
 from risk.risk_manager import RiskManager
 from execution.order_executor import OrderExecutor
 from monitoring.telegram_bot import TradingBotNotifier
 
-# logging
+# ---------- logging ----------
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +38,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+# ---------- TradingBot ----------
 class TradingBot:
     def __init__(self, mode='paper', capital=None):
         self.mode = mode
@@ -50,9 +54,10 @@ class TradingBot:
         }
 
         logger.info("="*100)
-        logger.info("🤖 ADVANCED CRYPTO TRADING BOT – FINAL")
+        logger.info("🤖 ADVANCED CRYPTO TRADING BOT – FINAL (TA-ONLY READY)")
         logger.info("Mode : %s  |  Capital : ₹%0.2f  |  Date : %s",
                     self.mode.upper(), self.capital, datetime.now())
+        logger.info("ML required: %s", TRADING_CONFIG.get('ml_required', True))
         logger.info("="*100)
 
         self._init_components()
@@ -60,52 +65,62 @@ class TradingBot:
         signal.signal(signal.SIGINT,  self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
-    # ---------------- components ----------------
+    # ---------- components ----------
     def _init_components(self):
         logger.info("📊 INITIALISING COMPONENTS...")
-        # Data
-        logger.info("1/7 📊 Data Collector...")
+
+        # 1) Data
+        logger.info("1/6 📊 Data Collector...")
         self.data_collector = DataCollector(EXCHANGES)
         logger.info("    ✅ Multi-exchange ready")
 
-        # Logics
-        logger.info("2/7 🧠 Logic Evaluator (45 unique logics)...")
+        # 2) 45-logics
+        logger.info("2/6 🧠 Logic Evaluator (45 unique logics)...")
         self.logic_evaluator = LogicEvaluator(UNIQUE_LOGICS)
         logger.info("    ✅ 45 unique logics loaded")
 
-        # ML
-        logger.info("3/7 🤖 ML Models...")
-        self.lstm_model = LSTMModel(ML_CONFIG.get('lookback_candles', 60),
-                                    ML_CONFIG.get('features_count', 50),
-                                    ML_CONFIG.get('model_path', 'models/'))
-        self.xgb_model = XGBoostModel(ML_CONFIG.get('model_path', 'models/'))
-        self.ensemble = EnsembleModel(self.lstm_model, self.xgb_model,
-                                      ML_CONFIG.get('lstm_weight', 0.5),
-                                      ML_CONFIG.get('xgboost_weight', 0.3),
-                                      ML_CONFIG.get('rf_weight', 0.2),
-                                      ML_CONFIG.get('model_path', 'models/'))
-        # try load models (graceful)
-        try:
-            self.lstm_model.load('lstm_model.h5')
-            self.xgb_model.load('xgboost_model.pkl')
-            logger.info("    ✅ Pre-trained LSTM/XGB loaded")
-        except Exception as e:
-            logger.warning("    ⚠️  ML models not found or failed to load: %s", e)
+        # 3) ML (only if required)
+        ml_required = TRADING_CONFIG.get('ml_required', True)
+        self.ml_available = False
+        if ml_required:
+            try:
+                from ml.lstm_model import LSTMModel
+                from ml.xgboost_model import XGBoostModel
+                from ml.ensemble import EnsembleModel
 
-        try:
-            self.ensemble.load_rf('random_forest.pkl')
-            logger.info("    ✅ Ensemble RF loaded")
-        except Exception:
-            logger.warning("    ⚠️  RF model missing")
+                self.lstm_model = LSTMModel(
+                    ML_CONFIG.get('lookback_candles', 60),
+                    ML_CONFIG.get('features_count', 50),
+                    ML_CONFIG.get('model_path', 'models/')
+                )
+                self.xgb_model = XGBoostModel(ML_CONFIG.get('model_path', 'models/'))
+                self.ensemble = EnsembleModel(
+                    self.lstm_model, self.xgb_model,
+                    ML_CONFIG.get('lstm_weight', 0.5),
+                    ML_CONFIG.get('xgboost_weight', 0.3),
+                    ML_CONFIG.get('rf_weight', 0.2),
+                    ML_CONFIG.get('model_path', 'models/')
+                )
 
-        # Risk manager
-        logger.info("5/7 🛡️ Risk Manager...")
+                self.lstm_model.load('lstm_model.h5')
+                self.xgb_model.load('xgboost_model.pkl')
+                self.ensemble.load_rf('random_forest.pkl')
+                self.ml_available = True
+                logger.info("    ✅ ML models loaded")
+            except Exception as e:
+                logger.warning("    ⚠️  ML models failed (%s) → TA-only mode", e)
+                self.ml_available = False
+        else:
+            logger.info("    🚫 ML disabled by config → TA-only mode")
+
+        # 4) Risk
+        logger.info("4/6 🛡️ Risk Manager...")
         self.risk_manager = RiskManager(RISK_CONFIG)
         self.risk_manager.initial_daily_capital = self.capital
         logger.info("    ✅ Risk system active")
 
-        # Executor
-        logger.info("6/7 ⚡ Order Executor...")
+        # 5) Executor
+        logger.info("5/6 ⚡ Order Executor...")
         if self.mode == 'live':
             self.executor = OrderExecutor(EXCHANGES)
             logger.info("    ✅ Live executor")
@@ -113,8 +128,8 @@ class TradingBot:
             self.executor = None
             logger.info("    ✅ Paper mode")
 
-        # DB
-        logger.info("7/7 🗄️  Database...")
+        # 6) DB
+        logger.info("6/6 🗄️  Database...")
         try:
             import psycopg2
             db_url = os.getenv("DATABASE_URL")
@@ -126,7 +141,7 @@ class TradingBot:
 
         logger.info("✅ ALL COMPONENTS INITIALISED")
 
-    # ---------------- telegram ----------------
+    # ---------- telegram ----------
     def _init_telegram(self):
         self.telegram_notifier = None
         if not TELEGRAM_CONFIG.get('enable_notifications', True):
@@ -142,7 +157,7 @@ class TradingBot:
         else:
             logger.warning("⚠️  Telegram not configured")
 
-    # ---------------- helpers ----------------
+    # ---------- helpers ----------
     def _signal_handler(self, signum, frame):
         logger.info("Shutdown signal received… stopping bot")
         self.is_running = False
@@ -155,7 +170,7 @@ class TradingBot:
         except Exception as e:
             logger.warning("Telegram send failed: %s", e)
 
-    # ---------------- market fetch ----------------
+    # ---------- market fetch ----------
     def fetch_market_data(self, symbol, timeframe=None, limit=200):
         tf = timeframe or TRADING_CONFIG.get('timeframe', '15m')
         try:
@@ -177,7 +192,7 @@ class TradingBot:
             logger.error("fetch_market_data error: %s", e)
             return None
 
-    # ---------------- feature engineering ----------------
+    # ---------- feature engineering ----------
     def generate_features(self, df):
         try:
             feats = pd.DataFrame(index=df.index)
@@ -203,7 +218,8 @@ class TradingBot:
         except Exception as e:
             logger.error("generate_features: %s", e)
             return pd.DataFrame()
-# ---------------- analyze & trade plan ----------------
+
+    # ---------- analyze & trade plan ----------
     def analyze_trade_opportunity(self, symbol):
         logger.info("\n🔍 ANALYSING: %s", symbol)
         mdata = self.fetch_market_data(symbol)
@@ -221,7 +237,7 @@ class TradingBot:
         if features.empty:
             return None
 
-        # First: evaluate 45-logics to see trade_allowed and a logic-based score
+        # 1) 45-logics gate
         logic_res = self.logic_evaluator.evaluate_all_logics(
             df=df, orderbook=orderbook, funding_rate=funding,
             oi_history=[mdata['open_interest']]*20,
@@ -235,13 +251,12 @@ class TradingBot:
             logger.warning("Blocked by logics")
             return None
 
-        # Determine side & confidence:
+        # 2) ML or TA signal
         ml_required = TRADING_CONFIG.get('ml_required', True)
         signal = None
         conf = 0.0
 
-        if ml_required:
-            # Try ML (if available). If ML raises, fallback to TA.
+        if ml_required and self.ml_available:
             try:
                 sig, confidence = self.ensemble.generate_signal(
                     features.tail(ML_CONFIG.get('lookback_candles', 100)).values,
@@ -254,14 +269,13 @@ class TradingBot:
                     logger.info("ML says HOLD")
                     return None
             except Exception as e:
-                logger.warning("ML failed (%s) -> falling back to TA-only", e)
-                ml_required = False  # force TA fallback
+                logger.warning("ML failed (%s) → TA fallback", e)
+                ml_required = False
 
-        if not ml_required:
-            # TA-only decision: determine bullish/bearish via EMA alignment & recent structure
+        if not ml_required or not self.ml_available:
+            # TA-only
             ema_align = self.logic_evaluator.check_ema_alignment(df)
             structure = self.logic_evaluator.detect_market_structure_shift(df)
-            # Heuristic: bullish if ema_align bullish or structure bullish
             if ema_align == 'bullish' or structure == 'bullish':
                 signal = 'BUY'
             elif ema_align == 'bearish' or structure == 'bearish':
@@ -269,13 +283,12 @@ class TradingBot:
             else:
                 logger.info("TA indecisive")
                 return None
-            # confidence proportional to logic score (0-1)
             conf = max(0.05, min(1.0, logic_res.get('final_score', 50) / 100.0))
-            logger.info("   TA Signal: %s | Conf (from logic score): %.1f%%", signal, conf*100)
+            logger.info("   TA Signal: %s | Conf: %.1f%%", signal, conf*100)
 
-        # Build trade plan
+        # 3) Build plan
         curr_p = df['close'].iloc[-1]
-        side = 'LONG' if signal in ('BUY','BUY') else 'SHORT'
+        side = 'LONG' if signal == 'BUY' else 'SHORT'
         regime = logic_res.get('market_health', {}).get('market_regime', 'ranging')
         atr = logic_res.get('price_action', {}).get('atr', 0.0)
 
@@ -309,7 +322,7 @@ class TradingBot:
         logger.info("✅ TRADE PLAN READY: %s %s (conf %.1f%%)", symbol, side, conf*100)
         return plan
 
-    # ---------------- execute ----------------
+    # ---------- execute ----------
     def execute_trade(self, plan):
         try:
             if self.mode == 'paper':
@@ -343,7 +356,7 @@ class TradingBot:
             logger.error("execute_trade error: %s", e)
             return {'error': str(e)}
 
-    # ---------------- monitor & close ----------------
+    # ---------- monitor ----------
     def monitor_positions(self):
         if not self.open_positions:
             return
@@ -386,12 +399,31 @@ class TradingBot:
                     asyncio.create_task(self._telegram(self.telegram_notifier.notify_trade_closed(pos)))
                 logger.info("Closed paper pos %s P&L ₹%+0.2f", pos.get('id'), pos['pnl'])
             else:
-                # For live, call executor (not implemented here)
+                # live close (integrate executor)
                 logger.info("Live close requested (executor integration required)")
         except Exception as e:
             logger.error("_close_position error: %s", e)
 
-    # ---------------- run loop (fixed) ----------------
+    # ---------- performance helpers ----------
+    def _update_performance(self):
+        total = self.performance['wins'] + self.performance['losses']
+        if total:
+            self.performance['win_rate'] = self.performance['wins'] / total
+            self.performance['equity_curve'].append(self.capital)
+
+    def _print_daily_summary(self):
+        self._update_performance()
+        logger.info("="*60)
+        logger.info("📈 DAILY SUMMARY – %s", datetime.now().date())
+        logger.info("Trades today : %d", len(self.trades_today))
+        logger.info("Win / Loss   : %d / %d", self.performance['wins'], self.performance['losses'])
+        logger.info("Win Rate     : %.1f%%", self.performance['win_rate']*100)
+        logger.info("Daily P&L    : ₹%+0.2f", self.performance['daily_pnl'])
+        logger.info("Total P&L    : ₹%+0.2f", self.performance['total_pnl'])
+        logger.info("Capital      : ₹%0.2f", self.capital)
+        logger.info("="*60)
+
+    # ---------- run loop ----------
     async def _run_loop(self):
         self.is_running = True
         symbols = TRADING_CONFIG.get('symbols', [TRADING_CONFIG.get('primary_symbol', 'BTC/USDT:USDT')])
@@ -401,7 +433,6 @@ class TradingBot:
         logger.info("Starting async loop: %d symbols | interval: %ds | ml_required: %s",
                     len(symbols), interval, TRADING_CONFIG.get('ml_required', True))
 
-        # If telegram notifier exists, initialize it (connect)
         if self.telegram_notifier:
             try:
                 await self.telegram_notifier.initialize()
@@ -412,9 +443,7 @@ class TradingBot:
             start_cycle = datetime.now()
             logger.info("Cycle start: %s", start_cycle)
 
-            # iterate symbols
             for symbol in symbols:
-                # respect max open positions
                 if len(self.open_positions) >= max_positions:
                     logger.info("Max positions reached (%d). Skipping further symbols.", max_positions)
                     break
@@ -426,24 +455,19 @@ class TradingBot:
                 except Exception as e:
                     logger.error("Error analyzing/executing %s: %s", symbol, e)
 
-                # tiny delay between symbols to avoid rate limits
                 await asyncio.sleep(1)
 
-            # monitor positions after scanning symbols
             try:
                 self.monitor_positions()
             except Exception as e:
                 logger.error("monitor_positions loop error: %s", e)
 
-            # daily summary once per day at configured time (non-blocking check)
-            # We'll check if local hour matches TELEGRAM_CONFIG['daily_summary_time'] and send once
+            # daily summary
             try:
-                ds_hour_min = TELEGRAM_CONFIG.get('daily_summary_time', '18:00')
-                hh, mm = map(int, ds_hour_min.split(":"))
+                ds_time = TELEGRAM_CONFIG.get('daily_summary_time', '18:00')
+                hh, mm = map(int, ds_time.split(':'))
                 now = datetime.now()
                 if now.hour == hh and now.minute == mm:
-                    # print and send daily summary
-                    self._update_performance()
                     self._print_daily_summary()
                     if self.telegram_notifier:
                         await self._telegram(self.telegram_notifier.notify_daily_summary({
@@ -455,19 +479,16 @@ class TradingBot:
                             'capital': self.capital,
                             'roi': (self.capital - self.initial_capital) / max(1, self.initial_capital)
                         }))
-                    # sleep 61 seconds to avoid re-sending in same minute
                     await asyncio.sleep(61)
             except Exception as e:
                 logger.error("Daily summary error: %s", e)
 
-            # compute elapsed and sleep remaining until next cycle
             elapsed = (datetime.now() - start_cycle).total_seconds()
             to_sleep = max(1, interval - elapsed)
             logger.info("Cycle complete. Sleeping %0.1fs until next cycle.", to_sleep)
             await asyncio.sleep(to_sleep)
 
     def run(self):
-        """Start asyncio loop (blocking)"""
         try:
             asyncio.run(self._run_loop())
         except KeyboardInterrupt:
@@ -477,7 +498,8 @@ class TradingBot:
         finally:
             self.is_running = False
 
-# ---------------- CLI entry ----------------
+
+# ---------- CLI ----------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['paper','live'], default='paper')
