@@ -1,60 +1,27 @@
 """
-📊 Market Scanner - FINAL FIXED VERSION
-- Railway safe
-- WATCHLIST auto-fallback
-- Soft volume filter (signals আসবে)
-- No missing config crash
+📊 Market Scanner - Health Checks + Pair Selection
+Implements Market Health + Volume Logic
+FINAL FIXED VERSION
 """
 
 import requests
 import pandas as pd
-from datetime import datetime, time
-import traceback
-
-# =========================
-# SAFE CONFIG IMPORT
-# =========================
-try:
-    from config import (
-        WATCHLIST,
-        BTC_VOLATILITY_THRESHOLD,
-        FEAR_GREED_EXTREME,
-        MIN_VOLUME_24H,
-        MAX_SPREAD_PERCENT,
-        VOLUME_MA_PERIOD,
-        AVOID_NEWS_HOURS
-    )
-except Exception:
-    # 🔥 Railway safe defaults
-    WATCHLIST = []
-    BTC_VOLATILITY_THRESHOLD = 2.5
-    FEAR_GREED_EXTREME = (10, 90)
-    MIN_VOLUME_24H = 1_000_000
-    MAX_SPREAD_PERCENT = 0.15
-    VOLUME_MA_PERIOD = 20
-    AVOID_NEWS_HOURS = [
-        (time(17, 30), time(18, 30)),
-        (time(13, 0), time(13, 30)),
-    ]
-
-# =========================
-# FORCE WATCHLIST (IMPORTANT)
-# =========================
-if not WATCHLIST:
-    WATCHLIST = [
-        "BTC", "ETH", "BNB", "SOL", "XRP",
-        "ADA", "AVAX", "DOGE", "MATIC", "DOT",
-        "LINK", "LTC", "UNI", "ATOM", "FIL",
-        "NEAR", "APT", "ARB", "OP", "INJ"
-    ]
-
+from datetime import datetime
+from config import (
+    WATCHLIST,
+    BTC_VOLATILITY_THRESHOLD,
+    FEAR_GREED_EXTREME,
+    MIN_VOLUME_24H,
+    MAX_SPREAD_PERCENT,
+    VOLUME_MA_PERIOD,
+    AVOID_NEWS_HOURS,
+)
 
 class MarketScanner:
     def __init__(self):
         self.base_url = "https://public.coindcx.com"
-        self.market_health_score = 0
         self.btc_volatility = 0.0
-        self.market_regime = "UNKNOWN"
+        self.market_regime = "RANGING"
 
     # =========================
     # DATA FETCH
@@ -69,7 +36,6 @@ class MarketScanner:
             }
             r = requests.get(url, params=params, timeout=10)
             if r.status_code != 200:
-                print(f"⚠️ API Error {symbol}: {r.status_code}")
                 return None
 
             data = r.json()
@@ -85,7 +51,10 @@ class MarketScanner:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
             df.dropna(inplace=True)
-            return df if len(df) >= 20 else None
+            if len(df) < 20:
+                return None
+
+            return df
 
         except Exception:
             return None
@@ -101,7 +70,6 @@ class MarketScanner:
 
         returns = df["close"].pct_change().abs()
         self.btc_volatility = returns.mean() * 100
-        print(f"🔹 BTC Volatility: {self.btc_volatility:.2f}%")
         return self.btc_volatility < BTC_VOLATILITY_THRESHOLD
 
     def detect_market_regime(self):
@@ -111,24 +79,20 @@ class MarketScanner:
             return self.market_regime
 
         returns = df["close"].pct_change().dropna()
-        vol = returns.rolling(20).std()
-
-        if vol.iloc[-1] > vol.mean() * 1.5:
+        if returns.std() > 0.01:
             self.market_regime = "VOLATILE"
-        elif abs(returns.rolling(20).mean().iloc[-1]) > 0.002:
+        elif abs(returns.mean()) > 0.0015:
             self.market_regime = "TRENDING"
         else:
             self.market_regime = "RANGING"
 
-        print(f"🔹 Market Regime: {self.market_regime}")
         return self.market_regime
 
     def check_fear_greed(self):
         try:
             r = requests.get("https://api.alternative.me/fng/", timeout=5)
-            fgi = int(r.json()["data"][0]["value"])
-            print(f"🔹 Fear & Greed: {fgi}")
-            return FEAR_GREED_EXTREME[0] < fgi < FEAR_GREED_EXTREME[1]
+            v = int(r.json()["data"][0]["value"])
+            return FEAR_GREED_EXTREME[0] < v < FEAR_GREED_EXTREME[1]
         except Exception:
             return True
 
@@ -138,7 +102,8 @@ class MarketScanner:
         if self.check_btc_calm():
             score += 2
 
-        if self.detect_market_regime() in ["TRENDING", "RANGING"]:
+        regime = self.detect_market_regime()
+        if regime in ["TRENDING", "RANGING"]:
             score += 2
 
         if self.check_fear_greed():
@@ -152,45 +117,41 @@ class MarketScanner:
         if self.btc_volatility < BTC_VOLATILITY_THRESHOLD:
             score += 2
 
-        self.market_health_score = score
         print(f"🏥 MARKET HEALTH SCORE: {score}/10")
         return score
 
     # =========================
-    # SCAN PAIRS
+    # PAIR SCAN
     # =========================
     def scan_all_pairs(self):
         tradeable = []
 
         print(f"🔍 Scanning {len(WATCHLIST)} pairs...")
 
-        # 🔥 Dynamic looseness
-        volume_threshold = 0.9 if self.market_health_score >= 8 else 1.1
-
         for symbol in WATCHLIST:
-            try:
-                df = self.get_market_data(symbol, "5m", 50)
-                if df is None:
-                    continue
+            df = self.get_market_data(symbol, "5m", 120)
+            if df is None:
+                continue
 
-                df["vol_ma"] = df["volume"].rolling(VOLUME_MA_PERIOD).mean()
-                if df["vol_ma"].isna().all():
-                    continue
+            df["vol_ma"] = df["volume"].rolling(VOLUME_MA_PERIOD).mean()
+            if df["vol_ma"].isna().all():
+                continue
 
-                ratio = df["volume"].iloc[-1] / df["vol_ma"].iloc[-1]
-                print(f"  🔎 {symbol} | Volume ratio: {ratio:.2f}")
+            current_vol = df["volume"].iloc[-1]
+            avg_vol = df["vol_ma"].iloc[-1]
+            if avg_vol <= 0:
+                continue
 
-                if ratio >= volume_threshold:
-                    tradeable.append({
-                        "symbol": symbol,
-                        "price": df["close"].iloc[-1],
-                        "volume_ratio": ratio
-                    })
-                    print(f"  ✅ {symbol} SELECTED")
+            volume_ratio = current_vol / avg_vol
 
-            except Exception:
-                print(f"⚠️ Scan error {symbol}")
-                traceback.print_exc()
+            if volume_ratio >= 1.2:
+                tradeable.append({
+                    "symbol": symbol,
+                    "price": df["close"].iloc[-1],
+                    "volume_ratio": round(volume_ratio, 2),
+                    "data": df   # 🔥 MOST IMPORTANT FIX
+                })
+                print(f"  ✅ {symbol} SELECTED | Vol x{volume_ratio:.2f}")
 
-        print(f"\n✅ Found {len(tradeable)} tradeable pairs")
+        print(f"✅ Found {len(tradeable)} tradeable pairs")
         return tradeable
