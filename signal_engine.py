@@ -1,6 +1,7 @@
 """
 🧠 Signal Engine - 45 Logic Implementation
 Logic 11-45: Trend, Momentum, Volume, Risk Filters
+WITH DETAILED DEBUG LOGGING
 """
 
 import pandas as pd
@@ -193,7 +194,7 @@ class SignalEngine:
         current_vol = volume.iloc[-1]
         avg_vol = volume_ma.iloc[-1]
         
-        if current_vol > avg_vol * 1.5:
+        if current_vol > avg_vol * 1.2:  # Lowered from 1.5
             return "VOLUME_SPIKE"
         elif current_vol < avg_vol * 0.5:
             return "VOLUME_DRY"
@@ -228,8 +229,8 @@ class SignalEngine:
         
         wick_ratio = body / total_range
         
-        # If wick > 70% of candle, likely manipulation
-        return wick_ratio > 0.3
+        # If body > 30% of candle, it's valid (loosened from 70%)
+        return wick_ratio > 0.2
     
     def check_round_number_trap(self, price):
         """Logic 40: Round Number Trap Avoidance"""
@@ -237,7 +238,7 @@ class SignalEngine:
         str_price = str(int(price))
         trailing_zeros = len(str_price) - len(str_price.rstrip('0'))
         
-        return trailing_zeros >= 3  # 3+ trailing zeros = trap zone
+        return trailing_zeros >= 4  # 4+ trailing zeros = trap zone
     
     def generate_signal(self, pair_data, mode="mid"):
         """Main signal generation combining all 45 logics"""
@@ -259,13 +260,13 @@ class SignalEngine:
             print(f"  📈 Structure: {structure}")
             
             rsi_signals = self.check_rsi_conditions(df)
-            print(f"  📉 RSI Signals: {rsi_signals}")
+            print(f"  📉 RSI Signals: {rsi_signals if rsi_signals else 'None'}")
             
             macd_signals = self.check_macd_signals(df)
-            print(f"  🔄 MACD Signals: {macd_signals}")
+            print(f"  🔄 MACD Signals: {macd_signals if macd_signals else 'None'}")
             
             bb_signals = self.check_bollinger_bands(df)
-            print(f"  📊 BB Signals: {bb_signals}")
+            print(f"  📊 BB Signals: {bb_signals if bb_signals else 'None'}")
             
             volume_status = self.check_volume_confirmation(df)
             print(f"  📦 Volume: {volume_status}")
@@ -322,8 +323,8 @@ class SignalEngine:
             rsi_value = df.get('rsi', pd.Series([50])).iloc[-1] if 'rsi' in df.columns else 50
             macd_hist_value = df.get('macd_hist', pd.Series([0])).iloc[-1] if 'macd_hist' in df.columns else 0
             
-            # Minimum 4/15 score to signal (LOWERED!)
-            if long_score >= 4:
+            # Use MIN_SIGNAL_SCORE from config
+            if long_score >= MIN_SIGNAL_SCORE:
                 print(f"  ✅ LONG SIGNAL PASSED! Score: {long_score}/15")
                 self.last_signal_time[symbol] = datetime.now()
                 return {
@@ -341,7 +342,7 @@ class SignalEngine:
                     }
                 }
             
-            elif short_score >= 4:
+            elif short_score >= MIN_SIGNAL_SCORE:
                 print(f"  ✅ SHORT SIGNAL PASSED! Score: {short_score}/15")
                 self.last_signal_time[symbol] = datetime.now()
                 return {
@@ -359,10 +360,12 @@ class SignalEngine:
                     }
                 }
             else:
-                print(f"  ❌ BLOCKED: Score too low (LONG: {long_score}, SHORT: {short_score})")
+                print(f"  ❌ BLOCKED: Score too low (LONG: {long_score}, SHORT: {short_score}, Need: {MIN_SIGNAL_SCORE})")
             
         except Exception as e:
             print(f"  ⚠️ Signal generation error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
         
         return None
