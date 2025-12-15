@@ -147,4 +147,4 @@ DRY_RUN = False
 # ========================
 # 🔥 SIGNAL ENGINE
 # ========================
-MIN_SIGNAL_SCORE = 3      # 🔥 VERY IMPORTANT
+MIN_SIGNAL_SCORE = 2      # 🔥 VERY IMPORTANT
