@@ -1,157 +1,244 @@
 """
-📊 Market Scanner - Health Checks + Pair Selection
-Implements Market Health + Volume Logic
-FINAL FIXED VERSION
+📊 Market Scanner - Health Checks + 50 Pair Monitoring
+Implements Logic 1-10: Market Health Filters
+WITH DEBUG LOGGING
 """
 
 import requests
 import pandas as pd
-from datetime import datetime
-from config import (
-    WATCHLIST,
-    BTC_VOLATILITY_THRESHOLD,
-    FEAR_GREED_EXTREME,
-    MIN_VOLUME_24H,
-    MAX_SPREAD_PERCENT,
-    VOLUME_MA_PERIOD,
-    AVOID_NEWS_HOURS,
-)
+import numpy as np
+from datetime import datetime, timedelta
+from config import *
 
 class MarketScanner:
     def __init__(self):
-        self.base_url = "https://public.coindcx.com"
-        self.btc_volatility = 0.0
-        self.market_regime = "RANGING"
-
-    # =========================
-    # DATA FETCH
-    # =========================
+        self.base_url = "https://api.coindcx.com"
+        self.market_health_score = 0
+        self.btc_volatility = 0
+        self.market_regime = "UNKNOWN"
+        
     def get_market_data(self, symbol, interval="5m", limit=200):
+        """Fetch OHLCV data from CoinDCX"""
         try:
-            url = f"{self.base_url}/market_data/candles"
+            endpoint = f"{self.base_url}/market_data/candles"
             params = {
                 "pair": f"B-{symbol}_USDT",
                 "interval": interval,
                 "limit": limit
             }
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code != 200:
+            response = requests.get(endpoint, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                print(f"⚠️ API Error for {symbol}: Status {response.status_code}")
                 return None
-
-            data = r.json()
-            if not data or len(data) < 20:
+            
+            data = response.json()
+            
+            # Check if data is empty or invalid
+            if not data or not isinstance(data, list) or len(data) == 0:
+                print(f"⚠️ No data returned for {symbol}")
                 return None
-
-            df = pd.DataFrame(
-                data,
-                columns=["time", "open", "high", "low", "close", "volume"]
-            )
-            df["time"] = pd.to_datetime(df["time"], unit="ms")
-            for c in ["open", "high", "low", "close", "volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            df.dropna(inplace=True)
-            if len(df) < 20:
+            
+            df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+            
+            # Validate dataframe
+            if df.empty or len(df) < 20:
+                print(f"⚠️ Insufficient data for {symbol}: {len(df)} candles")
                 return None
-
+            
+            df['time'] = pd.to_datetime(df['time'], unit='ms')
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # Remove any NaN rows
+            df = df.dropna()
+            
+            if df.empty or len(df) < 20:
+                print(f"⚠️ Invalid data for {symbol} after cleaning")
+                return None
+            
             return df
-
-        except Exception:
+            
+        except Exception as e:
+            print(f"❌ Error fetching {symbol}: {e}")
             return None
-
-    # =========================
-    # MARKET HEALTH
-    # =========================
+    
     def check_btc_calm(self):
-        df = self.get_market_data("BTC", "1h", 24)
-        if df is None:
+        """Logic 1: BTC Calm Check - Low volatility only"""
+        btc_data = self.get_market_data("BTC", "1h", 24)
+        if btc_data is None or len(btc_data) < 10:
+            print("⚠️ BTC data unavailable, assuming calm")
             self.btc_volatility = 1.0
             return True
-
-        returns = df["close"].pct_change().abs()
-        self.btc_volatility = returns.mean() * 100
-        return self.btc_volatility < BTC_VOLATILITY_THRESHOLD
-
+        
+        btc_returns = btc_data['close'].pct_change().abs()
+        self.btc_volatility = btc_returns.mean() * 100
+        
+        is_calm = self.btc_volatility < BTC_VOLATILITY_THRESHOLD
+        print(f"🔹 BTC Volatility: {self.btc_volatility:.2f}% {'✅' if is_calm else '⚠️'}")
+        return is_calm
+    
     def detect_market_regime(self):
-        df = self.get_market_data("BTC", "15m", 100)
-        if df is None:
+        """Logic 2: Trending / Ranging / Volatile"""
+        btc_data = self.get_market_data("BTC", "15m", 100)
+        if btc_data is None or len(btc_data) < 50:
+            print("⚠️ Insufficient BTC data, assuming RANGING")
             self.market_regime = "RANGING"
+            return "RANGING"
+        
+        close = btc_data['close']
+        
+        # Simple regime detection
+        returns = close.pct_change().dropna()
+        
+        if len(returns) < 20:
+            self.market_regime = "RANGING"
+            print(f"🔹 Market Regime: {self.market_regime}")
             return self.market_regime
-
-        returns = df["close"].pct_change().dropna()
-        if returns.std() > 0.01:
+        
+        volatility = returns.rolling(20).std()
+        avg_volatility = volatility.mean()
+        
+        if len(volatility.dropna()) == 0:
+            self.market_regime = "RANGING"
+        elif volatility.iloc[-1] > avg_volatility * 1.5:
             self.market_regime = "VOLATILE"
-        elif abs(returns.mean()) > 0.0015:
+        elif abs(returns.rolling(20).mean().iloc[-1]) > 0.002:
             self.market_regime = "TRENDING"
         else:
             self.market_regime = "RANGING"
-
+        
+        print(f"🔹 Market Regime: {self.market_regime}")
         return self.market_regime
-
+    
+    def check_funding_rate(self, symbol):
+        """Logic 3: Funding Rate Extreme Filter"""
+        # CoinDCX doesn't expose funding directly via public API
+        # Using proxy: price vs mark price deviation
+        return True  # Placeholder - implement with websocket
+    
     def check_fear_greed(self):
+        """Logic 4: Fear & Greed Index"""
         try:
-            r = requests.get("https://api.alternative.me/fng/", timeout=5)
-            v = int(r.json()["data"][0]["value"])
-            return FEAR_GREED_EXTREME[0] < v < FEAR_GREED_EXTREME[1]
-        except Exception:
-            return True
-
+            url = "https://api.alternative.me/fng/"
+            response = requests.get(url, timeout=5)
+            data = response.json()
+            fgi = int(data['data'][0]['value'])
+            
+            is_safe = FEAR_GREED_EXTREME[0] < fgi < FEAR_GREED_EXTREME[1]
+            print(f"🔹 Fear & Greed: {fgi} {'✅' if is_safe else '⚠️'}")
+            return is_safe
+        except:
+            return True  # Don't block on API failure
+    
+    def check_liquidity(self, symbol):
+        """Logic 8: Low Liquidity Filter"""
+        ticker_url = f"{self.base_url}/market_data/ticker"
+        try:
+            response = requests.get(ticker_url, timeout=5)
+            tickers = response.json()
+            
+            pair_key = f"B-{symbol}_USDT"
+            for ticker in tickers:
+                if ticker.get('market') == pair_key:
+                    volume_24h = float(ticker.get('volume', 0))
+                    return volume_24h > MIN_VOLUME_24H
+            return False
+        except:
+            return False
+    
+    def check_spread(self, symbol):
+        """Logic 7: Spread & Slippage Safety"""
+        # Check orderbook depth
+        try:
+            orderbook_url = f"{self.base_url}/market_data/orderbook"
+            params = {"pair": f"B-{symbol}_USDT"}
+            response = requests.get(orderbook_url, params=params, timeout=5)
+            data = response.json()
+            
+            if data.get('bids') and data.get('asks'):
+                best_bid = float(data['bids'][0]['price'])
+                best_ask = float(data['asks'][0]['price'])
+                spread_pct = ((best_ask - best_bid) / best_bid) * 100
+                
+                return spread_pct < MAX_SPREAD_PERCENT
+            return False
+        except:
+            return False
+    
     def calculate_market_health(self):
+        """Logic 1-10: Overall Market Health Score (0-10)"""
         score = 0
-
+        
+        # Check 1: BTC Calm
         if self.check_btc_calm():
             score += 2
-
+        
+        # Check 2: Market Regime
         regime = self.detect_market_regime()
         if regime in ["TRENDING", "RANGING"]:
             score += 2
-
+        
+        # Check 4: Fear & Greed
         if self.check_fear_greed():
             score += 2
-
-        now = datetime.now().time()
-        avoid = any(start <= now <= end for start, end in AVOID_NEWS_HOURS)
-        if not avoid:
+        
+        # Check 6: News Time Avoidance
+        current_time = datetime.now().time()
+        avoid_time = any(start <= current_time <= end for start, end in AVOID_NEWS_HOURS)
+        if not avoid_time:
             score += 2
-
+        
+        # Check 9: Volatility Spike
         if self.btc_volatility < BTC_VOLATILITY_THRESHOLD:
             score += 2
-
-        print(f"🏥 MARKET HEALTH SCORE: {score}/10")
+        
+        self.market_health_score = score
+        print(f"\n🏥 MARKET HEALTH SCORE: {score}/10 {'✅' if score >= 4 else '⚠️'}\n")
         return score
-
-    # =========================
-    # PAIR SCAN
-    # =========================
+    
     def scan_all_pairs(self):
-        tradeable = []
-
-        print(f"🔍 Scanning {len(WATCHLIST)} pairs...")
-
-        for symbol in WATCHLIST:
-            df = self.get_market_data(symbol, "5m", 120)
-            if df is None:
+        """Scan all 50 pairs for tradeable opportunities"""
+        tradeable_pairs = []
+        
+        print(f"🔍 Scanning {TEST_PAIRS_LIMIT} pairs from watchlist...")
+        
+        for symbol in WATCHLIST[:TEST_PAIRS_LIMIT]:
+            try:
+                # Get recent data
+                df = self.get_market_data(symbol, "5m", 50)
+                if df is None or len(df) < 20:
+                    continue
+                
+                # Calculate basic metrics
+                df['volume_ma'] = df['volume'].rolling(VOLUME_MA_PERIOD).mean()
+                
+                # Check if volume_ma has valid data
+                if df['volume_ma'].dropna().empty:
+                    continue
+                
+                current_volume = df['volume'].iloc[-1]
+                avg_volume = df['volume_ma'].iloc[-1]
+                
+                # Handle NaN in avg_volume
+                if pd.isna(avg_volume) or avg_volume == 0:
+                    continue
+                
+                # Volume spike check (Logic 31) - LOWERED THRESHOLD
+                volume_ratio = current_volume / avg_volume
+                
+                if volume_ratio > 1.0:  # Accept all pairs with normal+ volume
+                    tradeable_pairs.append({
+                        'symbol': symbol,
+                        'price': df['close'].iloc[-1],
+                        'volume_ratio': volume_ratio,
+                        'data': df
+                    })
+                    print(f"  ✅ {symbol}: Price ₹{df['close'].iloc[-1]:.2f} | Volume {volume_ratio:.2f}x")
+                
+            except Exception as e:
+                print(f"  ⚠️ Error scanning {symbol}: {e}")
                 continue
-
-            df["vol_ma"] = df["volume"].rolling(VOLUME_MA_PERIOD).mean()
-            if df["vol_ma"].isna().all():
-                continue
-
-            current_vol = df["volume"].iloc[-1]
-            avg_vol = df["vol_ma"].iloc[-1]
-            if avg_vol <= 0:
-                continue
-
-            volume_ratio = current_vol / avg_vol
-
-            if volume_ratio >= 1.2:
-                tradeable.append({
-                    "symbol": symbol,
-                    "price": df["close"].iloc[-1],
-                    "volume_ratio": round(volume_ratio, 2),
-                    "data": df   # 🔥 MOST IMPORTANT FIX
-                })
-                print(f"  ✅ {symbol} SELECTED | Vol x{volume_ratio:.2f}")
-
-        print(f"✅ Found {len(tradeable)} tradeable pairs")
-        return tradeable
+        
+        print(f"\n✅ Found {len(tradeable_pairs)} tradeable pairs\n")
+        return tradeable_pairs
