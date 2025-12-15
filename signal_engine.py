@@ -1,104 +1,118 @@
-# signal_engine.py
-import pandas as pd
-import numpy as np
+"""
+🧠 SIMPLE + SMART SIGNAL ENGINE
+Manual Trading Friendly
+Goal: 15–25 clean signals/day
+"""
+
 from datetime import datetime
+import pandas as pd
 from config import *
 
 class SignalEngine:
     def __init__(self):
         self.last_signal_time = {}
 
-    # ---------- UTILS ----------
-    def ema(self, s, p): return s.ewm(span=p, adjust=False).mean()
-    def rsi(self, s, p=14):
-        d = s.diff()
-        g = d.clip(lower=0).rolling(p).mean()
-        l = (-d.clip(upper=0)).rolling(p).mean()
-        return 100 - 100 / (1 + g / l)
+    # =====================
+    # INDICATORS
+    # =====================
+    def ema(self, series, period):
+        return series.ewm(span=period, adjust=False).mean()
 
-    # ---------- CORE FILTERS ----------
-    def ema_trend(self, df):
-        if len(df) < EMA_SLOW: return "NEUTRAL"
-        c = df['close']
-        e20, e50, e200 = self.ema(c, EMA_FAST), self.ema(c, EMA_MID), self.ema(c, EMA_SLOW)
-        if e20.iloc[-1] > e50.iloc[-1] > e200.iloc[-1]: return "BULL"
-        if e20.iloc[-1] < e50.iloc[-1] < e200.iloc[-1]: return "BEAR"
-        return "NEUTRAL"
+    def rsi(self, series, period=14):
+        delta = series.diff()
+        gain = delta.clip(lower=0).rolling(period).mean()
+        loss = (-delta.clip(upper=0)).rolling(period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
 
-    def volume_spike(self, df):
-        vol, ma = df['volume'], df['volume'].rolling(VOLUME_MA_PERIOD).mean()
-        return "SPIKE" if vol.iloc[-1] > ma.iloc[-1] * 1.1 else "NORMAL"
+    # =====================
+    # CORE SIGNAL LOGIC
+    # =====================
+    def generate_signal(self, pair_data, mode="quick"):
+        symbol = pair_data["symbol"]
+        df = pair_data["data"].copy()
 
-    def rsi_cond(self, df):
-        r = self.rsi(df['close'])
-        if r.iloc[-1] < RSI_OVERSOLD: return "OVERSOLD"
-        if r.iloc[-1] > RSI_OVERBOUGHT: return "OVERBOUGHT"
-        return "NEUTRAL"
-
-    def macd_momentum(self, df):
-        c = df['close']
-        macd = self.ema(c, MACD_FAST) - self.ema(c, MACD_SLOW)
-        hist = macd - self.ema(macd, MACD_SIGNAL)
-        return "BULL" if hist.iloc[-1] > hist.iloc[-2] else "BEAR"
-
-    def structure(self, df):
-        highs = df['high'].rolling(5).max()
-        lows  = df['low'].rolling(5).min()
-        hh = highs.iloc[-1] > highs.iloc[-3] and highs.iloc[-2] > highs.iloc[-4]
-        ll = lows.iloc[-1] < lows.iloc[-3] and lows.iloc[-2] < lows.iloc[-4]
-        return "BULL" if hh else "BEAR" if ll else "NEUTRAL"
-
-    def manipulation_filter(self, df):
-        c = df.iloc[-1]
-        body = abs(c['close'] - c['open'])
-        range_ = c['high'] - c['low']
-        if range_ == 0: return True
-        return (body / range_) > 0.05          # শিথিল
-
-    def round_trap(self, price):
-        return len(str(int(price)).rstrip('0')) <= 1 and str(int(price))[-4:] == '0000'
-
-    def cooldown_ok(self, sym, mode):
-        if sym not in self.last_signal_time: return True
-        return (datetime.now() - self.last_signal_time[sym]).seconds / 60 >= SIGNAL_MODES[mode]['hold_time']
-
-    # ---------- MAIN ----------
-    def generate(self, data, mode='mid'):
-        sym, df = data['symbol'], data['data'].copy()
-        if len(df) < 50: return None
-
-        if not self.cooldown_ok(sym, mode):
-            print(f"  ❌ {sym} cooldown")
-            return None
-        if not self.manipulation_filter(df):
-            print(f"  ❌ {sym} manipulation")
-            return None
-        if self.round_trap(df['close'].iloc[-1]):
-            print(f"  ❌ {sym} round trap")
+        if len(df) < 50:
+            print(f"❌ {symbol} blocked: low candles")
             return None
 
-        trend   = self.ema_trend(df)
-        vol     = self.volume_spike(df)
-        rsi     = self.rsi_cond(df)
-        macd    = self.macd_momentum(df)
-        struct  = self.structure(df)
+        close = df["close"]
+        volume = df["volume"]
 
-        score_long = score_short = 0
-        if trend == "BULL":  score_long += 2
-        if trend == "BEAR":  score_short += 2
-        if vol == "SPIKE":   score_long += 1; score_short += 1
-        if rsi == "OVERSOLD": score_long += 1
-        if rsi == "OVERBOUGHT": score_short += 1
-        if macd == "BULL":   score_long += 1
-        if macd == "BEAR":   score_short += 1
-        if struct == "BULL": score_long += 1
-        if struct == "BEAR": score_short += 1
+        # EMA Trend
+        ema20 = self.ema(close, 20)
+        ema50 = self.ema(close, 50)
 
-        price = df['close'].iloc[-1]
-        if score_long >= MIN_SIGNAL_SCORE:
-            self.last_signal_time[sym] = datetime.now()
-            return dict(symbol=sym, direction='LONG', entry=price, score=score_long, mode=mode)
-        if score_short >= MIN_SIGNAL_SCORE:
-            self.last_signal_time[sym] = datetime.now()
-            return dict(symbol=sym, direction='SHORT', entry=price, score=score_short, mode=mode)
-        return None
+        trend = None
+        if ema20.iloc[-1] > ema50.iloc[-1]:
+            trend = "BUY"
+        elif ema20.iloc[-1] < ema50.iloc[-1]:
+            trend = "SELL"
+        else:
+            print(f"❌ {symbol} blocked: EMA flat")
+            return None
+
+        # RSI Filter (relaxed but smart)
+        rsi_val = self.rsi(close).iloc[-1]
+        if trend == "BUY" and not (40 <= rsi_val <= 65):
+            print(f"❌ {symbol} BUY blocked: RSI {rsi_val:.1f}")
+            return None
+        if trend == "SELL" and not (35 <= rsi_val <= 60):
+            print(f"❌ {symbol} SELL blocked: RSI {rsi_val:.1f}")
+            return None
+
+        # Volume confirmation
+        vol_ma = volume.rolling(VOLUME_MA_PERIOD).mean().iloc[-1]
+        vol_ratio = volume.iloc[-1] / vol_ma if vol_ma else 0
+
+        if vol_ratio < 1.2:
+            print(f"❌ {symbol} blocked: Volume weak ({vol_ratio:.2f}x)")
+            return None
+
+        # Smart candle confirmation
+        last = df.iloc[-1]
+        if trend == "BUY" and last["close"] <= last["open"]:
+            print(f"❌ {symbol} BUY blocked: red candle")
+            return None
+        if trend == "SELL" and last["close"] >= last["open"]:
+            print(f"❌ {symbol} SELL blocked: green candle")
+            return None
+
+        # Soft cooldown (only same coin, same mode)
+        key = f"{symbol}_{mode}"
+        if key in self.last_signal_time:
+            mins = (datetime.now() - self.last_signal_time[key]).seconds / 60
+            if mins < 5:
+                print(f"⏸ {symbol} cooldown {mins:.1f} min")
+                return None
+
+        # SCORE (transparent & simple)
+        score = 0
+        score += 2  # EMA trend
+        score += 2  # RSI zone
+        score += 2  # Volume
+        score += 1  # Candle direction
+
+        if score < 5:
+            print(f"❌ {symbol} blocked: low score {score}")
+            return None
+
+        # Save cooldown
+        self.last_signal_time[key] = datetime.now()
+
+        print(f"✅ SIGNAL {symbol} {trend} | RSI {rsi_val:.1f} | Vol {vol_ratio:.2f}x")
+
+        return {
+            "symbol": symbol,
+            "direction": "LONG" if trend == "BUY" else "SHORT",
+            "entry_price": close.iloc[-1],
+            "mode": mode,
+            "score": score,
+            "timestamp": datetime.now(),
+            "indicators": {
+                "ema20": ema20.iloc[-1],
+                "ema50": ema50.iloc[-1],
+                "rsi": rsi_val,
+                "volume_ratio": round(vol_ratio, 2)
+            }
+        }
