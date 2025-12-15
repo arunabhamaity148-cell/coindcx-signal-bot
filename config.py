@@ -1,6 +1,6 @@
 """
-🔐 CoinDCX Futures Trading Bot - Configuration
-Bangla Version for Best Friend 🇧🇩
+🔐 CoinDCX Futures Trading Bot - CONFIG (FINAL STABLE)
+Bangla Version 🇧🇩 | Railway + CoinDCX Ready
 """
 
 import os
@@ -8,30 +8,34 @@ import logging
 from datetime import time
 
 # ========================
-# 🔧 DEBUG MODE
+# 🔧 LOGGING / DEBUG
 # ========================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=getattr(logging, LOG_LEVEL),
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
+DEBUG_MODE = True   # 🔥 block reasons log e dekhabe
 
 # ========================
 # 🔑 API CREDENTIALS
 # ========================
-COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "your_api_key_here")
-COINDCX_SECRET = os.getenv("COINDCX_SECRET", "your_secret_here")
+COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
+COINDCX_SECRET = os.getenv("COINDCX_SECRET", "")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "your_telegram_token")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "your_chat_id")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ========================
 # 💰 TRADING PARAMETERS
 # ========================
-MARGIN_PER_TRADE = 3000  # ₹3000 per trade
-LEVERAGE = 5  # 5x leverage
-TARGET_DAILY_PROFIT = 2000  # ₹2000/day
+MARGIN_PER_TRADE = 3000      # ₹3000
+LEVERAGE = 5                # ONLY 5x (safe)
+TARGET_DAILY_PROFIT = 2000
 MAX_DAILY_SIGNALS = 15
-MIN_DAILY_SIGNALS = 10
+MIN_DAILY_SIGNALS = 5       # 🔥 loosened (10 → 5)
 
 # ========================
 # 🎯 SIGNAL MODES
@@ -39,69 +43,62 @@ MIN_DAILY_SIGNALS = 10
 SIGNAL_MODES = {
     "quick": {
         "timeframe": "5m",
-        "hold_time": 15,  # minutes
-        "tp1": 0.6,  # 0.6% TP1
-        "tp2": 1.2,  # 1.2% TP2
-        "sl": 0.4,   # 0.4% SL
+        "hold_time": 10,
+        "tp1": 0.5,
+        "tp2": 1.0,
+        "sl": 0.4,
     },
     "mid": {
         "timeframe": "15m",
-        "hold_time": 60,
-        "tp1": 1.2,
-        "tp2": 2.0,
-        "sl": 0.8,
+        "hold_time": 45,
+        "tp1": 1.0,
+        "tp2": 1.8,
+        "sl": 0.7,
     },
     "trend": {
         "timeframe": "1h",
-        "hold_time": 240,
-        "tp1": 2.0,
-        "tp2": 3.5,
+        "hold_time": 180,
+        "tp1": 1.8,
+        "tp2": 3.0,
         "sl": 1.2,
     }
 }
 
 # ========================
-# 📊 WATCHLIST (50 PAIRS)
+# 📊 WATCHLIST (SYMBOL ONLY)
 # ========================
 WATCHLIST = [
-    "BTC", "ETH", "BNB", "SOL", "XRP",
-    "ADA", "AVAX", "DOGE", "MATIC", "DOT",
-    "LINK", "LTC", "UNI", "ATOM", "FIL",
-    "NEAR", "APT", "ARB", "OP", "INJ",
-    "SUI", "TIA", "WLD", "PEPE", "SHIB",
-    "RNDR", "FET", "TAO", "JUP", "PYTH",
-    "ALGO", "SAND", "MANA", "AXS", "ICP",
-    "AAVE", "MKR", "GRT", "LDO", "STX",
-    "FTM", "WIF", "BONK", "FLOKI", "ORDI",
-    "SEI", "RUNE", "CFX", "PENDLE", "ZETA"
+    "BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOGE","MATIC","DOT",
+    "LINK","LTC","UNI","ATOM","FIL","NEAR","APT","ARB","OP","INJ",
+    "SUI","TIA","WLD","PEPE","SHIB","RNDR","FET","TAO","JUP","PYTH"
 ]
+
+TEST_PAIRS_LIMIT = 30  # Railway load control
 
 # ========================
 # ⚙️ RISK MANAGEMENT
 # ========================
-MIN_RR_RATIO = 1.5  # Lowered from 1.8 for more signals
-MAX_POSITION_SIZE = 0.15  # 15% of total capital
-LIQUIDATION_BUFFER = 0.25  # 25% buffer from liq price
+MIN_RR_RATIO = 1.5          # 🔥 relaxed (signals asbe)
+LIQUIDATION_BUFFER = 0.30   # 30% distance from liq
 MAX_CONSECUTIVE_LOSSES = 3
-COOLDOWN_AFTER_LOSS = 30  # minutes
+COOLDOWN_AFTER_LOSS = 30    # minutes
 
 # ========================
 # 🛡️ MARKET HEALTH FILTERS
 # ========================
-BTC_VOLATILITY_THRESHOLD = 3.0  # Increased from 2.5 for more flexibility
-FUNDING_RATE_EXTREME = 0.05  # ±0.05% threshold
-FEAR_GREED_EXTREME = [10, 90]  # Avoid <10 or >90
-MIN_VOLUME_24H = 500000  # Lowered from 1M
-MAX_SPREAD_PERCENT = 0.2  # Increased from 0.15
+BTC_VOLATILITY_THRESHOLD = 3.5   # 🔥 relaxed
+FEAR_GREED_EXTREME = (10, 90)
+MIN_VOLUME_24H = 300_000         # 🔥 relaxed
+MAX_SPREAD_PERCENT = 0.25
 
 # ========================
 # ⏰ TIME FILTERS
 # ========================
 AVOID_NEWS_HOURS = [
-    (time(17, 30), time(18, 30)),  # US Market Open
-    (time(13, 0), time(13, 30)),   # Asian Lunch
+    (time(17, 30), time(18, 30)),  # US open
 ]
-AVOID_WEEKENDS = False  # CoinDCX trades 24/7
+
+AVOID_WEEKENDS = False  # Crypto 24/7
 
 # ========================
 # 📈 TECHNICAL PARAMETERS
@@ -109,43 +106,45 @@ AVOID_WEEKENDS = False  # CoinDCX trades 24/7
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
+
 RSI_PERIOD = 14
-RSI_OVERSOLD = 35  # Loosened from 30
-RSI_OVERBOUGHT = 65  # Loosened from 70
+RSI_OVERSOLD = 35        # 🔥 loosened
+RSI_OVERBOUGHT = 65
+
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+
 BB_PERIOD = 20
 BB_STD = 2
+
 VOLUME_MA_PERIOD = 20
 
 # ========================
-# 📱 TELEGRAM SETTINGS
+# 📱 TELEGRAM
 # ========================
 SEND_CHART_WITH_SIGNAL = True
-PERFORMANCE_REPORT_INTERVAL = 3600  # Every hour
+PERFORMANCE_REPORT_INTERVAL = 3600
+
 EMOJI_CONFIG = {
-    "long": "🟢",
-    "short": "🔴",
-    "tp1": "🎯",
-    "tp2": "💰",
-    "sl": "🛑",
+    "long": "🟢 LONG",
+    "short": "🔴 SHORT",
+    "tp1": "🎯 TP1",
+    "tp2": "💰 TP2",
+    "sl": "🛑 SL",
+    "alert": "⚡ SIGNAL",
     "win": "✅",
     "loss": "❌",
-    "alert": "⚡",
 }
 
 # ========================
-# 🚀 SYSTEM SETTINGS
+# 🚀 SYSTEM
 # ========================
-SCAN_INTERVAL = 90  # Increased to 90 seconds
-LOG_LEVEL = "INFO"
+SCAN_INTERVAL = 90        # seconds
 ENABLE_BACKTEST_MODE = False
-DRY_RUN = False  # Set True for paper trading
+DRY_RUN = False
 
 # ========================
-# 🔧 DEBUG SETTINGS
+# 🔥 SIGNAL ENGINE
 # ========================
-DEBUG_MODE = True  # Show detailed logs
-TEST_PAIRS_LIMIT = 30  # Test first 30 pairs
-MIN_SIGNAL_SCORE = 3  # Minimum score to generate signal (lowered!)
+MIN_SIGNAL_SCORE = 3      # 🔥 VERY IMPORTANT
