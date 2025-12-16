@@ -52,28 +52,29 @@ class UniqueTradingBot:
         self.db = DatabaseManager(config.DB_PATH)
         self.signal_gen = UniqueSignalGenerator()
 
-        self.processed = set()
-        self.daily_signals = 0
-        self.last_date = datetime.now().date()
-
         logger.info("🚀 UNIQUE Bot Initialized")
 
     async def get_markets(self) -> List[str]:
         """
-        ✅ FINAL FIX
-        CoinDCX INR pairs are ONLY reliable from /market_data/ticker
+        ✅ FINAL & CORRECT
+        CoinDCX ticker endpoint returns DICT with 'data'
         """
         try:
-            data = await self.dcx._request('GET', '/market_data/ticker')
+            raw = await self.dcx._request('GET', '/market_data/ticker')
 
-            if not isinstance(data, list):
-                logger.error("Invalid ticker response")
+            if not isinstance(raw, dict):
+                logger.error("Invalid ticker root response")
+                return []
+
+            tickers = raw.get("data", [])
+            if not isinstance(tickers, list):
+                logger.error("Ticker data is not list")
                 return []
 
             inr_markets = []
 
-            for item in data:
-                market = item.get('market')
+            for item in tickers:
+                market = item.get("market")
                 if not market:
                     continue
 
@@ -128,7 +129,7 @@ class UniqueTradingBot:
             for tf in config.TIMEFRAMES:
                 try:
                     signal = await self.analyze_market(market, tf)
-                    if signal and signal['logic_score'] >= config.MIN_SCORE:
+                    if signal:
                         await self.telegram.send_message(str(signal))
                         self.db.save_signal(signal)
                         found += 1
