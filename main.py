@@ -59,43 +59,40 @@ class UniqueTradingBot:
         logger.info("🚀 UNIQUE Bot Initialized")
 
     async def get_markets(self) -> List[str]:
-        """FINAL & CORRECT CoinDCX INR market filter"""
+        """
+        ✅ FINAL FIX
+        CoinDCX INR pairs are ONLY reliable from /market_data/ticker
+        """
         try:
-            markets = await self.dcx.get_markets()
+            data = await self.dcx._request('GET', '/market_data/ticker')
 
-            if not isinstance(markets, list):
+            if not isinstance(data, list):
+                logger.error("Invalid ticker response")
                 return []
 
             inr_markets = []
 
-            for m in markets:
-                if not isinstance(m, dict):
+            for item in data:
+                market = item.get('market')
+                if not market:
                     continue
 
-                symbol = m.get('symbol', '')
-                if not symbol:
-                    continue
-
-                symbol_upper = symbol.upper()
-
-                # 🔥 FINAL WORKING LOGIC
-                if 'INR' in symbol_upper:
-                    for coin in config.COINS_TO_MONITOR:
-                        if symbol_upper.startswith(coin) or symbol_upper.startswith(f'I-{coin}') or symbol_upper.startswith(f'B-{coin}'):
-                            inr_markets.append(symbol)
-                            break
+                for coin in config.COINS_TO_MONITOR:
+                    if market == f"{coin}INR":
+                        inr_markets.append(market)
+                        break
 
             logger.info(f"📊 {len(inr_markets)} markets loaded")
             return inr_markets
 
         except Exception as e:
-            logger.error(f"Market load error: {e}")
+            logger.error(f"❌ Market load error: {e}", exc_info=True)
             return []
 
     async def analyze_market(self, market: str, timeframe: str):
         try:
             candles = await self.dcx.get_candles(market, timeframe, limit=200)
-            if len(candles) < 100:
+            if candles is None or len(candles) < 100:
                 return None
 
             orderbook = await self.dcx.get_orderbook(market)
@@ -112,7 +109,9 @@ class UniqueTradingBot:
                 timeframe=timeframe,
                 current_price_inr=price
             )
-        except:
+
+        except Exception as e:
+            logger.error(f"❌ Analysis error {market}: {e}")
             return None
 
     async def scan_all(self):
@@ -123,15 +122,25 @@ class UniqueTradingBot:
             logger.warning("⚠️ No markets found, retrying next scan...")
             return
 
+        found = 0
+
         for market in markets:
             for tf in config.TIMEFRAMES:
-                signal = await self.analyze_market(market, tf)
-                if signal:
-                    await self.telegram.send_message(str(signal))
-                await asyncio.sleep(0.2)
+                try:
+                    signal = await self.analyze_market(market, tf)
+                    if signal and signal['logic_score'] >= config.MIN_SCORE:
+                        await self.telegram.send_message(str(signal))
+                        self.db.save_signal(signal)
+                        found += 1
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    logger.error(f"❌ {market} {tf}: {e}")
+
+        logger.info(f"✅ Scan done. Found: {found}")
 
     async def run(self):
         await self.telegram.send_message("🚀 UNIQUE Bot Started")
+
         while True:
             await self.scan_all()
             await asyncio.sleep(config.SCAN_INTERVAL)
