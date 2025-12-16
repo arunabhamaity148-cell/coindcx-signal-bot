@@ -21,7 +21,7 @@ class CoinDCXAPI:
     """CoinDCX Exchange API Wrapper"""
 
     BASE_URL = "https://api.coindcx.com"
-    PUBLIC_URL = "https://api.coindcx.com"   # ✅ FIXED (was wrong earlier)
+    PUBLIC_URL = "https://public.coindcx.com"   # ✅ FIXED (was wrong earlier)
 
     def __init__(self, api_key: str, secret: str):
         self.api_key = api_key
