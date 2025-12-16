@@ -26,3 +26,4 @@ pytz==2023.3
 # websocket-client==1.7.0  # For real-time data
 # ccxt==4.2.0  # Alternative exchange library
 aiohttp
+python-telegram-bot
