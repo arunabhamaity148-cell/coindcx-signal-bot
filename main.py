@@ -69,7 +69,7 @@ class UniqueTradingBot:
         logger.info("🚀 UNIQUE Bot Initialized")
 
     async def get_markets(self) -> List[str]:
-        """Get CoinDCX markets (FIXED)"""
+        """Get CoinDCX markets (FINAL FIX)"""
         try:
             markets = await self.dcx.get_markets()
 
@@ -83,8 +83,9 @@ class UniqueTradingBot:
                 if not isinstance(m, dict):
                     continue
 
-                base = m.get('base_currency_short_name')
-                target = m.get('target_currency_short_name')
+                # 🔥 FINAL FIX (fallback added)
+                base = m.get('base_currency_short_name') or m.get('base_currency')
+                target = m.get('target_currency_short_name') or m.get('target_currency')
                 symbol = m.get('symbol')
 
                 if base in config.COINS_TO_MONITOR and target == 'INR':
