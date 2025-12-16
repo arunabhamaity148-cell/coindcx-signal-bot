@@ -21,7 +21,7 @@ class CoinDCXAPI:
     """CoinDCX Exchange API Wrapper"""
 
     BASE_URL = "https://api.coindcx.com"
-    PUBLIC_URL = "https://public.coindcx.com"
+    PUBLIC_URL = "https://api.coindcx.com"   # ✅ FIXED (was wrong earlier)
 
     def __init__(self, api_key: str, secret: str):
         self.api_key = api_key
@@ -78,23 +78,23 @@ class CoinDCXAPI:
     async def get_markets(self) -> List[Dict]:
         """Get all available markets"""
         try:
-            data = await self._request('GET', '/market_data/markets')
-            
-            # Debug logging
+            # ✅ FIXED endpoint
+            data = await self._request('GET', '/exchange/v1/markets')
+
             logger.info(f"Markets API response type: {type(data)}")
-            
+
             if not data:
                 logger.error("Empty response from markets endpoint")
                 return []
-            
+
             if not isinstance(data, list):
                 logger.error(f"Invalid markets response format. Got: {type(data)}")
                 logger.error(f"Response preview: {str(data)[:300]}")
                 return []
-            
+
             logger.info(f"Successfully fetched {len(data)} markets from API")
             return data
-            
+
         except Exception as e:
             logger.error(f"Error fetching markets: {e}", exc_info=True)
             return []
@@ -107,7 +107,6 @@ class CoinDCXAPI:
             if not isinstance(data, list):
                 return {}
 
-            # Find the specific market
             for ticker in data:
                 if ticker.get('market') == market:
                     return ticker
@@ -118,12 +117,8 @@ class CoinDCXAPI:
             return {}
 
     async def get_candles(self, market: str, interval: str, limit: int = 500) -> pd.DataFrame:
-        """
-        Get candlestick data
-        interval: '1m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '1d', '1w', '1M'
-        """
+        """Get candlestick data"""
         try:
-            # CoinDCX interval mapping
             interval_map = {
                 '5m': '5m',
                 '15m': '15m',
@@ -144,10 +139,8 @@ class CoinDCXAPI:
             if not data or not isinstance(data, list):
                 return pd.DataFrame()
 
-            # Convert to DataFrame
             df = pd.DataFrame(data)
 
-            # Rename columns to standard OHLCV format
             if 'time' in df.columns:
                 df = df.rename(columns={
                     'time': 'timestamp',
@@ -158,10 +151,8 @@ class CoinDCXAPI:
                     'volume': 'volume'
                 })
 
-            # Convert timestamp to datetime
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-            # Convert string prices to float
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -175,15 +166,12 @@ class CoinDCXAPI:
     async def get_orderbook(self, market: str, depth: int = 20) -> Dict:
         """Get order book data"""
         try:
-            payload = {
-                'pair': market
-            }
-
+            payload = {'pair': market}
             data = await self._request('GET', '/market_data/orderbook', payload)
 
             if not data:
                 return {}
-# Parse orderbook
+
             bids = []
             asks = []
 
@@ -195,10 +183,7 @@ class CoinDCXAPI:
                 for ask in data['asks'][:depth]:
                     asks.append([float(ask['price']), float(ask['quantity'])])
 
-            return {
-                'bids': bids,
-                'asks': asks
-            }
+            return {'bids': bids, 'asks': asks}
 
         except Exception as e:
             logger.error(f"Error fetching orderbook for {market}: {e}")
@@ -218,7 +203,6 @@ class TelegramNotifier:
         self.chat_id = chat_id
 
     async def send_message(self, message: str):
-        """Send plain text message"""
         try:
             await self.bot.send_message(
                 chat_id=self.chat_id,
@@ -237,11 +221,9 @@ class DatabaseManager:
         self._init_db()
 
     def _init_db(self):
-        """Initialize database tables"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # Signals table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -265,7 +247,6 @@ class DatabaseManager:
         logger.info(f"📁 Database initialized: {self.db_path}")
 
     def save_signal(self, signal: Dict):
-        """Save signal to database"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -301,12 +282,10 @@ class TechnicalIndicators:
 
     @staticmethod
     def ema(df: pd.DataFrame, period: int, column: str = 'close'):
-        """Exponential Moving Average"""
         return df[column].ewm(span=period, adjust=False).mean()
 
     @staticmethod
     def rsi(df: pd.DataFrame, period: int = 14):
-        """Relative Strength Index"""
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -315,7 +294,6 @@ class TechnicalIndicators:
 
     @staticmethod
     def atr(df: pd.DataFrame, period: int = 14):
-        """Average True Range"""
         high_low = df['high'] - df['low']
         high_close = abs(df['high'] - df['close'].shift())
         low_close = abs(df['low'] - df['close'].shift())
