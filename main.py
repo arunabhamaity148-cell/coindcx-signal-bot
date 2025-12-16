@@ -7,7 +7,7 @@ Smart, Different, Profitable
 import asyncio
 import logging
 from datetime import datetime
-from typing import List
+from typing import List, Dict
 import os
 from dotenv import load_dotenv
 
