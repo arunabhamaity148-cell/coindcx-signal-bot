@@ -1,5 +1,6 @@
 """
-Helper functions - FIXED for CoinDCX
+CoinDCX API - COMPLETE FIX
+Direct endpoint testing and fallback strategies
 """
 
 import hmac
@@ -16,21 +17,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ==================== COINDCX API (FIXED) ====================
+# ==================== COINDCX API FIXED ====================
 class CoinDCXAPI:
-    """CoinDCX Exchange API - FIXED"""
+    """CoinDCX API with multiple endpoint strategies"""
     
     BASE_URL = "https://api.coindcx.com"
     PUBLIC_URL = "https://public.coindcx.com"
+    
+    # Alternative endpoint for markets
+    ALT_MARKETS_URL = "https://api.coindcx.com/exchange/ticker"
     
     def __init__(self, api_key: str, secret: str):
         self.api_key = api_key
         self.secret = secret
         self.session = None
+        self.markets_cache = []  # Cache markets
+        self.last_cache_time = 0
     
     async def _get_session(self):
         if self.session is None:
-            self.session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=30)
+            self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
     
     def _generate_signature(self, payload: dict) -> str:
@@ -65,77 +72,173 @@ class CoinDCXAPI:
         else:
             url = f"{self.PUBLIC_URL}{endpoint}"
             
-            if method == 'GET':
-                async with session.get(url, params=payload) as response:
-                    return await response.json()
-            else:
-                async with session.post(url, json=payload) as response:
-                    return await response.json()
+            try:
+                if method == 'GET':
+                    async with session.get(url, params=payload) as response:
+                        text = await response.text()
+                        logger.debug(f"Response status: {response.status}")
+                        logger.debug(f"Response text: {text[:500]}")  # First 500 chars
+                        return await response.json()
+                else:
+                    async with session.post(url, json=payload) as response:
+                        return await response.json()
+            except Exception as e:
+                logger.error(f"Request error for {url}: {e}")
+                return None
     
-    async def get_markets(self) -> List[Dict]:
-        """Get all markets - FIXED LOGIC"""
+    async def get_markets_v1(self) -> List[Dict]:
+        """Strategy 1: /market_data/markets"""
         try:
             data = await self._request('GET', '/market_data/markets')
             
-            logger.info(f"Markets API response type: {type(data)}")
+            if isinstance(data, dict):
+                if 'error' in data or 'message' in data:
+                    logger.error(f"API Error: {data}")
+                    return []
+                
+                if 'markets' in data:
+                    data = data['markets']
+                elif 'data' in data:
+                    data = data['data']
             
-            if not data:
-                logger.error("Empty response from markets API")
-                return []
+            if isinstance(data, list) and len(data) > 0:
+                logger.info(f"✅ Strategy 1 success: {len(data)} markets")
+                return data
             
-            # Sample first market to see structure
-            if len(data) > 0:
-                logger.info(f"Sample market data: {data[0]}")
-            
-            logger.info(f"Successfully fetched {len(data)} markets from API")
-            return data
+            return []
             
         except Exception as e:
-            logger.error(f"Error fetching markets: {e}")
+            logger.error(f"Strategy 1 failed: {e}")
             return []
     
-    async def get_ticker(self, market: str) -> Dict:
-        """Get ticker - FIXED"""
+    async def get_markets_v2(self) -> List[Dict]:
+        """Strategy 2: Alternative ticker endpoint"""
         try:
-            data = await self._request('GET', '/market_data/ticker')
+            session = await self._get_session()
             
-            if not data:
-                return {}
-            
-            # CoinDCX returns array of tickers
-            for ticker in data:
-                # Match market symbol
-                if ticker.get('market') == market or ticker.get('pair') == market:
-                    return ticker
-            
-            logger.warning(f"Ticker not found for {market}")
-            return {}
-            
+            async with session.get(self.ALT_MARKETS_URL) as response:
+                data = await response.json()
+                
+                if isinstance(data, list) and len(data) > 0:
+                    logger.info(f"✅ Strategy 2 success: {len(data)} tickers")
+                    
+                    # Convert ticker format to market format
+                    markets = []
+                    for ticker in data:
+                        markets.append({
+                            'symbol': ticker.get('market', ''),
+                            'pair': ticker.get('market', ''),
+                            'base_currency': ticker.get('market', '').split('_')[0] if '_' in ticker.get('market', '') else '',
+                            'target_currency': ticker.get('market', '').split('_')[1] if '_' in ticker.get('market', '') else ''
+                        })
+                    
+                    return markets
+                
+                return []
+        
         except Exception as e:
-            logger.error(f"Error fetching ticker for {market}: {e}")
-            return {}
+            logger.error(f"Strategy 2 failed: {e}")
+            return []
     
-    async def get_candles(self, market: str, interval: str, limit: int = 500) -> pd.DataFrame:
-        """Get candles - FIXED"""
+    async def get_markets_v3(self) -> List[Dict]:
+        """Strategy 3: Hardcoded popular INR markets"""
+        logger.info("📋 Using hardcoded popular markets")
+        
+        popular_coins = [
+            'BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'ADA', 'DOGE', 'MATIC',
+            'DOT', 'AVAX', 'LINK', 'LTC', 'ATOM', 'UNI', 'ETC',
+            'NEAR', 'FTM', 'SAND', 'MANA', 'TRX', 'AAVE'
+        ]
+        
+        # Test which format CoinDCX uses
+        formats = [
+            lambda c: f"{c}INR",
+            lambda c: f"{c}INRT",
+            lambda c: f"I-{c}_INRT",
+            lambda c: f"B-{c}_INRT",
+            lambda c: f"{c}_INR",
+        ]
+        
+        markets = []
+        for coin in popular_coins:
+            for fmt in formats:
+                symbol = fmt(coin)
+                markets.append({
+                    'symbol': symbol,
+                    'pair': symbol,
+                    'base_currency': coin,
+                    'target_currency': 'INR'
+                })
+        
+        logger.info(f"📋 Created {len(markets)} market variations")
+        return markets
+    
+    async def get_markets(self) -> List[Dict]:
+        """Get markets with multiple strategies"""
+        
+        # Use cache if recent (5 minutes)
+        current_time = time.time()
+        if self.markets_cache and (current_time - self.last_cache_time) < 300:
+            logger.info(f"📦 Using cached markets: {len(self.markets_cache)}")
+            return self.markets_cache
+        
+        logger.info("🔍 Fetching markets with multiple strategies...")
+        
+        # Try Strategy 1
+        markets = await self.get_markets_v1()
+        if markets:
+            self.markets_cache = markets
+            self.last_cache_time = current_time
+            return markets
+        
+        # Try Strategy 2
+        markets = await self.get_markets_v2()
+        if markets:
+            self.markets_cache = markets
+            self.last_cache_time = current_time
+            return markets
+        
+        # Fallback Strategy 3
+        logger.warning("⚠️ Using fallback hardcoded markets")
+        markets = await self.get_markets_v3()
+        self.markets_cache = markets
+        self.last_cache_time = current_time
+        return markets
+    
+    async def get_ticker(self, market: str) -> Dict:
+        """Get ticker with error handling"""
+        try:
+            # Try public ticker endpoint
+            session = await self._get_session()
+            
+            async with session.get(f"{self.PUBLIC_URL}/market_data/ticker") as response:
+                data = await response.json()
+                
+                if isinstance(data, list):
+                    for ticker in data:
+                        ticker_market = ticker.get('market', '') or ticker.get('pair', '')
+                        if ticker_market == market:
+                            return ticker
+                
+                # Fallback: return basic structure
+                logger.warning(f"Ticker not found for {market}, using fallback")
+                return {'market': market, 'last_price': 0}
+        
+        except Exception as e:
+            logger.error(f"Ticker error {market}: {e}")
+            return {'market': market, 'last_price': 0}
+    
+    async def get_candles(self, market: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        """Get candles with fallback"""
         try:
             interval_map = {
-                '1m': '1m',
-                '5m': '5m',
-                '15m': '15m',
-                '30m': '30m',
-                '1h': '1h',
-                '2h': '2h',
-                '4h': '4h',
-                '6h': '6h',
-                '8h': '8h',
-                '1d': '1d',
-                '1w': '1w',
-                '1M': '1M'
+                '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+                '1h': '1h', '2h': '2h', '4h': '4h', '1d': '1d'
             }
             
             dcx_interval = interval_map.get(interval, '15m')
             
-            # CoinDCX candles endpoint
+            # Try to get candles
             payload = {
                 'pair': market,
                 'interval': dcx_interval,
@@ -144,80 +247,69 @@ class CoinDCXAPI:
             
             data = await self._request('GET', '/market_data/candles', payload)
             
-            if not data or len(data) == 0:
-                logger.warning(f"No candle data for {market}")
+            if not data or not isinstance(data, list) or len(data) == 0:
+                logger.warning(f"No candles for {market}")
                 return pd.DataFrame()
             
-            # Convert to DataFrame
             df = pd.DataFrame(data)
             
-            # Check columns
-            logger.debug(f"Candle columns: {df.columns.tolist()}")
+            # Try different column name variations
+            column_mappings = [
+                {'time': 'timestamp', 'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'},
+                {'t': 'timestamp', 'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'},
+                {'timestamp': 'timestamp', 'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'vol': 'volume'}
+            ]
             
-            # Rename columns based on what CoinDCX returns
-            column_mapping = {
-                'time': 'timestamp',
-                't': 'timestamp',
-                'open': 'open',
-                'o': 'open',
-                'high': 'high',
-                'h': 'high',
-                'low': 'low',
-                'l': 'low',
-                'close': 'close',
-                'c': 'close',
-                'volume': 'volume',
-                'v': 'volume'
-            }
+            for mapping in column_mappings:
+                try:
+                    df_renamed = df.rename(columns=mapping)
+                    required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                    
+                    if all(col in df_renamed.columns for col in required):
+                        df = df_renamed
+                        break
+                except:
+                    continue
             
-            df = df.rename(columns=column_mapping)
-            
-            # Ensure we have required columns
             required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
             if not all(col in df.columns for col in required):
-                logger.error(f"Missing required columns. Have: {df.columns.tolist()}")
+                logger.error(f"Missing columns. Have: {df.columns.tolist()}")
                 return pd.DataFrame()
             
-            # Convert timestamp
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             
-            # Convert to float
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # Remove NaN
             df = df.dropna()
+            
+            if len(df) < 50:
+                logger.warning(f"Only {len(df)} candles for {market}")
+                return pd.DataFrame()
             
             return df.sort_values('timestamp').reset_index(drop=True)
         
         except Exception as e:
-            logger.error(f"Error fetching candles for {market}: {e}")
+            logger.error(f"Candles error {market}: {e}")
             return pd.DataFrame()
     
     async def get_orderbook(self, market: str, depth: int = 20) -> Dict:
-        """Get orderbook - FIXED"""
+        """Get orderbook"""
         try:
-            payload = {
-                'pair': market
-            }
-            
+            payload = {'pair': market}
             data = await self._request('GET', '/market_data/orderbook', payload)
             
             if not data:
-                return {}
+                return {'bids': [], 'asks': []}
             
-            # Parse orderbook
             bids = []
             asks = []
             
-            # CoinDCX format
             if 'bids' in data:
                 if isinstance(data['bids'], dict):
-                    # Format: {"price": "quantity"}
                     for price, qty in list(data['bids'].items())[:depth]:
                         bids.append([float(price), float(qty)])
                 elif isinstance(data['bids'], list):
-                    # Format: [["price", "quantity"], ...]
                     for item in data['bids'][:depth]:
                         if isinstance(item, dict):
                             bids.append([float(item.get('price', 0)), float(item.get('quantity', 0))])
@@ -235,14 +327,11 @@ class CoinDCXAPI:
                         elif isinstance(item, list) and len(item) >= 2:
                             asks.append([float(item[0]), float(item[1])])
             
-            return {
-                'bids': bids,
-                'asks': asks
-            }
+            return {'bids': bids, 'asks': asks}
         
         except Exception as e:
-            logger.error(f"Error fetching orderbook for {market}: {e}")
-            return {}
+            logger.error(f"Orderbook error {market}: {e}")
+            return {'bids': [], 'asks': []}
     
     async def close(self):
         if self.session:
@@ -263,13 +352,13 @@ class TelegramNotifier:
                 parse_mode='Markdown'
             )
         except Exception as e:
-            logger.error(f"Error sending message: {e}")
+            logger.error(f"Telegram error: {e}")
     
     async def send_signal(self, signal: Dict):
         side_emoji = "📈" if signal['side'] == "BUY" else "📉"
         conf_emoji = {"HIGH": "🔥", "MEDIUM": "⚡", "LOW": "⚠️"}[signal['confidence']]
         
-        message = f"""🚨 *{signal['mode']} MODE SIGNAL* 🚨
+        message = f"""🚨 *{signal['mode']} SIGNAL* 🚨
 
 📌 *Pair:* {signal['market']}
 📊 *TF:* {signal['timeframe']}
@@ -284,7 +373,7 @@ class TelegramNotifier:
 {conf_emoji} *Confidence:* {signal['confidence']}
 
 ⏱️ *Mode:* {signal['mode']}
-⚠️ *Trade manually*
+⚠️ *Trade CoinDCX manually*
 
 🕐 _{datetime.now().strftime("%d-%b %I:%M %p")}_
 """
@@ -297,9 +386,9 @@ class TelegramNotifier:
             )
             logger.info(f"✅ Signal sent: {signal['market']}")
         except Exception as e:
-            logger.error(f"❌ Telegram error: {e}")
+            logger.error(f"Telegram error: {e}")
 
-# ==================== DATABASE (SAME) ====================
+# ==================== DATABASE ====================
 class DatabaseManager:
     
     def __init__(self, db_path: str):
@@ -328,29 +417,9 @@ class DatabaseManager:
             )
         ''')
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id INTEGER,
-                entry_time DATETIME,
-                exit_time DATETIME,
-                market TEXT,
-                side TEXT,
-                entry_price REAL,
-                exit_price REAL,
-                sl_price REAL,
-                tp_price REAL,
-                pnl_inr REAL,
-                pnl_percent REAL,
-                status TEXT,
-                notes TEXT,
-                FOREIGN KEY (signal_id) REFERENCES signals(id)
-            )
-        ''')
-        
         conn.commit()
         conn.close()
-        logger.info(f"📁 Database initialized: {self.db_path}")
+        logger.info(f"📁 Database ready: {self.db_path}")
     
     def save_signal(self, signal: Dict):
         try:
@@ -380,9 +449,9 @@ class DatabaseManager:
             conn.close()
         
         except Exception as e:
-            logger.error(f"❌ DB save error: {e}")
+            logger.error(f"DB error: {e}")
 
-# ==================== TECHNICAL INDICATORS (SAME) ====================
+# ==================== TECHNICAL INDICATORS ====================
 class TechnicalIndicators:
     
     @staticmethod
