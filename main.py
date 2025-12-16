@@ -62,19 +62,20 @@ class UniqueTradingBot:
         logger.info("🚀 UNIQUE Bot Initialized")
     
     async def get_markets(self) -> List[str]:
-        """FIXED: Better market detection"""
+        """Get INR markets with filtering"""
         try:
             all_markets = await self.dcx.get_markets()
             
             if not all_markets:
-                logger.error("❌ No markets returned from API")
+                logger.error("❌ No markets")
                 return []
             
-            # Debug: Show sample market
+            logger.info(f"📊 Received {len(all_markets)} total markets")
+            
+            # Show first market structure
             if len(all_markets) > 0:
                 sample = all_markets[0]
-                logger.info(f"Sample market structure: {sample}")
-                logger.info(f"Market keys: {sample.keys() if isinstance(sample, dict) else 'Not a dict'}")
+                logger.info(f"Sample: {sample}")
             
             inr_markets = []
             
@@ -82,51 +83,32 @@ class UniqueTradingBot:
                 if not isinstance(market, dict):
                     continue
                 
-                # Get symbol/pair - try different field names
                 symbol = (
                     market.get('symbol') or 
                     market.get('pair') or 
                     market.get('market') or 
-                    market.get('coindcx_name') or 
                     ''
-                )
+                ).upper()
                 
-                symbol = symbol.upper()
-                
-                # Skip if empty
-                if not symbol:
+                if not symbol or ('INR' not in symbol and 'INRT' not in symbol):
                     continue
                 
-                # Check for INR/INRT pairs
-                is_inr = ('INR' in symbol or 'INRT' in symbol)
-                
-                if not is_inr:
-                    continue
-                
-                # Match with our coins
+                # Match coins
                 for coin in config.COINS_TO_MONITOR:
-                    # Multiple pattern matching
-                    patterns = [
-                        f'{coin}INR',
-                        f'{coin}INRT',
-                        f'I-{coin}',
-                        f'B-{coin}',
-                        f'{coin}_INR',
-                        f'{coin}_INRT',
-                    ]
-                    
-                    if any(pattern in symbol for pattern in patterns):
-                        inr_markets.append(symbol)
-                        logger.debug(f"✅ Matched: {symbol} for {coin}")
+                    if (coin in symbol and 
+                        ('INR' in symbol or 'INRT' in symbol)):
+                        
+                        if symbol not in inr_markets:
+                            inr_markets.append(symbol)
+                            logger.info(f"✅ Matched: {symbol}")
                         break
             
-            logger.info(f"📊 {len(inr_markets)} INR markets found")
+            logger.info(f"📊 Found {len(inr_markets)} INR markets")
             
-            if len(inr_markets) > 0:
-                logger.info(f"Markets: {inr_markets[:5]}...")  # Show first 5
-            else:
-                logger.warning("⚠️ No INR markets matched!")
-                logger.warning(f"Sample symbols from API: {[m.get('symbol', m.get('pair', '?')) for m in all_markets[:10]]}")
+            if len(inr_markets) == 0:
+                logger.warning("⚠️ No matches! Showing all symbols:")
+                for m in all_markets[:20]:
+                    logger.warning(f"  - {m.get('symbol', m.get('pair', '?'))}")
             
             return inr_markets
         
