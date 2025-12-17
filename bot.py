@@ -11,7 +11,6 @@ from config import *
 from signal_logic import analyze_market, can_send_signal, mark_signal_sent
 from smart_logic import get_smart_signals
 
-# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -62,18 +61,18 @@ def process_market(market: str):
     if df is None:
         return
     
-    # Regular analysis
     result = analyze_market(df, market)
     
-    # Smart logic overlay
     smart = None
     if ENABLE_SMART_LOGIC:
-        smart = get_smart_signals(df, market)
+        try:
+            smart = get_smart_signals(df, market)
+        except Exception as e:
+            logging.error(f"Smart logic error: {e}")
+            smart = None
     
-    # Combine scores
     if result and smart:
-        final_score = (result['score'] * WEIGHT_REGULAR_SCORE + 
-                      smart['smart_score'] * WEIGHT_SMART_SCORE)
+        final_score = (result['score'] * WEIGHT_REGULAR_SCORE + smart['smart_score'] * WEIGHT_SMART_SCORE)
     elif result:
         final_score = result['score']
     elif smart:
@@ -86,11 +85,11 @@ def process_market(market: str):
         logging.info(f"📊 {market}: Score {final_score:.0f} < threshold")
         return
     
-    # Build message
     direction = smart['direction'] if smart else result['direction']
     emoji = "🟢" if direction == "LONG" else "🔴"
     
-    msg = f"{emoji} *{direction} SIGNAL*
+    msg = ""
+    msg += f"{emoji} *{direction} SIGNAL*
 
 "
     msg += f"💎 Market: `{market}`
@@ -99,8 +98,9 @@ def process_market(market: str):
     if smart:
         msg += f"🧠 Smart: *{smart['smart_score']:.0f}/100*
 "
-        msg += f"📊 Technical: *{result['score']:.0f}/100*
-" if result else ""
+        if result:
+            msg += f"📊 Technical: *{result['score']:.0f}/100*
+"
         msg += f"🎯 Combined: *{final_score:.0f}/100*
 "
         msg += f"⚡ Confidence: *{smart['confidence']}*
@@ -125,7 +125,6 @@ def process_market(market: str):
         msg += f"⚖️ R:R: `1:{result['rr']:.2f}`
 
 "
-        
         msg += f"📊 *Indicators:*
 "
         msg += f"RSI: `{result['rsi']:.1f}`
@@ -136,14 +135,14 @@ def process_market(market: str):
 "
         msg += f"EMA: `{result['ema_fast']:.2f}`/`{result['ema_slow']:.2f}`
 "
-        if result['pattern']:
+        if result.get('pattern'):
             msg += f"Pattern: `{result['pattern']}`
 "
-        if result['divergence']:
+        if result.get('divergence'):
             msg += f"Div: `{result['divergence']}`
 "
     
-    if smart and smart['signals']:
+    if smart and smart.get('signals'):
         msg += f"
 🧠 *Smart Signals:*
 "
@@ -175,35 +174,34 @@ def job():
 
 def main():
     """Main bot loop"""
-    startup = (
-        "🤖 *CoinDCX Smart Bot Started*
+    markets_str = ', '.join([f"`{m}`" for m in MARKETS[:4]])
+    smart_status = "ON" if ENABLE_SMART_LOGIC else "OFF"
+    
+    startup = f"🤖 *CoinDCX Smart Bot Started*
 
 "
-        f"📊 Markets: `{len(MARKETS)}`
+    startup += f"📊 Markets: `{len(MARKETS)}`
 "
-        f"⏱️ Interval: `{CANDLE_INTERVAL}`
+    startup += f"⏱️ Interval: `{CANDLE_INTERVAL}`
 "
-        f"📈 Min Score: `{MIN_SIGNAL_SCORE}`
+    startup += f"📈 Min Score: `{MIN_SIGNAL_SCORE}`
 "
-        f"🔄 Check: Every `{CHECK_INTERVAL_MINUTES}min`
+    startup += f"🔄 Check: Every `{CHECK_INTERVAL_MINUTES}min`
 "
-        f"⏳ Cooldown: `{COOLDOWN_MINUTES}min`
+    startup += f"⏳ Cooldown: `{COOLDOWN_MINUTES}min`
 "
-        f"📅 Daily Limit: `{MAX_SIGNALS_PER_DAY}`
+    startup += f"📅 Daily Limit: `{MAX_SIGNALS_PER_DAY}`
 "
-        f"🧠 Smart Logic: `{'ON' if ENABLE_SMART_LOGIC else 'OFF'}`
+    startup += f"🧠 Smart Logic: `{smart_status}`
 
 "
-        f"Pairs: {', '.join([f'`{m}`' for m in MARKETS[:4]])}"
-    )
+    startup += f"Pairs: {markets_str}"
     
     send_telegram(startup)
     logging.info("🤖 Bot initialized")
     
-    # First run
     job()
     
-    # Schedule
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job)
     
     while True:
