@@ -1,8 +1,4 @@
-import logging
-import time
-import schedule
-import requests
-import pandas as pd
+import logging, time, schedule, requests, pandas as pd
 from telegram import Bot
 from config import *
 from signal_logic import analyze_market, can_send_signal, mark_signal_sent
@@ -43,22 +39,16 @@ def check_market(market):
         return
     if result['score'] < MIN_SIGNAL_SCORE:
         return
-    direction = result['direction']
-    entry = str(round(result['entry'], 4))
-    sl = str(round(result['sl'], 4))
-    tp = str(round(result['tp1'], 4))
-    score = str(result['score'])
-    msg = direction + " on " + market + "
-Score: " + score + "
-Entry: " + entry + "
-SL: " + sl + "
-TP: " + tp
+    d = result['direction']
+    e = round(result['entry'], 4)
+    s = round(result['sl'], 4)
+    t = round(result['tp1'], 4)
+    sc = result['score']
+    msg = str(d) + " on " + str(market) + " Score:" + str(sc) + " Entry:" + str(e) + " SL:" + str(s) + " TP:" + str(t)
     send_msg(msg)
     mark_signal_sent(market)
-    logging.info("Signal sent")
 
 def scan():
-    logging.info("Scanning")
     for m in MARKETS:
         try:
             check_market(m.strip())
