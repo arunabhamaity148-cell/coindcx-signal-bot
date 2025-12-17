@@ -8,11 +8,13 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import aiohttp, numpy as np
 from collections import deque
+from aiohttp import web
 
 API_KEY    = os.getenv("COINDCX_API_KEY")
 SECRET     = os.getenv("COINDCX_SECRET")
 TG_BOT     = os.getenv("TG_BOT")
 TG_CHAT    = os.getenv("TG_CHAT")
+PORT       = int(os.getenv("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -204,6 +206,16 @@ async def notify(text: str):
     async with aiohttp.ClientSession() as s:
         await s.post(url, data=payload)
 
+# ---------- HEALTH ENDPOINT ----------
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", lambda req: web.Response(text="CoinDCX EdgeBot OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info(f"Health server running on port {PORT}")
+
 # ---------- BOT ----------
 class EdgeBot:
     def __init__(self):
@@ -239,10 +251,13 @@ class EdgeBot:
     async def run(self):
         log.info("CoinDCX EdgeBot start")
         await notify("🚀 Bot started")
+        # health endpoint
+        asyncio.create_task(start_web())
         # warm-up
         for _ in range(3):
             await self.update()
             await asyncio.sleep(20)
+        # main loop
         while True:
             try:
                 await self.scan()
