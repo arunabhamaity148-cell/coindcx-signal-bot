@@ -43,18 +43,22 @@ def check_market(market):
         return
     if result['score'] < MIN_SIGNAL_SCORE:
         return
-    msg = result['direction'] + " SIGNAL
-Market: " + market + "
-Score: " + str(result['score']) + "
-Entry: " + str(result['entry']) + "
-SL: " + str(result['sl']) + "
-TP1: " + str(result['tp1'])
+    direction = result['direction']
+    entry = str(round(result['entry'], 4))
+    sl = str(round(result['sl'], 4))
+    tp = str(round(result['tp1'], 4))
+    score = str(result['score'])
+    msg = direction + " on " + market + "
+Score: " + score + "
+Entry: " + entry + "
+SL: " + sl + "
+TP: " + tp
     send_msg(msg)
     mark_signal_sent(market)
-    logging.info("Signal sent for " + market)
+    logging.info("Signal sent")
 
 def scan():
-    logging.info("Scanning markets")
+    logging.info("Scanning")
     for m in MARKETS:
         try:
             check_market(m.strip())
