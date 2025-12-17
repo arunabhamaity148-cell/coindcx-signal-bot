@@ -10,21 +10,21 @@ from signal_logic import SignalGenerator
 class TradingBot:
 
     def __init__(self):
-        self.config = Config()
-        self.generator = SignalGenerator()
+        self.cfg = Config()
+        self.gen = SignalGenerator()
 
-        self.last_candle_time = {}     # same-candle skip
-        self.last_signal_time = {}     # direction-based cooldown
+        self.last_candle = {}
+        self.last_signal = {}
 
-    # ======================================================
+    # ==================================================
     # DATA FETCH
-    # ======================================================
-    def fetch_candles(self, market, interval, limit=120):
+    # ==================================================
+    def fetch(self, market, tf, limit=120):
         try:
-            url = f"{self.config.COINDCX_BASE_URL}/market_data/candles"
+            url = f"{self.cfg.COINDCX_BASE_URL}/market_data/candles"
             params = {
                 "pair": market,
-                "interval": interval,
+                "interval": tf,
                 "limit": limit
             }
             r = requests.get(url, params=params, timeout=10)
@@ -43,25 +43,24 @@ class TradingBot:
             } for c in data]
 
         except Exception as e:
-            print(f"❌ Candle fetch error {market} {interval}: {e}")
+            print(f"❌ Fetch error {market} {tf}: {e}")
             return None
 
-    # ======================================================
+    # ==================================================
     # BTC CALM FILTER
-    # ======================================================
-    def btc_is_calm(self):
-        btc = self.fetch_candles("B-BTC_USDT", "5m", 20)
+    # ==================================================
+    def btc_calm(self):
+        btc = self.fetch("B-BTC_USDT", "5m", 20)
         if not btc or len(btc) < 5:
             return False
 
-        last = btc[-1]
-        range_pct = (last["high"] - last["low"]) / last["close"] * 100
+        c = btc[-1]
+        range_pct = (c["high"] - c["low"]) / c["close"] * 100
+        return range_pct < 0.6
 
-        return range_pct < 0.6   # BTC calm threshold
-
-    # ======================================================
+    # ==================================================
     # TELEGRAM
-    # ======================================================
+    # ==================================================
     def send_telegram(self, signal):
         try:
             emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
@@ -83,12 +82,12 @@ class TradingBot:
 
             msg += (
                 f"\n🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"⚠️ Use proper risk management"
+                f"⚠️ Always use proper risk management"
             )
 
-            url = f"https://api.telegram.org/bot{self.config.TELEGRAM_BOT_TOKEN}/sendMessage"
+            url = f"https://api.telegram.org/bot{self.cfg.TELEGRAM_BOT_TOKEN}/sendMessage"
             payload = {
-                "chat_id": self.config.TELEGRAM_CHAT_ID,
+                "chat_id": self.cfg.TELEGRAM_CHAT_ID,
                 "text": msg
             }
 
@@ -100,78 +99,59 @@ class TradingBot:
         except Exception as e:
             print(f"❌ Telegram error: {e}")
 
-    # ======================================================
-    # CORE SCAN
-    # ======================================================
-    def scan_market(self, market):
-        candles_5m = self.fetch_candles(market, "5m")
-        candles_15m = self.fetch_candles(market, "15m")
-
-        if not candles_5m or not candles_15m:
-            return None
-
-        # same candle skip
-        latest_time = candles_5m[-1]["time"]
-        if self.last_candle_time.get(market) == latest_time:
-            return None
-        self.last_candle_time[market] = latest_time
-
-        signal = self.generator.generate_signal(
-            market,
-            candles_5m,
-            candles_15m
-        )
-
-        if not signal:
-            return None
-
-        # direction-based cooldown
-        last = self.last_signal_time.get(market)
-        if last:
-            if last["direction"] == signal["direction"]:
-                if datetime.now() - last["time"] < timedelta(minutes=30):
-                    return None
-
-        self.last_signal_time[market] = {
-            "direction": signal["direction"],
-            "time": datetime.now()
-        }
-
-        return signal
-
-    # ======================================================
+    # ==================================================
     # DYNAMIC SLEEP (NEXT 5m CANDLE)
-    # ======================================================
-    def next_candle_sleep(self):
-        now = time.time()
-        next_5m = math.ceil(now / 300) * 300
-        return max(5, next_5m - now)
+    # ==================================================
+    def sleep_next_5m(self):
+        return max(5, math.ceil(time.time() / 300) * 300 - time.time())
 
-    # ======================================================
+    # ==================================================
     # MAIN LOOP
-    # ======================================================
+    # ==================================================
     def run(self):
-        print("🤖 COINDCX BOT STARTED")
-        print(f"Interval: 5m | Scoring + MTF + BTC Calm\n")
+        print("🤖 CLEAN SCORING + MTF BOT (Telegram Enabled)")
 
         while True:
             try:
-                if not self.btc_is_calm():
+                if not self.btc_calm():
                     print("⚠️ BTC volatile → skipping this round")
                 else:
-                    for market in self.config.MARKETS:
-                        sig = self.scan_market(market)
-                        if sig:
-                            print(
-                                f"🎯 {sig['market']} "
-                                f"{sig['direction']} | "
-                                f"Score {sig['score']}"
-                            )
-                            self.send_telegram(sig)
+                    for m in self.cfg.MARKETS:
+                        c5 = self.fetch(m, "5m")
+                        c15 = self.fetch(m, "15m")
 
-                sleep_sec = self.next_candle_sleep()
-                print(f"💤 Sleeping {int(sleep_sec)} sec\n")
-                time.sleep(sleep_sec)
+                        if not c5 or not c15:
+                            continue
+
+                        # same candle skip
+                        if self.last_candle.get(m) == c5[-1]["time"]:
+                            continue
+                        self.last_candle[m] = c5[-1]["time"]
+
+                        signal = self.gen.generate_signal(m, c5, c15)
+                        if not signal:
+                            continue
+
+                        # direction-based cooldown
+                        last = self.last_signal.get(m)
+                        if last and last["direction"] == signal["direction"]:
+                            if datetime.now() - last["time"] < timedelta(minutes=30):
+                                continue
+
+                        self.last_signal[m] = {
+                            "direction": signal["direction"],
+                            "time": datetime.now()
+                        }
+
+                        print(
+                            f"🎯 {signal['market']} "
+                            f"{signal['direction']} "
+                            f"Score {signal['score']}"
+                        )
+
+                        self.send_telegram(signal)
+
+                time.sleep(self.sleep_next_5m())
 
             except KeyboardInterrupt:
                 print("🛑 Bot stopped by user")
