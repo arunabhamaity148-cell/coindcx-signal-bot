@@ -1,7 +1,7 @@
 """
-COINDCX BALANCED EDGE BOT – FINAL (1 MONTH LOCK)
-Signal-only | Manual Trading
-No auto-execution | No overtrading
+COINDCX BALANCED EDGE BOT – FINAL (ORDERBOOK OFF)
+1 Month Hands-Free | Signal Only | Manual Trading
+Stable | No 404 | No Container Stop
 """
 
 import asyncio
@@ -49,19 +49,16 @@ class Config:
     COOLDOWN_MINUTES = 30
     MIN_SCORE = 58
 
-    # TP / SL (FIXED RANGE)
+    # FIXED TP / SL RANGE
     TP_MIN = 0.018
     TP_MAX = 0.024
     SL_MIN = 0.009
     SL_MAX = 0.012
 
-    # BTC CALM
-    BTC_RANGE_5M = 0.0035  # 0.35%
+    # BTC CALM CHECK (5m approx)
+    BTC_RANGE_LIMIT = 0.0035  # 0.35%
 
-    # SPREAD
-    MAX_SPREAD = 0.35
-
-    # TIME WINDOWS
+    # SAFE TIME WINDOWS
     TIME_WINDOWS = [
         (time(9, 15), time(12, 0)),
         (time(20, 0), time(23, 0)),
@@ -71,38 +68,28 @@ class Config:
 config = Config()
 
 # =====================================================
-# DATA TRACKER
+# DATA TRACKER (NO ORDERBOOK)
 # =====================================================
 class Tracker:
     def __init__(self, size: int):
         self.prices = {}
         self.volumes = {}
-        self.orderbooks = {}
-        self.spreads = {}
         self.size = size
 
-    def add(self, m: str, price: float, vol: float, ob: dict):
+    def add(self, m: str, price: float, vol: float):
         if m not in self.prices:
             self.prices[m] = deque(maxlen=self.size)
             self.volumes[m] = deque(maxlen=self.size)
-            self.spreads[m] = deque(maxlen=self.size)
 
         self.prices[m].append(price)
         self.volumes[m].append(vol)
-        self.orderbooks[m] = ob
-
-        if ob and ob.get("bids") and ob.get("asks"):
-            bid = ob["bids"][0][0]
-            ask = ob["asks"][0][0]
-            if bid > 0:
-                self.spreads[m].append(((ask - bid) / bid) * 100)
 
     def ready(self, m: str) -> bool:
         return m in self.prices and len(self.prices[m]) >= config.MIN_DATA_POINTS
 
 
 # =====================================================
-# CORE BOT
+# FINAL BOT
 # =====================================================
 class CoinDCXFinalBot:
 
@@ -117,7 +104,7 @@ class CoinDCXFinalBot:
         self.daily_count = 0
         self.today = datetime.now().date()
 
-        logger.info("✅ FINAL COINDCX BOT INITIALIZED")
+        logger.info("✅ COINDCX FINAL BOT INITIALIZED (ORDERBOOK OFF)")
 
     # ---------------- TIME CHECK ----------------
     def in_time_window(self) -> bool:
@@ -127,13 +114,13 @@ class CoinDCXFinalBot:
                 return True
         return False
 
-    # ---------------- BTC CALM ----------------
+    # ---------------- BTC CALM CHECK ----------------
     def btc_calm(self) -> bool:
         prices = self.tracker.prices.get("BTCINR", [])
         if len(prices) < 10:
             return False
         rng = (max(prices[-10:]) - min(prices[-10:])) / prices[-1]
-        return rng < config.BTC_RANGE_5M
+        return rng < config.BTC_RANGE_LIMIT
 
     # ---------------- COOLDOWN ----------------
     def in_cooldown(self, m: str) -> bool:
@@ -151,8 +138,7 @@ class CoinDCXFinalBot:
                 continue
             price = float(t["last_price"])
             vol = float(t["volume"])
-            ob = await self.api.get_orderbook(m)
-            self.tracker.add(m, price, vol, ob)
+            self.tracker.add(m, price, vol)
 
     # ---------------- ANALYZE ----------------
     def analyze(self, m: str) -> Optional[Dict]:
@@ -163,21 +149,16 @@ class CoinDCXFinalBot:
 
         prices = self.tracker.prices[m]
         vols = self.tracker.volumes[m]
-        spreads = self.tracker.spreads[m]
 
-        if spreads and spreads[-1] > config.MAX_SPREAD:
-            return None
-
+        # Momentum + Volume agreement
         change = (prices[-1] - prices[-6]) / prices[-6]
         vol_ratio = np.mean(vols[-5:]) / np.mean(vols[-15:-5])
 
         score = 0
-        if vol_ratio > 1.2:
-            score += 25
         if abs(change) > 0.008:
-            score += 25
-        if spreads and spreads[-1] < 0.2:
-            score += 15
+            score += 30
+        if vol_ratio > 1.2:
+            score += 30
 
         if score < config.MIN_SCORE:
             return None
@@ -204,7 +185,7 @@ class CoinDCXFinalBot:
             "score": score
         }
 
-    # ---------------- SEND ----------------
+    # ---------------- SEND SIGNAL ----------------
     async def send(self, s: Dict):
         msg = f"""
 🚀 *COINDCX CONFIRMED SIGNAL*
@@ -228,8 +209,8 @@ class CoinDCXFinalBot:
     async def run(self):
         await self.tg.send_message(
             "🚀 *COINDCX FINAL BOT STARTED*\n\n"
-            "🔒 System Locked – 30 Days\n"
-            "📊 Balanced Edge Mode"
+            "🔒 Orderbook OFF | Stable Mode\n"
+            "⏳ System Locked – 30 Days"
         )
 
         while True:
