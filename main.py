@@ -96,7 +96,6 @@ class SmartPriceTracker:
                 return False
         
         return True
-
 class UniqueAnalyzer:
     """10 Unique Proprietary Indicators"""
     
@@ -107,6 +106,7 @@ class UniqueAnalyzer:
             return "DORMANT", 0
         
         prices = [h['price'] for h in history]
+        
         # Velocity (rate of change)
         velocity = (prices[-1] - prices[-5]) / prices[-5]
         
@@ -623,7 +623,8 @@ class SmartSignalBot:
     
     async def run(self):
         """Main loop"""
-logger.info("🎨 UNIQUE SMART Signal Bot Started!")
+        
+        logger.info("🎨 UNIQUE SMART Signal Bot Started!")
         logger.info("=" * 50)
         logger.info("📊 10 Proprietary Indicators")
         logger.info(f"🎯 Min Score: {config.MIN_SCORE}%")
@@ -651,8 +652,9 @@ logger.info("🎨 UNIQUE SMART Signal Bot Started!")
                       if any(c in (m.get('symbol', '') or m.get('pair', '')) 
                             for c in config.COINS_TO_MONITOR)]
                 await self.update_prices(inr)
-            await asyncio.sleep(40
-  logger.info("✅ Ready for signals!")
+            await asyncio.sleep(40)
+        
+        logger.info("✅ Ready for signals!")
         
         while True:
             try:
