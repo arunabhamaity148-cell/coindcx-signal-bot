@@ -2,7 +2,6 @@ class CandlestickPatterns:
     
     @staticmethod
     def is_bullish_engulfing(candles):
-        """Detect bullish engulfing pattern"""
         if len(candles) < 2:
             return False
         
@@ -18,7 +17,6 @@ class CandlestickPatterns:
     
     @staticmethod
     def is_bearish_engulfing(candles):
-        """Detect bearish engulfing pattern"""
         if len(candles) < 2:
             return False
         
@@ -34,7 +32,6 @@ class CandlestickPatterns:
     
     @staticmethod
     def is_hammer(candle):
-        """Detect hammer pattern (bullish reversal)"""
         body = abs(candle['close'] - candle['open'])
         total_range = candle['high'] - candle['low']
         
@@ -44,12 +41,10 @@ class CandlestickPatterns:
         lower_shadow = min(candle['open'], candle['close']) - candle['low']
         upper_shadow = candle['high'] - max(candle['open'], candle['close'])
         
-        # Long lower shadow, small body, little/no upper shadow
         return lower_shadow > body * 2 and upper_shadow < body * 0.5 and body / total_range < 0.3
     
     @staticmethod
     def is_shooting_star(candle):
-        """Detect shooting star pattern (bearish reversal)"""
         body = abs(candle['close'] - candle['open'])
         total_range = candle['high'] - candle['low']
         
@@ -59,24 +54,10 @@ class CandlestickPatterns:
         lower_shadow = min(candle['open'], candle['close']) - candle['low']
         upper_shadow = candle['high'] - max(candle['open'], candle['close'])
         
-        # Long upper shadow, small body, little/no lower shadow
         return upper_shadow > body * 2 and lower_shadow < body * 0.5 and body / total_range < 0.3
     
     @staticmethod
-    def is_doji(candle):
-        """Detect doji pattern (indecision)"""
-        body = abs(candle['close'] - candle['open'])
-        total_range = candle['high'] - candle['low']
-        
-        if total_range == 0:
-            return False
-        
-        # Very small body relative to total range
-        return body / total_range < 0.1
-    
-    @staticmethod
     def is_morning_star(candles):
-        """Detect morning star pattern (bullish reversal)"""
         if len(candles) < 3:
             return False
         
@@ -92,7 +73,6 @@ class CandlestickPatterns:
     
     @staticmethod
     def is_evening_star(candles):
-        """Detect evening star pattern (bearish reversal)"""
         if len(candles) < 3:
             return False
         
