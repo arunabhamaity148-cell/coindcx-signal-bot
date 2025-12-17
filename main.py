@@ -118,7 +118,7 @@ class Tracker:
     def spread_pct(self, m: str) -> float:
         return self.spreads[m][-1] if self.spreads.get(m) else 0.0
 
-    def vol spike(self, m: str) -> Tuple[bool, str]:
+    def vol_spike(self, m: str) -> Tuple[bool, str]:
         if not self.ready(m, 30): return False, ""
         v = list(self.vols[m])
         cur, avg = v[-1], np.mean(v[-20:-1])
