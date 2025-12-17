@@ -1,14 +1,14 @@
 """
-WINNING CoinDCX Signal Bot
-Professional-grade strategy for HIGH WIN RATE
-Only CoinDCX data, Manual trading
-Target: 75%+ win rate, 10-20 signals/day
+CoinDCX-SPECIFIC Trading Bot
+Uses REAL CoinDCX market characteristics
+NOT generic Binance strategies
+Target: 65%+ win rate, 12-18 signals/day
 """
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime, time
+from typing import Dict, List, Optional, Tuple
 import os
 from dotenv import load_dotenv
 from collections import deque
@@ -22,7 +22,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('winning_bot.log'),
+        logging.FileHandler('coindcx_edge.log'),
         logging.StreamHandler()
     ]
 )
@@ -34,64 +34,71 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
     
-    # HIGH WIN RATE coins (Best liquidity on CoinDCX)
-    COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'MATIC', 'DOGE', 'ADA', 'DOT', 'LINK', 'UNI']
+    # Best liquid coins on CoinDCX
+    COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'MATIC', 'DOGE', 'ADA']
     
-    # WINNING SETTINGS
-    MIN_SCORE = 65  # High quality threshold
-    SCAN_INTERVAL = 30  # Fast scanning
-    PRICE_HISTORY = 40  # Good data depth
-    MIN_DATA_POINTS = 20  # Quick signals
+    # CoinDCX-SPECIFIC SETTINGS
+    MIN_SCORE = 50  # Balanced for CoinDCX liquidity
+    SCAN_INTERVAL = 25  # Fast for CoinDCX volatility
+    PRICE_HISTORY = 35
+    MIN_DATA_POINTS = 18
     
-    # RISK MANAGEMENT
-    MIN_RR_RATIO = 1.8  # Minimum 1:1.8 R:R
-    MAX_DAILY_SIGNALS = 20  # Quality control
+    # Edge parameters
+    INR_PREMIUM_THRESHOLD = 0.035  # 3.5% premium = overbought
+    WHALE_WALL_RATIO = 6  # 6x avg order = fake wall
+    VOLUME_SPIKE_RATIO = 3.5  # 3.5x avg = artificial
+    MIN_SPREAD_PCT = 0.08  # 0.08% min for good execution
+    MAX_SPREAD_PCT = 0.35  # 0.35% max acceptable
     
 config = Config()
 
-class PriceTracker:
-    """Track price + orderbook data"""
+class CoinDCXDataTracker:
+    """Track CoinDCX-specific data"""
     
-    def __init__(self, size: int = 40):
-        self.prices = {}  # {market: deque of prices}
-        self.volumes = {}  # {market: deque of volumes}
-        self.orderbooks = {}  # {market: latest orderbook}
+    def __init__(self, size: int = 35):
+        self.prices = {}
+        self.volumes = {}
+        self.orderbooks = {}
+        self.spreads = {}
         self.last_update = {}
         self.size = size
     
     def add_data(self, market: str, price: float, volume: float, orderbook: dict):
-        """Add new data point"""
-        
         # Validate
         if market in self.prices and len(self.prices[market]) > 0:
             last = self.prices[market][-1]
             change = abs(price - last) / last
-            if change > 0.20:  # Skip >20% jump
+            if change > 0.25:
                 return
         
         if market not in self.prices:
             self.prices[market] = deque(maxlen=self.size)
             self.volumes[market] = deque(maxlen=self.size)
+            self.spreads[market] = deque(maxlen=self.size)
         
         self.prices[market].append(price)
         self.volumes[market].append(volume)
         self.orderbooks[market] = orderbook
+        
+        # Calculate spread
+        if orderbook and orderbook.get('bids') and orderbook.get('asks'):
+            bid = orderbook['bids'][0][0]
+            ask = orderbook['asks'][0][0]
+            if bid > 0:
+                spread_pct = ((ask - bid) / bid) * 100
+                self.spreads[market].append(spread_pct)
+        
         self.last_update[market] = datetime.now()
     
     def has_data(self, market: str, min_points: int) -> bool:
-        """Check if enough data"""
         if market not in self.prices:
             return False
-        
         if len(self.prices[market]) < min_points:
             return False
-        
-        # Freshness check
         if market in self.last_update:
             age = (datetime.now() - self.last_update[market]).seconds
-            if age > 120:  # 2 minutes max
+            if age > 90:
                 return False
-        
         return True
     
     def get_prices(self, market: str) -> List[float]:
@@ -102,169 +109,181 @@ class PriceTracker:
     
     def get_orderbook(self, market: str) -> dict:
         return self.orderbooks.get(market, {})
+    
+    def get_spreads(self, market: str) -> List[float]:
+        return list(self.spreads.get(market, []))
 
-class WinningAnalyzer:
-    """Professional analysis for HIGH WIN RATE"""
+class CoinDCXEdgeAnalyzer:
+    """CoinDCX-specific edge detection"""
     
     @staticmethod
-    def orderbook_imbalance(orderbook: dict) -> tuple:
-        """Factor 1: Smart money detection"""
+    def detect_whale_wall(orderbook: dict) -> Tuple[str, int]:
+        """Trick 1: Fake wall detection"""
+        if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
+            return "NONE", 0
+        
+        bid_sizes = [b[1] for b in orderbook['bids'][:5]]
+        ask_sizes = [a[1] for a in orderbook['asks'][:5]]
+        
+        if len(bid_sizes) < 5 or len(ask_sizes) < 5:
+            return "NONE", 0
+        
+        avg_bid = np.mean(bid_sizes[1:])
+        avg_ask = np.mean(ask_sizes[1:])
+        
+        # Fake support wall
+        if bid_sizes[0] > avg_bid * config.WHALE_WALL_RATIO:
+            return "FAKE_SUPPORT", 12  # Likely to be pulled, expect dump
+        
+        # Fake resistance wall
+        if ask_sizes[0] > avg_ask * config.WHALE_WALL_RATIO:
+            return "FAKE_RESISTANCE", 12  # Likely to be pulled, expect pump
+        
+        return "NONE", 0
+    
+    @staticmethod
+    def volume_spike_fade(volumes: List[float]) -> Tuple[bool, str, int]:
+        """Trick 2: Fade artificial volume spikes"""
+        if len(volumes) < 20:
+            return False, "NONE", 0
+        
+        avg_vol = np.mean(volumes[-20:-1])
+        current_vol = volumes[-1]
+        prev_vol = volumes[-2]
+        
+        if avg_vol == 0:
+            return False, "NONE", 0
+        
+        spike_ratio = current_vol / avg_vol
+        
+        # Artificial spike without follow-through
+        if spike_ratio > config.VOLUME_SPIKE_RATIO:
+            if prev_vol < avg_vol * 1.5:  # Previous candle normal
+                return True, "FADE_SPIKE", 15  # High probability reversal
+        
+        return False, "NONE", 0
+    
+    @staticmethod
+    def time_based_edge() -> Tuple[bool, str, int]:
+        """Trick 3: CoinDCX time-based patterns"""
+        now = datetime.now()
+        hour = now.hour
+        weekday = now.weekday()
+        
+        # Weekend = range-bound (mean reversion works)
+        if weekday >= 5:  # Saturday, Sunday
+            return True, "WEEKEND_RANGE", 8
+        
+        # High activity hours (best signals)
+        if 10 <= hour <= 11 or 20 <= hour <= 22:
+            return True, "HIGH_ACTIVITY", 10
+        
+        # Dead zone (avoid)
+        if 14 <= hour <= 16:
+            return False, "DEAD_ZONE", 0
+        
+        # Normal hours
+        if 9 <= hour <= 23:
+            return True, "NORMAL_HOURS", 5
+        
+        # Night (low liquidity, avoid)
+        return False, "LOW_LIQUIDITY", 0
+    
+    @staticmethod
+    def spread_quality_check(spreads: List[float]) -> Tuple[str, int]:
+        """Trick 4: Spread-based execution quality"""
+        if len(spreads) < 5:
+            return "UNKNOWN", 0
+        
+        current_spread = spreads[-1]
+        avg_spread = np.mean(spreads[-10:])
+        
+        # Excellent execution
+        if current_spread < config.MIN_SPREAD_PCT:
+            return "EXCELLENT", 10
+        
+        # Good execution
+        if current_spread < avg_spread * 0.8:
+            return "GOOD", 8
+        
+        # Poor execution (high spread)
+        if current_spread > config.MAX_SPREAD_PCT:
+            return "POOR", 0
+        
+        # Acceptable
+        return "ACCEPTABLE", 5
+    
+    @staticmethod
+    def orderbook_imbalance_coindcx(orderbook: dict) -> Tuple[float, str, int]:
+        """Trick 5: CoinDCX-specific imbalance (smaller depth)"""
         if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
             return 0, "NEUTRAL", 0
         
-        # Top 5 levels
-        bid_vol = sum([b[1] for b in orderbook['bids'][:5]])
-        ask_vol = sum([a[1] for a in orderbook['asks'][:5]])
+        # CoinDCX: Use top 3 levels (not 5, less liquid)
+        bid_vol = sum([b[1] for b in orderbook['bids'][:3]])
+        ask_vol = sum([a[1] for a in orderbook['asks'][:3]])
         
         total = bid_vol + ask_vol
         if total == 0:
             return 0, "NEUTRAL", 0
         
         imbalance = (bid_vol - ask_vol) / total
-        # Scoring
-        if imbalance > 0.25:
-            return imbalance, "STRONG_BUY", 15
-        elif imbalance > 0.15:
-            return imbalance, "BUY", 10
-        elif imbalance < -0.25:
-            return imbalance, "STRONG_SELL", 15
-        elif imbalance < -0.15:
-            return imbalance, "SELL", 10
+        
+        # Lower thresholds for CoinDCX
+        if imbalance > 0.20:
+            return imbalance, "STRONG_BUY", 12
+        elif imbalance > 0.12:
+            return imbalance, "BUY", 8
+        elif imbalance < -0.20:
+            return imbalance, "STRONG_SELL", 12
+        elif imbalance < -0.12:
+            return imbalance, "SELL", 8
         else:
             return imbalance, "NEUTRAL", 0
     
     @staticmethod
-    def volume_surge(volumes: List[float]) -> tuple:
-        """Factor 2: Institutional activity"""
-        if len(volumes) < 15:
-            return False, 0
-        
-        recent = np.mean(volumes[-5:])
-        avg = np.mean(volumes[-15:])
-        
-        if avg == 0:
-            return False, 0
-        
-        ratio = recent / avg
-        
-        if ratio > 2.5:
-            return True, 15  # Very strong
-        elif ratio > 2.0:
-            return True, 12
-        elif ratio > 1.5:
-            return True, 8
-        else:
-            return False, 0
-    
-    @staticmethod
-    def momentum_strength(prices: List[float]) -> tuple:
-        """Factor 3: Strong trend detection"""
-        if len(prices) < 20:
-            return "NONE", 0
-        
-        # Multi-timeframe momentum
-        short = (prices[-1] - prices[-5]) / prices[-5]  # 5-period
-        medium = (prices[-1] - prices[-10]) / prices[-10]  # 10-period
-        long = (prices[-1] - prices[-20]) / prices[-20]  # 20-period
-        
-        # All aligned = strong trend
-        if all([short > 0.01, medium > 0.015, long > 0.02]):
-            return "STRONG_UP", 15
-        elif all([short < -0.01, medium < -0.015, long < -0.02]):
-            return "STRONG_DOWN", 15
-        elif short > 0.008 and medium > 0.01:
-            return "UP", 10
-        elif short < -0.008 and medium < -0.01:
-            return "DOWN", 10
-        else:
-            return "NONE", 0
-    
-    @staticmethod
-    def spread_quality(orderbook: dict) -> tuple:
-        """Factor 4: Execution advantage"""
-        if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
-            return 0, 0
-        
-        best_bid = orderbook['bids'][0][0]
-        best_ask = orderbook['asks'][0][0]
-        
-        if best_bid == 0:
-            return 0, 0
-        
-        spread_pct = ((best_ask - best_bid) / best_bid) * 100
-        
-        # Tighter spread = better execution
-        if spread_pct < 0.05:
-            return spread_pct, 10
-        elif spread_pct < 0.10:
-            return spread_pct, 7
-        elif spread_pct < 0.15:
-            return spread_pct, 4
-        else:
-            return spread_pct, 0
-    
-    @staticmethod
-    def price_consolidation(prices: List[float]) -> tuple:
-        """Factor 5: Breakout setup detection"""
-        if len(prices) < 20:
-            return False, 0
-        
-        # Check if price consolidating (low volatility)
-        recent = prices[-10:]
-        volatility = np.std(recent) / np.mean(recent)
-        
-        # Low volatility before breakout
-        if volatility < 0.015:  # Very tight
-            # Check if approaching breakout
-            if prices[-1] == max(recent) or prices[-1] == min(recent):
-                return True, 12  # At range extreme
-            else:
-                return True, 8  # Consolidating
-        else:
-            return False, 0
-    
-    @staticmethod
-    def volume_price_divergence(prices: List[float], volumes: List[float]) -> tuple:
-        """Factor 6: Hidden strength/weakness"""
+    def low_liquidity_momentum(prices: List[float], volumes: List[float]) -> Tuple[str, int]:
+        """Trick 6: CoinDCX momentum (adjusts for low liquidity)"""
         if len(prices) < 15 or len(volumes) < 15:
             return "NONE", 0
         
-        price_trend = prices[-1] - prices[-10]
+        # Shorter timeframes for CoinDCX
+        recent_change = (prices[-1] - prices[-8]) / prices[-8]
+        vol_trend = np.mean(volumes[-5:]) / np.mean(volumes[-15:-5])
         
-        vol_recent = np.mean(volumes[-5:])
-        vol_past = np.mean(volumes[-15:-5])
+        # Strong momentum with volume
+        if recent_change > 0.015 and vol_trend > 1.3:
+            return "STRONG_UP", 12
+        elif recent_change < -0.015 and vol_trend > 1.3:
+            return "STRONG_DOWN", 12
         
-        # Bullish: Price down but volume increasing (accumulation)
-        if price_trend < 0 and vol_recent > vol_past * 1.5:
-            return "BULLISH_DIV", 10
+        # Moderate momentum
+        if recent_change > 0.008 and vol_trend > 1.1:
+            return "UP", 8
+        elif recent_change < -0.008 and vol_trend > 1.1:
+            return "DOWN", 8
         
-        # Bearish: Price up but volume decreasing (distribution)
-        elif price_trend > 0 and vol_recent < vol_past * 0.7:
-            return "BEARISH_DIV", 10
-        
-        else:
-            return "NONE", 0
+        return "NONE", 0
 
-class WinningSignalBot:
-    """Professional signal generation - HIGH WIN RATE"""
+class CoinDCXEdgeBot:
+    """CoinDCX-specific edge trading bot"""
     
     def __init__(self):
         self.dcx = CoinDCXAPI(config.COINDCX_API_KEY, config.COINDCX_SECRET)
         self.telegram = TelegramNotifier(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
-        self.db = DatabaseManager('winning_signals.db')
-        self.tracker = PriceTracker(config.PRICE_HISTORY)
-        self.analyzer = WinningAnalyzer()
+        self.db = DatabaseManager('coindcx_edge.db')
+        self.tracker = CoinDCXDataTracker(config.PRICE_HISTORY)
+        self.analyzer = CoinDCXEdgeAnalyzer()
         
         self.processed = set()
         self.daily_signals = 0
         self.last_date = datetime.now().date()
         
-        logger.info("✅ WINNING Signal Bot initialized")
+        logger.info("✅ CoinDCX Edge Bot initialized")
     
-    async def update_all_data(self, markets: List[str]):
-        """Update price + orderbook data"""
+    async def update_data(self, markets: List[str]):
+        """Update all data"""
         try:
-            # Get tickers
             session = await self.dcx._get_session()
             async with session.get(f"{self.dcx.PUBLIC_URL}/market_data/ticker") as response:
                 tickers = await response.json()
@@ -272,9 +291,7 @@ class WinningSignalBot:
             if not isinstance(tickers, list):
                 return
             
-            # Process each market
             for market in markets:
-                # Find ticker
                 ticker = None
                 for t in tickers:
                     if t.get('market', '') == market:
@@ -290,17 +307,14 @@ class WinningSignalBot:
                 if price == 0:
                     continue
                 
-                # Get orderbook
                 orderbook = await self.dcx.get_orderbook(market)
-                
-                # Add to tracker
                 self.tracker.add_data(market, price, volume, orderbook)
         
         except Exception as e:
             logger.error(f"Data update error: {e}")
     
-    def analyze_market(self, market: str) -> Optional[Dict]:
-        """Deep professional analysis"""
+    def analyze_coindcx_market(self, market: str) -> Optional[Dict]:
+        """CoinDCX-specific analysis"""
         
         if not self.tracker.has_data(market, config.MIN_DATA_POINTS):
             return None
@@ -308,47 +322,49 @@ class WinningSignalBot:
         prices = self.tracker.get_prices(market)
         volumes = self.tracker.get_volumes(market)
         orderbook = self.tracker.get_orderbook(market)
-        
-        # === 6 PROFESSIONAL FACTORS ===
+        spreads = self.tracker.get_spreads(market)
         
         score = 0
-        factors = {}
+        edge_factors = {}
+# === 6 CoinDCX-SPECIFIC EDGES ===
         
-        # 1. Orderbook Imbalance (15 pts)
-        imb_val, imb_dir, imb_score = self.analyzer.orderbook_imbalance(orderbook)
-        score += imb_score
-        factors['imbalance'] = {'value': round(imb_val, 3), 'direction': imb_dir}
+        # 1. Whale Wall Detection (12 pts)
+        wall_type, wall_score = self.analyzer.detect_whale_wall(orderbook)
+        score += wall_score
+        edge_factors['whale_wall'] = wall_type
         
-        # 2. Volume Surge (15 pts)
-        vol_surge, vol_score = self.analyzer.volume_surge(volumes)
-        score += vol_score
-        factors['volume_surge'] = vol_surge
+        # 2. Volume Spike Fade (15 pts)
+        is_spike, spike_type, spike_score = self.analyzer.volume_spike_fade(volumes)
+        score += spike_score
+        edge_factors['volume_spike'] = spike_type
         
-        # 3. Momentum Strength (15 pts)
-        mom_dir, mom_score = self.analyzer.momentum_strength(prices)
-        score += mom_score
-        factors['momentum'] = mom_dir
+        # 3. Time-Based Edge (10 pts)
+        time_ok, time_type, time_score = self.analyzer.time_based_edge()
+        if not time_ok:
+            return None  # Skip bad times
+        score += time_score
+        edge_factors['time_edge'] = time_type
         
         # 4. Spread Quality (10 pts)
-        spread_val, spread_score = self.analyzer.spread_quality(orderbook)
+        spread_qual, spread_score = self.analyzer.spread_quality_check(spreads)
         score += spread_score
-        factors['spread'] = round(spread_val, 4)
+        edge_factors['spread'] = spread_qual
         
-        # 5. Price Consolidation (12 pts)
-        consol, consol_score = self.analyzer.price_consolidation(prices)
-        score += consol_score
-        factors['consolidation'] = consol
+        # 5. Orderbook Imbalance (12 pts)
+        imb_val, imb_dir, imb_score = self.analyzer.orderbook_imbalance_coindcx(orderbook)
+        score += imb_score
+        edge_factors['imbalance'] = {'value': round(imb_val, 3), 'direction': imb_dir}
         
-        # 6. Volume-Price Divergence (10 pts)
-        div_type, div_score = self.analyzer.volume_price_divergence(prices, volumes)
-        score += div_score
-        factors['divergence'] = div_type
+        # 6. Low Liquidity Momentum (12 pts)
+        mom_dir, mom_score = self.analyzer.low_liquidity_momentum(prices, volumes)
+        score += mom_score
+        edge_factors['momentum'] = mom_dir
         
-        # Calculate final score
-        max_possible = 77
+        # Final score
+        max_possible = 71
         final_score = int((score / max_possible) * 100)
         
-        logger.info(f"{market}: Score={final_score}% | Imb={imb_score} Vol={vol_score} Mom={mom_score} Spread={spread_score}")
+        logger.info(f"{market}: Score={final_score}% | Wall={wall_score} Spike={spike_score} Time={time_score}")
         
         if final_score < config.MIN_SCORE:
             return None
@@ -358,30 +374,31 @@ class WinningSignalBot:
         bullish = 0
         bearish = 0
         
-        # Orderbook
+        # Whale walls (reverse logic)
+        if "FAKE_SUPPORT" in wall_type:
+            bearish += 3  # Support will be pulled, price drops
+        elif "FAKE_RESISTANCE" in wall_type:
+            bullish += 3  # Resistance will be pulled, price pumps
+        
+        # Volume spike (fade logic)
+        if "FADE" in spike_type:
+            # Check direction to fade
+            if prices[-1] > prices[-5]:
+                bearish += 3  # Fade upward spike
+            else:
+                bullish += 3  # Fade downward spike
+        
+        # Imbalance
         if "BUY" in imb_dir:
-            bullish += 3
+            bullish += 2
         elif "SELL" in imb_dir:
-            bearish += 3
+            bearish += 2
         
         # Momentum
         if "UP" in mom_dir:
-            bullish += 3
-        elif "DOWN" in mom_dir:
-            bearish += 3
-        
-        # Divergence
-        if "BULLISH" in div_type:
             bullish += 2
-        elif "BEARISH" in div_type:
+        elif "DOWN" in mom_dir:
             bearish += 2
-        
-        # Volume surge adds weight to direction
-        if vol_surge:
-            if bullish > bearish:
-                bullish += 2
-            elif bearish > bullish:
-                bearish += 2
         
         # Decision
         if bullish <= bearish:
@@ -396,37 +413,32 @@ class WinningSignalBot:
         # === CALCULATE LEVELS ===
         
         current_price = prices[-1]
-        
-        # ATR for stop/target
         price_changes = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
-        atr = np.mean(price_changes[-14:])
+        atr = np.mean(price_changes[-12:])
         
+        # CoinDCX: Wider stops due to volatility
         if side == "BUY":
             entry = current_price
-            sl = entry - (atr * 2.5)
-            tp = entry + (atr * 5)  # 1:2 R:R
+            sl = entry - (atr * 3)
+            tp = entry + (atr * 6)
         else:
             entry = current_price
-            sl = entry + (atr * 2.5)
-            tp = entry - (atr * 5)
+            sl = entry + (atr * 3)
+            tp = entry - (atr * 6)
         
         rr_ratio = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
         
-        # Check minimum R:R
-        if rr_ratio < config.MIN_RR_RATIO:
-            return None
-        
         # Confidence
-        if final_score >= 80:
-            confidence = "VERY_HIGH"
-        elif final_score >= 72:
+        if final_score >= 70:
             confidence = "HIGH"
-        else:
+        elif final_score >= 58:
             confidence = "GOOD"
+        else:
+            confidence = "MODERATE"
         
         return {
             'market': market,
-            'timeframe': 'PROFESSIONAL',
+            'timeframe': 'COINDCX',
             'side': side,
             'entry': round(entry, 2),
             'sl': round(sl, 2),
@@ -434,44 +446,39 @@ class WinningSignalBot:
             'rr_ratio': round(rr_ratio, 1),
             'logic_score': final_score,
             'confidence': confidence,
-            'mode': 'WIN',
-            'factors': factors
+            'mode': 'EDGE',
+            'edge_factors': edge_factors
         }
     
-    async def send_signal(self, signal: Dict):
-        """Send winning signal"""
+    async def send_edge_signal(self, signal: Dict):
+        """Send CoinDCX edge signal"""
         
         side_emoji = "📈" if signal['side'] == "BUY" else "📉"
-        conf_map = {
-            "VERY_HIGH": "🔥🔥🔥",
-            "HIGH": "🔥🔥",
-            "GOOD": "🔥"
-        }
-        conf_emoji = conf_map[signal['confidence']]
+        conf_emoji = {"HIGH": "🔥", "GOOD": "✨", "MODERATE": "⚡"}[signal['confidence']]
         
-        factors = signal['factors']
+        factors = signal['edge_factors']
         
         insights = []
         
-        imb = factors['imbalance']
-        if "STRONG" in imb['direction']:
-            insights.append(f"🐋 {imb['direction']} ({imb['value']:+.2%})")
+        if "FAKE" in factors.get('whale_wall', ''):
+            insights.append(f"🐋 {factors['whale_wall']}")
         
-        if factors['volume_surge']:
-            insights.append("📊 Volume Surge Detected")
+        if "FADE" in factors.get('volume_spike', ''):
+            insights.append("📊 Fade Artificial Spike")
         
-        if "STRONG" in factors['momentum']:
-            insights.append(f"⚡ {factors['momentum']}")
+        imb = factors.get('imbalance', {})
+        if "STRONG" in imb.get('direction', ''):
+            insights.append(f"💪 {imb['direction']}")
         
-        if factors['consolidation']:
-            insights.append("🎯 Breakout Setup")
+        if factors.get('spread') in ['EXCELLENT', 'GOOD']:
+            insights.append(f"✅ Spread: {factors['spread']}")
         
-        if "DIV" in factors['divergence']:
-            insights.append(f"🔄 {factors['divergence']}")
+        if factors.get('time_edge') != 'NORMAL_HOURS':
+            insights.append(f"⏰ {factors['time_edge']}")
         
-        insight_text = "\n".join([f"  • {i}" for i in insights[:4]]) if insights else "  • Strong setup"
+        insight_text = "\n".join([f"  • {i}" for i in insights[:4]]) if insights else "  • CoinDCX Edge Detected"
         
-        message = f"""🏆 *WINNING SIGNAL* 🏆
+        message = f"""🎯 *COINDCX EDGE SIGNAL* 🎯
 
 📌 *Pair:* {signal['market']}
 {side_emoji} *Side:* *{signal['side']}*
@@ -484,11 +491,11 @@ class WinningSignalBot:
 🧠 *Score:* {signal['logic_score']}%
 {conf_emoji} *Confidence:* {signal['confidence']}
 
-🎨 *Professional Factors:*
+🎯 *CoinDCX Edge Factors:*
 {insight_text}
 
-💼 *CoinDCX Manual Trade*
-✅ *High Win Probability*
+💼 *Manual Trade on CoinDCX*
+✅ *Market-Specific Strategy*
 
 🕐 _{datetime.now().strftime("%d-%b %I:%M %p")}_
 """
@@ -499,30 +506,23 @@ class WinningSignalBot:
                 text=message,
                 parse_mode='Markdown'
             )
-            logger.info(f"✅ WINNING Signal: {signal['market']} {signal['side']} ({signal['logic_score']}%)")
+            logger.info(f"✅ Edge Signal: {signal['market']} {signal['side']} ({signal['logic_score']}%)")
         except Exception as e:
             logger.error(f"Telegram error: {e}")
     
     async def scan(self):
-        """Professional market scan"""
+        """Scan with CoinDCX edge"""
         
         today = datetime.now().date()
         if today != self.last_date:
             self.daily_signals = 0
             self.last_date = today
-            logger.info(f"📅 New trading day: {today}")
+            logger.info(f"📅 New day: {today}")
         
-        # Check daily limit
-        if self.daily_signals >= config.MAX_DAILY_SIGNALS:
-            logger.info(f"Daily limit reached: {self.daily_signals}/{config.MAX_DAILY_SIGNALS}")
-            return
-        
-        # Get markets
         markets_data = await self.dcx.get_markets()
         if not markets_data:
             return
         
-        # Filter INR markets
         inr_markets = []
         for m in markets_data:
             symbol = m.get('symbol', '') or m.get('pair', '')
@@ -535,21 +535,19 @@ class WinningSignalBot:
         if not inr_markets:
             return
         
-        # Update data
-        await self.update_all_data(inr_markets)
+        await self.update_data(inr_markets)
         
-        # Analyze
         found = 0
         
         for market in inr_markets:
             try:
-                signal = self.analyze_market(market)
+                signal = self.analyze_coindcx_market(market)
                 
                 if signal:
                     key = f"{market}_{signal['side']}_{datetime.now().strftime('%Y%m%d%H')}"
                     
                     if key not in self.processed:
-                        await self.send_signal(signal)
+                        await self.send_edge_signal(signal)
                         self.db.save_signal(signal)
                         self.processed.add(key)
                         self.daily_signals += 1
@@ -564,34 +562,35 @@ class WinningSignalBot:
                 logger.error(f"Analysis error {market}: {e}")
                 continue
         
-        logger.info(f"✅ Scan complete. Signals: {found} | Today: {self.daily_signals}/{config.MAX_DAILY_SIGNALS}")
+        logger.info(f"✅ CoinDCX scan done. Signals: {found} | Today: {self.daily_signals}")
     
     async def run(self):
         """Main loop"""
         
-        logger.info("🏆 WINNING Signal Bot Started!")
+        logger.info("🎯 CoinDCX EDGE Bot Started!")
         logger.info("=" * 50)
-        logger.info("📊 Professional 6-Factor Analysis")
+        logger.info("📊 CoinDCX-Specific Strategy")
         logger.info(f"🎯 Min Score: {config.MIN_SCORE}%")
-        logger.info(f"📐 Min R:R: 1:{config.MIN_RR_RATIO}")
         logger.info(f"⏱️ Scan: {config.SCAN_INTERVAL}s")
-        logger.info(f"🎯 Max signals/day: {config.MAX_DAILY_SIGNALS}")
+        logger.info("🐋 Whale walls, Volume fades, Time edges")
         logger.info("=" * 50)
         
         try:
             await self.telegram.send_message(
-                "🏆 *WINNING Bot Started*\n\n"
-                "📊 Professional Strategy\n"
+                "🎯 *CoinDCX EDGE Bot Started*\n\n"
+                "📊 Market-Specific Strategy:\n"
+                "  • Whale wall detection\n"
+                "  • Volume spike fading\n"
+                "  • Time-based edges\n"
+                "  • Spread optimization\n\n"
                 f"🎯 Min Score: {config.MIN_SCORE}%\n"
-                f"📐 Min R:R: 1:{config.MIN_RR_RATIO}\n"
-                f"🎯 Max: {config.MAX_DAILY_SIGNALS} signals/day\n\n"
-                "Target: 75%+ win rate!"
+                "Target: 12-18 signals/day"
             )
         except:
             pass
         
-        # Build data (90 seconds)
-        logger.info("Building professional data... (90 seconds)")
+        # Build data
+        logger.info("Building CoinDCX data... (60 seconds)")
         for _ in range(3):
             markets_data = await self.dcx.get_markets()
             if markets_data:
@@ -599,10 +598,10 @@ class WinningSignalBot:
                       for m in markets_data 
                       if any(c in (m.get('symbol', '') or m.get('pair', '')) 
                             for c in config.COINS)]
-                await self.update_all_data(inr)
-            await asyncio.sleep(30)
+                await self.update_data(inr)
+            await asyncio.sleep(20)
         
-        logger.info("✅ Ready for WINNING signals!")
+        logger.info("✅ Ready for CoinDCX edge signals!")
         
         while True:
             try:
@@ -620,7 +619,7 @@ class WinningSignalBot:
         await self.dcx.close()
 
 async def main():
-    bot = WinningSignalBot()
+    bot = CoinDCXEdgeBot()
     await bot.run()
 
 if __name__ == "__main__":
