@@ -3,142 +3,124 @@ import time
 from datetime import datetime, timedelta
 from config import Config
 from signal_logic import SignalGenerator
+import math
 
 class TradingBot:
 
     def __init__(self):
         self.config = Config()
-        self.signal_generator = SignalGenerator()
-        self.last_signal_time = {}
-        self.last_candle_time = {}     # ✅ NEW
-        self.signals_sent_today = 0
-        self.last_reset_date = datetime.now().date()
+        self.generator = SignalGenerator()
+        self.last_candle = {}
+        self.last_signal = {}
 
-    def fetch_candles(self, market, interval='5m', limit=100):
+    # ===================== DATA =====================
+    def fetch(self, market, interval):
+        url = f"{self.config.COINDCX_BASE_URL}/market_data/candles"
+        params = {"pair": market, "interval": interval, "limit": 120}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        return [{
+            "time": c["time"],
+            "open": float(c["open"]),
+            "high": float(c["high"]),
+            "low": float(c["low"]),
+            "close": float(c["close"])
+        } for c in r.json()]
+
+    # ===================== FILTERS =====================
+    def btc_calm(self):
+        btc = self.fetch("B-BTC_USDT", "5m")
+        if not btc or len(btc) < 10:
+            return False
+        last = btc[-1]
+        rng = (last["high"] - last["low"]) / last["close"] * 100
+        return rng < 0.6   # BTC calm threshold
+
+    def next_candle_sleep(self):
+        now = time.time()
+        next_5m = math.ceil(now / 300) * 300
+        return max(5, next_5m - now)
+
+    # ===================== TELEGRAM =====================
+    def send_telegram(self, signal):
         try:
-            url = f"{self.config.COINDCX_BASE_URL}/market_data/candles"
-            params = {
-                'pair': market,
-                'interval': interval,
-                'limit': limit
+            emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
+
+            msg = (
+                f"{emoji*3} {signal['direction']} SIGNAL {emoji*3}\n\n"
+                f"💹 Market: {signal['market']}\n"
+                f"🎯 Mode: Institutional (One-TP)\n\n"
+                f"💰 Entry: {signal['entry']:.6f}\n"
+                f"🎯 TP: {signal['tp']:.6f}\n"
+                f"🛑 SL: {signal['sl']:.6f}\n\n"
+                f"📈 R:R ≈ {signal['rr']:.2f}\n"
+                f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ Use proper risk management"
+            )
+
+            url = f"https://api.telegram.org/bot{self.config.TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": self.config.TELEGRAM_CHAT_ID,
+                "text": msg
             }
 
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            if not data:
-                return None
-
-            candles = []
-            for candle in data:
-                candles.append({
-                    'time': candle['time'],
-                    'open': float(candle['open']),
-                    'high': float(candle['high']),
-                    'low': float(candle['low']),
-                    'close': float(candle['close']),
-                    'volume': float(candle['volume'])
-                })
-
-            return candles
+            r = requests.post(url, json=payload, timeout=10)
+            r.raise_for_status()
+            print(f"✅ Telegram sent | {signal['market']}")
 
         except Exception as e:
-            print(f"❌ Error fetching candles for {market}: {str(e)}")
+            print(f"❌ Telegram error: {e}")
+
+    # ===================== CORE =====================
+    def scan(self, market):
+        c5 = self.fetch(market, "5m")
+        c15 = self.fetch(market, "15m")
+        if not c5 or not c15:
             return None
 
-    def check_cooldown(self, market):
-        if market not in self.last_signal_time:
-            return True
-        return datetime.now() - self.last_signal_time[market] >= timedelta(
-            minutes=self.config.COOLDOWN_MINUTES
-        )
+        if self.last_candle.get(market) == c5[-1]["time"]:
+            return None
+        self.last_candle[market] = c5[-1]["time"]
 
-    def check_daily_limit(self):
-        today = datetime.now().date()
-        if today != self.last_reset_date:
-            self.signals_sent_today = 0
-            self.last_reset_date = today
-        return self.signals_sent_today < self.config.MAX_SIGNALS_PER_DAY
-
-    def scan_market(self, market):
-        print(f"📊 Scanning {market}...")
-
-        if not self.check_cooldown(market):
-            print("⏳ Cooldown active")
+        signal = self.generator.generate_signal(market, c5, c15)
+        if not signal:
             return None
 
-        if not self.check_daily_limit():
-            print("⚠️ Daily limit reached")
-            return None
+        last = self.last_signal.get(market)
+        if last and last["direction"] == signal["direction"]:
+            if datetime.now() - last["time"] < timedelta(minutes=30):
+                return None
 
-        candles = self.fetch_candles(market, self.config.CANDLE_INTERVAL)
-        if not candles:
-            return None
+        self.last_signal[market] = {
+            "direction": signal["direction"],
+            "time": datetime.now()
+        }
 
-        # ✅ SAME CANDLE SKIP LOGIC
-        latest_time = candles[-1]['time']
-        if self.last_candle_time.get(market) == latest_time:
-            print("⏭️ Same candle, skipping")
-            return None
-        self.last_candle_time[market] = latest_time
+        return signal
 
-        signal = self.signal_generator.generate_signal(market, candles)
-        if signal:
-            print(f"🎯 Signal found | Score: {signal['score']}")
-            return signal
-
-        print("⏭️ No signal")
-        return None
-
-    def scan_all_markets(self):
-        print("\n" + "="*60)
-        print(f"🔍 SCAN START | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*60)
-
-        signals = []
-        for market in self.config.MARKETS:
-            sig = self.scan_market(market)
-            if sig:
-                signals.append(sig)
-            time.sleep(1)
-        return signals
-
-    def process_signals(self, signals):
-        if not signals:
-            print("📭 No signals this round\n")
-            return
-
-        for signal in signals:
-            self.last_signal_time[signal['market']] = datetime.now()
-            self.signals_sent_today += 1
-            print(f"✅ Signal processed | {signal['market']}")
-
+    # ===================== RUN =====================
     def run(self):
-        print("\n🤖 COINDCX BOT STARTED")
-        print(f"Interval: {self.config.CANDLE_INTERVAL}")
-        print(f"Check every: {self.config.CHECK_INTERVAL_MINUTES} min\n")
+        print("🤖 INSTITUTIONAL MODE STARTED (Telegram Enabled)")
 
         while True:
             try:
-                signals = self.scan_all_markets()
-                self.process_signals(signals)
+                if not self.btc_calm():
+                    print("⚠️ BTC volatile — skipping all signals")
+                else:
+                    for m in self.config.MARKETS:
+                        s = self.scan(m)
+                        if s:
+                            print(f"🎯 {s['market']} {s['direction']} | sending Telegram")
+                            self.send_telegram(s)
 
-                next_scan = datetime.now() + timedelta(
-                    minutes=self.config.CHECK_INTERVAL_MINUTES
-                )
-                print(f"⏰ Next scan: {next_scan.strftime('%H:%M:%S')}")
-                print(f"💤 Sleeping {self.config.CHECK_INTERVAL_MINUTES} minutes...\n")
-
-                time.sleep(self.config.CHECK_INTERVAL_MINUTES * 60)
-
-            except KeyboardInterrupt:
-                print("🛑 Bot stopped")
-                break
+                sleep_sec = self.next_candle_sleep()
+                print(f"💤 Sleep {int(sleep_sec)} sec\n")
+                time.sleep(sleep_sec)
 
             except Exception as e:
-                print(f"❌ Error: {str(e)} | Retry in 5 min")
-                time.sleep(300)
+                print("❌ Runtime error:", e)
+                time.sleep(60)
 
 if __name__ == "__main__":
     TradingBot().run()
