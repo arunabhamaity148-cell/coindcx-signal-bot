@@ -9,7 +9,7 @@ UNIQUE & SMART CoinDCX Signal Bot
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import os
 from dotenv import load_dotenv
 from collections import deque
@@ -107,7 +107,6 @@ class UniqueAnalyzer:
             return "DORMANT", 0
         
         prices = [h['price'] for h in history]
-        
         # Velocity (rate of change)
         velocity = (prices[-1] - prices[-5]) / prices[-5]
         
@@ -399,7 +398,7 @@ class SmartSignalBot:
         score += vol_score
         details['volatility'] = round(vol_val * 100, 2)
         
-# 5. Trend Persistence (8 pts)
+        # 5. Trend Persistence (8 pts)
         trend_state, trend_score = self.analyzer.trend_persistence(history)
         score += trend_score
         details['trend'] = trend_state
@@ -624,8 +623,7 @@ class SmartSignalBot:
     
     async def run(self):
         """Main loop"""
-        
-        logger.info("🎨 UNIQUE SMART Signal Bot Started!")
+logger.info("🎨 UNIQUE SMART Signal Bot Started!")
         logger.info("=" * 50)
         logger.info("📊 10 Proprietary Indicators")
         logger.info(f"🎯 Min Score: {config.MIN_SCORE}%")
