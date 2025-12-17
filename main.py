@@ -1,268 +1,271 @@
 """
-CoinDCX-ONLY Edge Bot  (TDS-hedged, no external exchange)
-Crash-proof for Railway deploy
+COINDCX BALANCED EDGE BOT – FINAL (1 MONTH LOCK)
+Signal-only | Manual Trading
+No auto-execution | No overtrading
 """
 
-import asyncio, os, time, logging
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-import aiohttp, numpy as np
+import asyncio
+import logging
+from datetime import datetime, time
+from typing import Dict, List, Optional
+import os
+from dotenv import load_dotenv
 from collections import deque
-from aiohttp import web, client_exceptions
+import numpy as np
 
-API_KEY    = os.getenv("COINDCX_API_KEY")
-SECRET     = os.getenv("COINDCX_SECRET")
-TG_BOT     = os.getenv("TG_BOT")
-TG_CHAT    = os.getenv("TG_CHAT")
-PORT       = int(os.getenv("PORT", 8080))
+from helpers import CoinDCXAPI, TelegramNotifier, DatabaseManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger(__name__)
+# =====================================================
+# ENV + LOGGING
+# =====================================================
+load_dotenv()
 
-# ---------- CONFIG ----------
-COINS        = ["BTC", "ETH", "MATIC", "SOL", "XRP", "ADA"]
-MIN_SCORE    = 55
-SCAN_SEC     = 25
-PRICE_DEQUE  = 120
-FUND_WARN    = 0.05
-PARTICIP     = 0.15
-CAPITAL      = float(os.getenv("CAPITAL", 50000))
-RISK         = 0.01
-# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("coindcx_final.log")
+    ]
+)
+logger = logging.getLogger(__name__)
 
-class CoinDCXClient:
-    def __init__(self):
-        self.base = "https://api.coindcx.com"
-        self._session: Optional[aiohttp.ClientSession] = None
+# =====================================================
+# CONFIG (LOCKED)
+# =====================================================
+class Config:
+    COINDCX_API_KEY = os.getenv("COINDCX_API_KEY")
+    COINDCX_SECRET = os.getenv("COINDCX_SECRET")
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    @property
-    async def session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
-            )
-        return self._session
+    COINS = ["BTC", "ETH", "SOL", "XRP", "MATIC", "DOGE", "ADA"]
 
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
+    SCAN_INTERVAL = 30
+    PRICE_HISTORY = 40
+    MIN_DATA_POINTS = 20
 
-    async def safe_get(self, path: str, params: dict = None) -> dict:
-        try:
-            sess = await self.session
-            async with sess.get(self.base + path, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status != 200:
-                    log.warning(f"{path} {r.status}")
-                    return {}
-                return await r.json()
-        except client_exceptions.ContentTypeError:
-                    return {}
-        except Exception as e:
-            log.exception("safe_get")
-            return {}
+    DAILY_SIGNAL_LIMIT = 15
+    COOLDOWN_MINUTES = 30
+    MIN_SCORE = 58
 
-    async def markets(self) -> List[str]:
-        res = await self.safe_get("/exchange/v1/markets")
-        return [m for m in res if m.endswith(("INR", "INRT"))] if res else []
+    # TP / SL (FIXED RANGE)
+    TP_MIN = 0.018
+    TP_MAX = 0.024
+    SL_MIN = 0.009
+    SL_MAX = 0.012
 
-    async def ticker(self, market: str) -> dict:
-        res = await self.safe_get("/exchange/ticker", {"market": market})
-        return res[0] if res else {}
+    # BTC CALM
+    BTC_RANGE_5M = 0.0035  # 0.35%
 
-    async def orderbook(self, market: str) -> dict:
-        return await self.safe_get("/exchange/v1/orderbook", {"market": market})
+    # SPREAD
+    MAX_SPREAD = 0.35
 
-    async def funding(self, perp: str) -> float:
-        res = await self.safe_get("/exchange/v1/funding", {"market": perp})
-        return float(res[0].get("funding_rate", 0)) if res else 0.0
+    # TIME WINDOWS
+    TIME_WINDOWS = [
+        (time(9, 15), time(12, 0)),
+        (time(20, 0), time(23, 0)),
+    ]
 
-    async def place(self, mkt: str, side: str, price: float, qty: float, typ: str) -> dict:
-        body = {
-            "market": mkt, "side": side, "order_type": typ,
-            "price": price, "quantity": qty,
-            "timestamp": int(time.time()*1000)
-        }
-        try:
-            sess = await self.session
-            async with sess.post(self.base + "/exchange/v1/orders/create", json=body, timeout=8) as r:
-                if r.status != 200: log.warning(f"place {r.status}")
-                return await r.json()
-        except Exception as e:
-            log.exception("place")
-            return {}
 
-# ---------- DATA ----------
+config = Config()
+
+# =====================================================
+# DATA TRACKER
+# =====================================================
 class Tracker:
-    def __init__(self, sz: int):
-        self.prices : Dict[str, deque] = {}
-        self.vols   : Dict[str, deque] = {}
-        self.spreads: Dict[str, deque] = {}
-        self.books  : Dict[str, dict]  = {}
-        self.sz = sz
+    def __init__(self, size: int):
+        self.prices = {}
+        self.volumes = {}
+        self.orderbooks = {}
+        self.spreads = {}
+        self.size = size
 
-    def add(self, m: str, p: float, v: float, book: dict):
+    def add(self, m: str, price: float, vol: float, ob: dict):
         if m not in self.prices:
-            self.prices[m] = deque(maxlen=self.sz)
-            self.vols[m]   = deque(maxlen=self.sz)
-            self.spreads[m]= deque(maxlen=self.sz)
-        self.prices[m].append(p)
-        self.vols[m].append(v)
-        self.books[m] = book
-        if book.get("bids") and book.get("asks"):
-            b, a = book["bids"][0][0], book["asks"][0][0]
-            self.spreads[m].append((a-b)/b)
+            self.prices[m] = deque(maxlen=self.size)
+            self.volumes[m] = deque(maxlen=self.size)
+            self.spreads[m] = deque(maxlen=self.size)
 
-    def ready(self, m: str, n: int) -> bool:
-        return len(self.prices.get(m, [])) >= n
+        self.prices[m].append(price)
+        self.volumes[m].append(vol)
+        self.orderbooks[m] = ob
 
-    def last(self, m: str) -> float:
-        return self.prices[m][-1]
+        if ob and ob.get("bids") and ob.get("asks"):
+            bid = ob["bids"][0][0]
+            ask = ob["asks"][0][0]
+            if bid > 0:
+                self.spreads[m].append(((ask - bid) / bid) * 100)
 
-    def book(self, m: str) -> dict:
-        return self.books.get(m, {})
+    def ready(self, m: str) -> bool:
+        return m in self.prices and len(self.prices[m]) >= config.MIN_DATA_POINTS
 
-    def spread_pct(self, m: str) -> float:
-        return self.spreads[m][-1] if self.spreads.get(m) else 0.0
 
-    def vol_spike(self, m: str) -> Tuple[bool, str]:
-        if not self.ready(m, 30): return False, ""
-        v = list(self.vols[m])
-        cur, avg = v[-1], np.mean(v[-20:-1])
-        if avg == 0: return False, ""
-        if cur > avg * 3.5:
-            if v[-2] < avg * 1.5:
-                return True, "FADE"
-        return False, ""
+# =====================================================
+# CORE BOT
+# =====================================================
+class CoinDCXFinalBot:
 
-    def imb(self, m: str) -> float:
-        b = self.books[m]
-        if not b.get("bids") or not b.get("asks"): return 0.0
-        bidV = sum(x[1] for x in b["bids"][:3])
-        askV = sum(x[1] for x in b["asks"][:3])
-        t = bidV + askV
-        return (bidV - askV) / t if t else 0.0
-
-    def top3_vol(self, m: str) -> float:
-        b = self.books[m]
-        if not b.get("bids"): return 0.0
-        return sum(x[1]*x[0] for x in b["bids"][:3])
-
-# ---------- ANALYTICS ----------
-def score(m: str, tr: Tracker) -> Tuple[int, str]:
-    s, direction = 0, "NONE"
-    sp = tr.spread_pct(m)
-    if sp < np.percentile(list(tr.spreads[m]), 25):
-        s += 8
-    fade, txt = tr.vol_spike(m)
-    if fade:
-        s += 12
-        direction = "CONTRA"
-    imb = tr.imb(m)
-    if imb > 0.18:
-        s += 10
-        direction = "BUY"
-    elif imb < -0.18:
-        s += 10
-        direction = "SELL"
-    hr = datetime.now().hour
-    if 10 <= hr <= 11 or 20 <= hr <= 22:
-        s += 6
-    return s, direction
-
-# ---------- RISK ----------
-def qty(m: str, side: str, entry: float, tr: Tracker) -> float:
-    risk_amt = CAPITAL * RISK
-    atr = np.std(list(tr.prices[m])[-12:])
-    sl_dist = max(0.005, 2.5 * atr)
-    risk_qty = risk_amt / sl_dist
-    max_qty = PARTICIP * tr.top3_vol(m) / entry
-    return min(risk_qty, max_qty)
-
-# ---------- EXECUTION ----------
-async def hedge_enter(client: CoinDCXClient, mkt_spot: str, side: str, qty_spot: float, entry: float):
-    perp = mkt_spot.replace("INR", "USDT") + "-PERPETUAL"
-    fund = await client.funding(perp)
-    if abs(fund) > FUND_WARN and (
-        (side == "BUY" and fund < 0) or (side == "SELL" and fund > 0)
-    ):
-        log.warning(f"skip {mkt_spot} fund={fund}")
-        return
-    if side == "BUY":
-        await client.place(mkt_spot, "buy",  entry, qty_spot, "limit")
-        await client.place(perp,    "sell", entry, qty_spot, "market")
-    else:
-        await client.place(mkt_spot, "sell", entry, qty_spot, "limit")
-        await client.place(perp,    "buy",  entry, qty_spot, "market")
-    log.info(f"HEDGE {side} {mkt_spot} @{entry} Q={qty_spot}")
-
-# ---------- NOTIFIER ----------
-async def notify(text: str):
-    if not TG_BOT: return
-    url = f"https://api.telegram.org/bot{TG_BOT}/sendMessage"
-    payload = {"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"}
-    async with aiohttp.ClientSession() as s:
-        await s.post(url, data=payload)
-
-# ---------- HEALTH ----------
-async def start_web():
-    app = web.Application()
-    app.router.add_get("/", lambda req: web.Response(text="CoinDCX EdgeBot OK"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info(f"Health server on port {PORT}")
-
-# ---------- BOT ----------
-class EdgeBot:
     def __init__(self):
-        self.cli = CoinDCXClient()
-        self.tr  = Tracker(PRICE_DEQUE)
-        self.seen: set[str] = set()
+        self.api = CoinDCXAPI(config.COINDCX_API_KEY, config.COINDCX_SECRET)
+        self.tg = TelegramNotifier(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+        self.db = DatabaseManager("coindcx_final.db")
 
-    async def update(self):
-        mkts = await self.cli.markets()
-        for m in mkts:
-            t = await self.cli.ticker(m)
-            if not t: continue
-            p = float(t["last_price"])
-            v = float(t["volume"])
-            b = await self.cli.orderbook(m)
-            self.tr.add(m, p, v, b)
+        self.tracker = Tracker(config.PRICE_HISTORY)
 
-    async def scan(self):
-        await self.update()
-        for m in self.tr.prices:
-            if not self.tr.ready(m, 30): continue
-            scr, dir_ = score(m, self.tr)
-            if scr < MIN_SCORE or dir_ == "NONE": continue
-            key = f"{m}{dir_}{datetime.now().hour}"
-            if key in self.seen: continue
-            self.seen.add(key)
-            entry = self.tr.last(m)
-            q = qty(m, dir_, entry, self.tr)
-            await hedge_enter(self.cli, m, dir_, q, entry)
-            msg = f"🎯 *CoinDCX EDGE*\n{m}  {dir_}\nEntry ₹{entry:.2f}\nQty {q:.4f}\nScore {scr}"
-            await notify(msg)
+        self.cooldown = {}
+        self.daily_count = 0
+        self.today = datetime.now().date()
 
+        logger.info("✅ FINAL COINDCX BOT INITIALIZED")
+
+    # ---------------- TIME CHECK ----------------
+    def in_time_window(self) -> bool:
+        now = datetime.now().time()
+        for start, end in config.TIME_WINDOWS:
+            if start <= now <= end:
+                return True
+        return False
+
+    # ---------------- BTC CALM ----------------
+    def btc_calm(self) -> bool:
+        prices = self.tracker.prices.get("BTCINR", [])
+        if len(prices) < 10:
+            return False
+        rng = (max(prices[-10:]) - min(prices[-10:])) / prices[-1]
+        return rng < config.BTC_RANGE_5M
+
+    # ---------------- COOLDOWN ----------------
+    def in_cooldown(self, m: str) -> bool:
+        t = self.cooldown.get(m)
+        if not t:
+            return False
+        return (datetime.now() - t).seconds < config.COOLDOWN_MINUTES * 60
+
+    # ---------------- UPDATE DATA ----------------
+    async def update_data(self, markets: List[str]):
+        tickers = await self.api.get_tickers()
+        for m in markets:
+            t = next((x for x in tickers if x.get("market") == m), None)
+            if not t:
+                continue
+            price = float(t["last_price"])
+            vol = float(t["volume"])
+            ob = await self.api.get_orderbook(m)
+            self.tracker.add(m, price, vol, ob)
+
+    # ---------------- ANALYZE ----------------
+    def analyze(self, m: str) -> Optional[Dict]:
+        if not self.tracker.ready(m):
+            return None
+        if self.in_cooldown(m):
+            return None
+
+        prices = self.tracker.prices[m]
+        vols = self.tracker.volumes[m]
+        spreads = self.tracker.spreads[m]
+
+        if spreads and spreads[-1] > config.MAX_SPREAD:
+            return None
+
+        change = (prices[-1] - prices[-6]) / prices[-6]
+        vol_ratio = np.mean(vols[-5:]) / np.mean(vols[-15:-5])
+
+        score = 0
+        if vol_ratio > 1.2:
+            score += 25
+        if abs(change) > 0.008:
+            score += 25
+        if spreads and spreads[-1] < 0.2:
+            score += 15
+
+        if score < config.MIN_SCORE:
+            return None
+
+        side = "BUY" if change > 0 else "SELL"
+        entry = prices[-1]
+
+        tp_pct = np.random.uniform(config.TP_MIN, config.TP_MAX)
+        sl_pct = np.random.uniform(config.SL_MIN, config.SL_MAX)
+
+        if side == "BUY":
+            tp = entry * (1 + tp_pct)
+            sl = entry * (1 - sl_pct)
+        else:
+            tp = entry * (1 - tp_pct)
+            sl = entry * (1 + sl_pct)
+
+        return {
+            "market": m,
+            "side": side,
+            "entry": round(entry, 2),
+            "tp": round(tp, 2),
+            "sl": round(sl, 2),
+            "score": score
+        }
+
+    # ---------------- SEND ----------------
+    async def send(self, s: Dict):
+        msg = f"""
+🚀 *COINDCX CONFIRMED SIGNAL*
+
+🪙 Pair: {s['market']}
+📊 Side: *{s['side']}*
+
+💰 Entry: ₹{s['entry']}
+🎯 TP: ₹{s['tp']}
+🛑 SL: ₹{s['sl']}
+
+🧠 Score: {s['score']}%
+₿ BTC: Calm
+⏳ Cooldown: OK
+
+⏰ {datetime.now().strftime('%d-%b %I:%M %p')}
+"""
+        await self.tg.send_message(msg)
+
+    # ---------------- RUN ----------------
     async def run(self):
-        log.info("CoinDCX EdgeBot start")
-        await notify("🚀 Bot started")
-        asyncio.create_task(start_web())
-        for _ in range(3):
-            await self.update()
-            await asyncio.sleep(20)
-        while True:
-            try:
-                await self.scan()
-                await asyncio.sleep(SCAN_SEC)
-            except Exception as e:
-                log.exception("loop")
-                await asyncio.sleep(5)
-        await self.cli.close()
+        await self.tg.send_message(
+            "🚀 *COINDCX FINAL BOT STARTED*\n\n"
+            "🔒 System Locked – 30 Days\n"
+            "📊 Balanced Edge Mode"
+        )
 
+        while True:
+            if datetime.now().date() != self.today:
+                self.today = datetime.now().date()
+                self.daily_count = 0
+
+            if not self.in_time_window():
+                await asyncio.sleep(60)
+                continue
+
+            if self.daily_count >= config.DAILY_SIGNAL_LIMIT:
+                await asyncio.sleep(300)
+                continue
+
+            markets = await self.api.get_inr_markets(config.COINS)
+            await self.update_data(markets)
+
+            if not self.btc_calm():
+                await asyncio.sleep(60)
+                continue
+
+            for m in markets:
+                sig = self.analyze(m)
+                if sig:
+                    await self.send(sig)
+                    self.db.save_signal(sig)
+                    self.cooldown[m] = datetime.now()
+                    self.daily_count += 1
+
+            await asyncio.sleep(config.SCAN_INTERVAL)
+
+
+# =====================================================
+# START
+# =====================================================
 if __name__ == "__main__":
-    try:
-        asyncio.run(EdgeBot().run())
-    except KeyboardInterrupt:
-        log.info("Stopped")
+    bot = CoinDCXFinalBot()
+    asyncio.run(bot.run())
