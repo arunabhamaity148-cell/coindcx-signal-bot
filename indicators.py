@@ -5,14 +5,12 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_ema(data, period):
-        """Calculate Exponential Moving Average"""
         if len(data) < period:
             return None
         return pd.Series(data).ewm(span=period, adjust=False).mean().iloc[-1]
     
     @staticmethod
     def calculate_rsi(prices, period=14):
-        """Calculate RSI"""
         if len(prices) < period + 1:
             return None
         
@@ -32,7 +30,6 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_macd(prices, fast=12, slow=26, signal=9):
-        """Calculate MACD"""
         if len(prices) < slow:
             return None, None, None
         
@@ -48,7 +45,6 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_atr(highs, lows, closes, period=14):
-        """Calculate Average True Range"""
         if len(highs) < period + 1:
             return None
         
@@ -65,7 +61,6 @@ class TechnicalIndicators:
     
     @staticmethod
     def calculate_adx(highs, lows, closes, period=14):
-        """Calculate ADX (Average Directional Index)"""
         if len(highs) < period + 1:
             return None
         
@@ -96,37 +91,3 @@ class TechnicalIndicators:
         dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100 if (plus_di + minus_di) != 0 else 0
         
         return dx
-    
-    @staticmethod
-    def calculate_bollinger_bands(prices, period=20, std_dev=2):
-        """Calculate Bollinger Bands"""
-        if len(prices) < period:
-            return None, None, None
-        
-        prices_series = pd.Series(prices[-period:])
-        middle_band = prices_series.mean()
-        std = prices_series.std()
-        
-        upper_band = middle_band + (std * std_dev)
-        lower_band = middle_band - (std * std_dev)
-        
-        return upper_band, middle_band, lower_band
-    
-    @staticmethod
-    def detect_divergence(prices, indicator_values, lookback=10):
-        """Detect bullish/bearish divergence"""
-        if len(prices) < lookback or len(indicator_values) < lookback:
-            return None
-        
-        price_trend = prices[-1] - prices[-lookback]
-        indicator_trend = indicator_values[-1] - indicator_values[-lookback]
-        
-        # Bullish divergence: price making lower lows, indicator making higher lows
-        if price_trend < 0 and indicator_trend > 0:
-            return 'bullish'
-        
-        # Bearish divergence: price making higher highs, indicator making lower highs
-        if price_trend > 0 and indicator_trend < 0:
-            return 'bearish'
-        
-        return None
