@@ -1,101 +1,132 @@
-"""
-Technical indicators for trading analysis
-"""
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Relative Strength Index"""
-    delta = series.diff()
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
+class TechnicalIndicators:
     
-    gain = pd.Series(gain).rolling(window=period).mean()
-    loss = pd.Series(loss).rolling(window=period).mean()
+    @staticmethod
+    def calculate_ema(data, period):
+        """Calculate Exponential Moving Average"""
+        if len(data) < period:
+            return None
+        return pd.Series(data).ewm(span=period, adjust=False).mean().iloc[-1]
     
-    rs = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    """Exponential Moving Average"""
-    return series.ewm(span=period, adjust=False).mean()
-
-def sma(series: pd.Series, period: int) -> pd.Series:
-    """Simple Moving Average"""
-    return series.rolling(window=period).mean()
-
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    """MACD Indicator"""
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal)
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range"""
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+    @staticmethod
+    def calculate_rsi(prices, period=14):
+        """Calculate RSI"""
+        if len(prices) < period + 1:
+            return None
+        
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains[-period:])
+        avg_loss = np.mean(losses[-period:])
+        
+        if avg_loss == 0:
+            return 100
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
     
-    prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
-
-def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average Directional Index"""
-    high = df["high"]
-    low = df["low"]
+    @staticmethod
+    def calculate_macd(prices, fast=12, slow=26, signal=9):
+        """Calculate MACD"""
+        if len(prices) < slow:
+            return None, None, None
+        
+        prices_series = pd.Series(prices)
+        ema_fast = prices_series.ewm(span=fast, adjust=False).mean()
+        ema_slow = prices_series.ewm(span=slow, adjust=False).mean()
+        
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+        
+        return macd_line.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1]
     
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
+    @staticmethod
+    def calculate_atr(highs, lows, closes, period=14):
+        """Calculate Average True Range"""
+        if len(highs) < period + 1:
+            return None
+        
+        tr_list = []
+        for i in range(1, len(highs)):
+            high_low = highs[i] - lows[i]
+            high_close = abs(highs[i] - closes[i-1])
+            low_close = abs(lows[i] - closes[i-1])
+            tr = max(high_low, high_close, low_close)
+            tr_list.append(tr)
+        
+        atr = np.mean(tr_list[-period:])
+        return atr
     
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
+    @staticmethod
+    def calculate_adx(highs, lows, closes, period=14):
+        """Calculate ADX (Average Directional Index)"""
+        if len(highs) < period + 1:
+            return None
+        
+        plus_dm = []
+        minus_dm = []
+        
+        for i in range(1, len(highs)):
+            high_diff = highs[i] - highs[i-1]
+            low_diff = lows[i-1] - lows[i]
+            
+            if high_diff > low_diff and high_diff > 0:
+                plus_dm.append(high_diff)
+            else:
+                plus_dm.append(0)
+            
+            if low_diff > high_diff and low_diff > 0:
+                minus_dm.append(low_diff)
+            else:
+                minus_dm.append(0)
+        
+        atr = TechnicalIndicators.calculate_atr(highs, lows, closes, period)
+        if not atr or atr == 0:
+            return None
+        
+        plus_di = (np.mean(plus_dm[-period:]) / atr) * 100
+        minus_di = (np.mean(minus_dm[-period:]) / atr) * 100
+        
+        dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100 if (plus_di + minus_di) != 0 else 0
+        
+        return dx
     
-    tr_atr = atr(df, period)
-    plus_di = 100 * (plus_dm.rolling(window=period).mean() / tr_atr)
-    minus_di = 100 * (minus_dm.rolling(window=period).mean() / tr_atr)
+    @staticmethod
+    def calculate_bollinger_bands(prices, period=20, std_dev=2):
+        """Calculate Bollinger Bands"""
+        if len(prices) < period:
+            return None, None, None
+        
+        prices_series = pd.Series(prices[-period:])
+        middle_band = prices_series.mean()
+        std = prices_series.std()
+        
+        upper_band = middle_band + (std * std_dev)
+        lower_band = middle_band - (std * std_dev)
+        
+        return upper_band, middle_band, lower_band
     
-    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
-    adx_val = dx.rolling(window=period).mean()
-    
-    return adx_val
-
-def bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0):
-    """Bollinger Bands"""
-    middle = sma(series, period)
-    std = series.rolling(window=period).std()
-    upper = middle + (std * std_dev)
-    lower = middle - (std * std_dev)
-    return upper, middle, lower
-
-def stochastic(df: pd.DataFrame, period: int = 14) -> tuple:
-    """Stochastic Oscillator"""
-    low_min = df['low'].rolling(window=period).min()
-    high_max = df['high'].rolling(window=period).max()
-    
-    k = 100 * (df['close'] - low_min) / (high_max - low_min + 1e-9)
-    d = k.rolling(window=3).mean()
-    
-    return k, d
-
-def detect_divergence(price: pd.Series, indicator: pd.Series, lookback: int = 10) -> str:
-    """Detect bullish/bearish divergence"""
-    if len(price) < lookback + 2:
+    @staticmethod
+    def detect_divergence(prices, indicator_values, lookback=10):
+        """Detect bullish/bearish divergence"""
+        if len(prices) < lookback or len(indicator_values) < lookback:
+            return None
+        
+        price_trend = prices[-1] - prices[-lookback]
+        indicator_trend = indicator_values[-1] - indicator_values[-lookback]
+        
+        # Bullish divergence: price making lower lows, indicator making higher lows
+        if price_trend < 0 and indicator_trend > 0:
+            return 'bullish'
+        
+        # Bearish divergence: price making higher highs, indicator making lower highs
+        if price_trend > 0 and indicator_trend < 0:
+            return 'bearish'
+        
         return None
-    
-    price_trend = price.iloc[-1] - price.iloc[-lookback]
-    ind_trend = indicator.iloc[-1] - indicator.iloc[-lookback]
-    
-    if price_trend < -0.01 and ind_trend > 0.01:
-        return "bullish_divergence"
-    
-    if price_trend > 0.01 and ind_trend < -0.01:
-        return "bearish_divergence"
-    
-    return None
