@@ -651,9 +651,8 @@ logger.info("🎨 UNIQUE SMART Signal Bot Started!")
                       if any(c in (m.get('symbol', '') or m.get('pair', '')) 
                             for c in config.COINS_TO_MONITOR)]
                 await self.update_prices(inr)
-            await asyncio.sleep(40)
-        
-        logger.info("✅ Ready for signals!")
+            await asyncio.sleep(40
+  logger.info("✅ Ready for signals!")
         
         while True:
             try:
