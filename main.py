@@ -1,14 +1,14 @@
 """
 CoinDCX-ONLY Edge Bot  (TDS-hedged, no external exchange)
-Runs on spot + perpetual inside CoinDCX
+Crash-proof for Railway deploy
 """
 
-import asyncio, os, time, math, logging
+import asyncio, os, time, logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import aiohttp, numpy as np
 from collections import deque
-from aiohttp import web
+from aiohttp import web, client_exceptions
 
 API_KEY    = os.getenv("COINDCX_API_KEY")
 SECRET     = os.getenv("COINDCX_SECRET")
@@ -24,68 +24,72 @@ COINS        = ["BTC", "ETH", "MATIC", "SOL", "XRP", "ADA"]
 MIN_SCORE    = 55
 SCAN_SEC     = 25
 PRICE_DEQUE  = 120
-SPREAD_DEQUE = 100
-FUND_WARN    = 0.05          # 5 bps
-MAX_SLIP     = 0.25/100      # 0.25 %
-PARTICIP     = 0.15          # 15 % of top-3 volume
+FUND_WARN    = 0.05
+PARTICIP     = 0.15
 CAPITAL      = float(os.getenv("CAPITAL", 50000))
-RISK         = 0.01          # 1 % per trade
+RISK         = 0.01
 # ----------------------------
 
 class CoinDCXClient:
-    def __init__(self, key: str, secret: str):
-        self.key = key
-        self.s = secret
+    def __init__(self):
         self.base = "https://api.coindcx.com"
-        self.session : Optional[aiohttp.ClientSession] = None
+        self._session: Optional[aiohttp.ClientSession] = None
 
-    async def _sess(self) -> aiohttp.ClientSession:
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
-        return self.session
+    @property
+    async def session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
+            )
+        return self._session
 
     async def close(self):
-        if self.session: await self.session.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
 
-    async def get(self, path: str, params: dict = None) -> dict:
-        sess = await self._sess()
-        async with sess.get(self.base + path, params=params) as r:
-            return await r.json()
-
-    async def post(self, path: str, payload: dict) -> dict:
-        sess = await self._sess()
-        async with sess.post(self.base + path, json=payload) as r:
-            return await r.json()
+    async def safe_get(self, path: str, params: dict = None) -> dict:
+        try:
+            sess = await self.session
+            async with sess.get(self.base + path, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200:
+                    log.warning(f"{path} {r.status}")
+                    return {}
+                return await r.json()
+        except client_exceptions.ContentTypeError:
+                    return {}
+        except Exception as e:
+            log.exception("safe_get")
+            return {}
 
     async def markets(self) -> List[str]:
-        res = await self.get("/exchange/v1/markets")
-        return [m for m in res if m.endswith(("INR", "INRT"))]
+        res = await self.safe_get("/exchange/v1/markets")
+        return [m for m in res if m.endswith(("INR", "INRT"))] if res else []
 
     async def ticker(self, market: str) -> dict:
-        res = await self.get("/exchange/ticker", {"market": market})
+        res = await self.safe_get("/exchange/ticker", {"market": market})
         return res[0] if res else {}
 
     async def orderbook(self, market: str) -> dict:
-        return await self.get("/exchange/v1/orderbook", {"market": market})
+        return await self.safe_get("/exchange/v1/orderbook", {"market": market})
 
     async def funding(self, perp: str) -> float:
-        res = await self.get("/exchange/v1/funding", {"market": perp})
+        res = await self.safe_get("/exchange/v1/funding", {"market": perp})
         return float(res[0].get("funding_rate", 0)) if res else 0.0
 
-    async def place(self, mkt: str, side: str, price: float, qty: float, ord_type: str) -> dict:
+    async def place(self, mkt: str, side: str, price: float, qty: float, typ: str) -> dict:
         body = {
-            "market": mkt,
-            "side": side,
-            "order_type": ord_type,
-            "price": price,
-            "quantity": qty,
+            "market": mkt, "side": side, "order_type": typ,
+            "price": price, "quantity": qty,
             "timestamp": int(time.time()*1000)
         }
-        return await self.post("/exchange/v1/orders/create", body)
-
-    async def pos(self, perp: str) -> dict:
-        res = await self.get("/exchange/v1/positions", {"market": perp})
-        return res[0] if res else {}
+        try:
+            sess = await self.session
+            async with sess.post(self.base + "/exchange/v1/orders/create", json=body, timeout=8) as r:
+                if r.status != 200: log.warning(f"place {r.status}")
+                return await r.json()
+        except Exception as e:
+            log.exception("place")
+            return {}
 
 # ---------- DATA ----------
 class Tracker:
@@ -146,16 +150,13 @@ class Tracker:
 # ---------- ANALYTICS ----------
 def score(m: str, tr: Tracker) -> Tuple[int, str]:
     s, direction = 0, "NONE"
-    # 1. spread quality
     sp = tr.spread_pct(m)
     if sp < np.percentile(list(tr.spreads[m]), 25):
         s += 8
-    # 2. volume spike fade
     fade, txt = tr.vol_spike(m)
     if fade:
         s += 12
         direction = "CONTRA"
-    # 3. orderbook imbalance
     imb = tr.imb(m)
     if imb > 0.18:
         s += 10
@@ -163,7 +164,6 @@ def score(m: str, tr: Tracker) -> Tuple[int, str]:
     elif imb < -0.18:
         s += 10
         direction = "SELL"
-    # 4. time
     hr = datetime.now().hour
     if 10 <= hr <= 11 or 20 <= hr <= 22:
         s += 6
@@ -175,21 +175,18 @@ def qty(m: str, side: str, entry: float, tr: Tracker) -> float:
     atr = np.std(list(tr.prices[m])[-12:])
     sl_dist = max(0.005, 2.5 * atr)
     risk_qty = risk_amt / sl_dist
-    # participation cap
     max_qty = PARTICIP * tr.top3_vol(m) / entry
     return min(risk_qty, max_qty)
 
 # ---------- EXECUTION ----------
 async def hedge_enter(client: CoinDCXClient, mkt_spot: str, side: str, qty_spot: float, entry: float):
     perp = mkt_spot.replace("INR", "USDT") + "-PERPETUAL"
-    # funding check
     fund = await client.funding(perp)
     if abs(fund) > FUND_WARN and (
         (side == "BUY" and fund < 0) or (side == "SELL" and fund > 0)
     ):
         log.warning(f"skip {mkt_spot} fund={fund}")
         return
-    # place both legs
     if side == "BUY":
         await client.place(mkt_spot, "buy",  entry, qty_spot, "limit")
         await client.place(perp,    "sell", entry, qty_spot, "market")
@@ -206,7 +203,7 @@ async def notify(text: str):
     async with aiohttp.ClientSession() as s:
         await s.post(url, data=payload)
 
-# ---------- HEALTH ENDPOINT ----------
+# ---------- HEALTH ----------
 async def start_web():
     app = web.Application()
     app.router.add_get("/", lambda req: web.Response(text="CoinDCX EdgeBot OK"))
@@ -214,12 +211,12 @@ async def start_web():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info(f"Health server running on port {PORT}")
+    log.info(f"Health server on port {PORT}")
 
 # ---------- BOT ----------
 class EdgeBot:
     def __init__(self):
-        self.cli = CoinDCXClient(API_KEY, SECRET)
+        self.cli = CoinDCXClient()
         self.tr  = Tracker(PRICE_DEQUE)
         self.seen: set[str] = set()
 
@@ -251,13 +248,10 @@ class EdgeBot:
     async def run(self):
         log.info("CoinDCX EdgeBot start")
         await notify("🚀 Bot started")
-        # health endpoint
         asyncio.create_task(start_web())
-        # warm-up
         for _ in range(3):
             await self.update()
             await asyncio.sleep(20)
-        # main loop
         while True:
             try:
                 await self.scan()
@@ -265,7 +259,10 @@ class EdgeBot:
             except Exception as e:
                 log.exception("loop")
                 await asyncio.sleep(5)
+        await self.cli.close()
 
 if __name__ == "__main__":
-    bot = EdgeBot()
-    asyncio.run(bot.run())
+    try:
+        asyncio.run(EdgeBot().run())
+    except KeyboardInterrupt:
+        log.info("Stopped")
