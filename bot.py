@@ -92,30 +92,24 @@ class TradingBot:
     
     def format_telegram_message(self, signal):
         emoji = "🟢" if signal['direction'] == 'LONG' else "🔴"
-        
         confidence = 'HIGH' if signal['score'] >= 85 else 'MEDIUM'
         
         msg = f"{emoji * 3} {signal['direction']} SIGNAL {emoji * 3}\n\n"
         msg += f"💹 Market: {signal['market']}\n"
         msg += f"📊 Score: {signal['score']}/100\n"
         msg += f"⚡ Confidence: {confidence}\n\n"
-        
         msg += f"💰 Entry: {signal['entry']:.8f}\n"
         msg += f"🎯 TP1: {signal['tp1']:.8f}\n"
         msg += f"🎯 TP2: {signal['tp2']:.8f}\n"
         msg += f"🛑 SL: {signal['sl']:.8f}\n\n"
-        
         msg += f"📈 R:R = 1:{signal['rr_ratio']:.2f}\n\n"
-        
         msg += "📊 Analysis:\n"
         msg += f"• RSI: {signal['analysis']['rsi']:.1f}\n"
         msg += f"• ADX: {signal['analysis']['adx']:.1f}\n"
         msg += f"• Regime: {signal['analysis']['market_regime'].upper()}\n\n"
-        
         msg += "✅ Reasons:\n"
         for i, reason in enumerate(signal['reasons'][:5], 1):
             msg += f"{i}. {reason}\n"
-        
         msg += f"\n🕐 {datetime.now().strftime('%H:%M:%S')}\n"
         msg += "⚠️ Use proper risk management!"
         
@@ -129,20 +123,18 @@ class TradingBot:
             response.raise_for_status()
             return True
         except Exception as e:
-            print(f"❌ Telegram error: {str(e)}")
+            print(f"Telegram error: {str(e)}")
             return False
     
     def send_telegram_signal(self, signal):
         try:
             message = self.format_telegram_message(signal)
-            
             if self.send_telegram_message(message):
-                print(f"✅ Signal sent: {signal['market']} {signal['direction']}")
+                print(f"Signal sent: {signal['market']} {signal['direction']}")
                 return True
             return False
-            
         except Exception as e:
-            print(f"❌ Signal send error: {str(e)}")
+            print(f"Signal send error: {str(e)}")
             return False
     
     def send_startup_message(self):
@@ -156,12 +148,12 @@ class TradingBot:
             msg += f"⏳ Cooldown: {self.config.COOLDOWN_MINUTES} min\n\n"
             msg += f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             msg += "Bot is now scanning markets...\n"
-            msg += "Signals will arrive when conditions are met! 📈"
+            msg += "Signals will arrive when conditions are met!"
             
             self.send_telegram_message(msg)
-            print("✅ Startup message sent to Telegram")
+            print("Startup message sent to Telegram")
         except Exception as e:
-            print(f"⚠️ Could not send startup message: {e}")
+            print(f"Could not send startup message: {e}")
     
     def send_heartbeat(self):
         try:
@@ -194,10 +186,10 @@ class TradingBot:
         signal = self.signal_generator.generate_signal(market, candles)
         
         if signal:
-            print(f"   🎯 ✅ SIGNAL GENERATED! Score: {signal['score']}/100")
+            print(f"   🎯 SIGNAL! Score: {signal['score']}/100")
             return signal
         else:
-            print(f"   ⏭️ No signal (see details above)")
+            print(f"   ⏭️ No signal")
             return None
     
     def scan_all_markets(self):
@@ -209,10 +201,8 @@ class TradingBot:
         
         for market in self.config.MARKETS:
             signal = self.scan_market(market)
-            
             if signal:
                 signals_found.append(signal)
-            
             time.sleep(0.5)
         
         return signals_found
@@ -232,10 +222,8 @@ class TradingBot:
                 self.last_signal_time[signal['market']] = datetime.now()
                 self.signals_sent_today += 1
                 self.save_state()
-                
-                print(f"✅ Processed: {signal['market']}")
-                print(f"📊 Today's Total: {self.signals_sent_today}/{self.config.MAX_SIGNALS_PER_DAY}\n")
-            
+                print(f"Processed: {signal['market']}")
+                print(f"Today Total: {self.signals_sent_today}/{self.config.MAX_SIGNALS_PER_DAY}\n")
             time.sleep(2)
         
         print(f"{'=' * 60}\n")
@@ -252,7 +240,6 @@ class TradingBot:
         print(f"📈 Daily Limit: {self.config.MAX_SIGNALS_PER_DAY}")
         print("=" * 60 + "\n")
         
-        # Send startup notification
         self.send_startup_message()
         
         heartbeat_counter = 0
@@ -262,7 +249,6 @@ class TradingBot:
                 signals = self.scan_all_markets()
                 self.process_signals(signals)
                 
-                # Heartbeat every 12 scans (60 min if 5min interval)
                 heartbeat_counter += 1
                 if heartbeat_counter >= 12:
                     self.send_heartbeat()
@@ -287,114 +273,3 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot()
     bot.run()
-```
-
----
-
-## ✅ **Key Features Added:**
-
-1. ✅ **Startup Message** - Deploy হলেই Telegram এ notification
-2. ✅ **Detailed Scan Logs** - প্রতিটা pair এর score দেখাবে
-3. ✅ **Cooldown Display** - কত মিনিট বাকি আছে
-4. ✅ **Heartbeat** - Every hour bot alive confirmation
-5. ✅ **Better Formatting** - Clean, readable logs
-6. ✅ **State Persistence** - Restart হলেও memory থাকবে
-
----
-
-## 📱 **Telegram এ এরকম Message আসবে:**
-
-**Deploy হলেই:**
-```
-🚀 BOT DEPLOYED SUCCESSFULLY!
-
-✅ Status: ACTIVE
-📊 Markets: 15 pairs
-⏱️ Interval: 15m
-🔄 Scan Every: 5 min
-🎯 Min Score: 75
-⏳ Cooldown: 30 min
-
-🕐 Started: 2025-12-18 10:30:45
-
-Bot is now scanning markets...
-Signals will arrive when conditions are met! 📈
-```
-
-**Signal পেলে:**
-```
-🟢🟢🟢 LONG SIGNAL 🟢🟢🟢
-
-💹 Market: B-BTC_USDT
-📊 Score: 82/100
-⚡ Confidence: MEDIUM
-
-💰 Entry: 0.00043210
-🎯 TP1: 0.00044500
-🎯 TP2: 0.00046200
-🛑 SL: 0.00042100
-
-📈 R:R = 1:2.45
-
-📊 Analysis:
-- RSI: 42.5
-- ADX: 28.3
-- Regime: TRENDING
-
-✅ Reasons:
-1. EMA bullish
-2. RSI oversold recovery (42.5)
-3. MACD bullish
-4. Strong trend (ADX 28.3)
-5. Trending regime
-
-🕐 15:30:22
-⚠️ Use proper risk management!
-```
-
-**Heartbeat (Every Hour):**
-```
-💚 Bot Heartbeat
-🕐 16:30:45
-📊 Signals Today: 3
-✅ Status: Running
-```
-
----
-
-## 🚀 **Deploy Instructions:**
-
-1. **Replace bot.py** with this full code
-2. **Keep signal_logic.py** updated (previous version with logging)
-3. **Push to GitHub**
-4. **Railway auto-deploys**
-5. **Check Telegram** - startup message আসবে!
-
----
-
-## 📊 **Railway Logs এ দেখবে:**
-```
-============================================================
-🔍 SCAN START - 2025-12-18 10:35:00
-============================================================
-
-📊 Scanning B-BTC_USDT...
-   📊 B-BTC_USDT: LONG score = 55/100 (need 75+)
-   ⚠️ Score too low. Missing:
-      • No bullish pattern
-      • Weak trend (ADX: 19.2)
-      • Weak order flow (0.12)
-   ⏭️ No signal (see details above)
-
-📊 Scanning B-ETH_USDT...
-   ❌ B-ETH_USDT: BLOCKED: Ranging market (ADX: 14.8)
-   📊 B-ETH_USDT: LONG score = 0/100 (need 75+)
-   ⏭️ No signal (see details above)
-
-...
-
-📭 No signals found this scan
-============================================================
-
-⏰ Next scan: 10:40:00
-💤 Sleeping 5 min...
