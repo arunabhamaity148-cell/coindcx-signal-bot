@@ -4,18 +4,24 @@ class SmartMoneyLogic:
 
     @staticmethod
     def detect_market_regime(prices, atr, adx):
+        """
+        RELAXED regime detection for INR futures
+        """
         if adx is None or atr is None:
-            return 'unknown'
+            return 'mixed'
 
-        price_range = max(prices[-20:]) - min(prices[-20:])
         avg_price = np.mean(prices[-20:])
-        volatility_ratio = (atr / avg_price) * 100 if avg_price > 0 else 0
+        if avg_price == 0:
+            return 'mixed'
+            
+        volatility_ratio = (atr / avg_price) * 100
 
-        if adx > 25 and volatility_ratio < 3:
+        # RELAXED thresholds for INR futures
+        if adx > 20 and volatility_ratio < 8:
             return 'trending'
-        elif adx < 20 and volatility_ratio < 2:
+        elif adx < 15 and volatility_ratio < 4:
             return 'ranging'
-        elif volatility_ratio > 3:
+        elif volatility_ratio > 10:
             return 'volatile'
         else:
             return 'mixed'
