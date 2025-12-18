@@ -3,35 +3,57 @@ import os
 class Config:
     TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
-    
+
     COINDCX_BASE_URL = "https://public.coindcx.com"
-    MARKETS = os.environ.get('COINDCX_MARKETS', 'B-BTC_USDT,B-ETH_USDT,B-SOL_USDT,B-XRP_USDT,B-MATIC_USDT,B-ADA_USDT,B-DOGE_USDT,B-DOT_USDT,B-LTC_USDT,B-LINK_USDT,B-UNI_USDT,B-AVAX_USDT,B-ATOM_USDT,B-TRX_USDT,B-SHIB_USDT').split(',')
     
-    # Trading
-    CANDLE_INTERVAL = os.environ.get('CANDLE_INTERVAL', '15m')
-    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '68'))
-    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '5'))
-    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '25'))
+    # INR FUTURES MARKETS
+    MARKETS = os.environ.get('COINDCX_MARKETS', 
+        'F-BTC_INR,F-ETH_INR,F-SOL_INR,F-MATIC_INR,F-XRP_INR,'
+        'F-ADA_INR,F-DOGE_INR,F-DOT_INR,F-LTC_INR,F-LINK_INR,'
+        'F-UNI_INR,F-AVAX_INR,F-ATOM_INR,F-TRX_INR,F-SHIB_INR,'
+        'F-ARB_INR,F-OP_INR,F-APT_INR,F-SUI_INR,F-INJ_INR'
+    ).split(',')
+
+    # Leverage
+    LEVERAGE = int(os.environ.get('LEVERAGE', '12'))
+    MIN_LEVERAGE = 10
+    MAX_LEVERAGE = 15
+
+    # Timeframes
+    SIGNAL_TIMEFRAME = '5m'
+    TREND_TIMEFRAME = '15m'
+    BIAS_TIMEFRAME = '1h'
+    
+    # Scanning
+    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '3'))
+    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '30'))
     MAX_SIGNALS_PER_DAY = int(os.environ.get('MAX_SIGNALS_PER_DAY', '999'))
-    
-    # Risk
-    ATR_SL_MULTIPLIER = 1.5
-    ATR_TP1_MULTIPLIER = 2.0
-    ATR_TP2_MULTIPLIER = 3.5
-    MIN_RR_RATIO = 1.4
-    
-    # Technical
+
+    # Scoring
+    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '70'))
+    HIGH_QUALITY_THRESHOLD = 80
+    MEDIUM_QUALITY_THRESHOLD = 70
+
+    # Risk Management
+    ATR_SL_MULTIPLIER = 1.8
+    ATR_TP1_MULTIPLIER = 2.5
+    ATR_TP2_MULTIPLIER = 4.0
+    MIN_RR_RATIO = 1.5
+
+    # Technical Indicators
     RSI_PERIOD = 14
     EMA_FAST = 9
     EMA_SLOW = 21
     ADX_PERIOD = 14
     ATR_PERIOD = 14
+
+    # Smart Filters
+    MIN_ADX_THRESHOLD = 15
+    BLOCK_RANGING_SCORE = 75
+    BLOCK_VOLATILE_SCORE = 80
     
-    # SMART FILTERS (HARD BLOCKS)
-    BLOCK_RANGING_IF_SCORE_BELOW = 70
-    BLOCK_VOLATILE_IF_SCORE_BELOW = 75
-    MIN_ADX_FOR_RANGING_OVERRIDE = 18
-    
-    # Quality Tiers
-    HIGH_QUALITY_THRESHOLD = 75
-    MEDIUM_QUALITY_THRESHOLD = 68
+    # BTC Stability
+    BTC_PAIR = 'F-BTC_INR'
+    BTC_MIN_ADX = 15
+    BTC_MAX_VOLATILITY = 3.5
+    BTC_CHECK_CANDLES = 10
