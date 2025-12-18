@@ -42,50 +42,51 @@ class SignalGenerator:
             
             return candles
         except Exception as e:
-            print(f"Error fetching {market} {interval}: {str(e)}")
+            print(f"   ⚠️ Fetch error {market} {interval}: {str(e)}")
             return None
 
     def check_btc_stability(self):
-        """BTC Calm Check - HARD BLOCK if unstable"""
+        """
+        OPTIONAL BTC check - only if enabled
+        Uses SPOT market (B-BTC_USDT) which has reliable data
+        """
+        if not self.config.ENABLE_BTC_CHECK:
+            return True, 'BTC check disabled', 'neutral'
+        
         try:
             btc_5m = self.fetch_candles(self.config.BTC_PAIR, '5m', 20)
-            btc_15m = self.fetch_candles(self.config.BTC_PAIR, '15m', 20)
-            btc_1h = self.fetch_candles(self.config.BTC_PAIR, '1h', 20)
             
-            if not btc_5m or not btc_15m or not btc_1h:
-                return False, 'BTC data unavailable'
+            if not btc_5m or len(btc_5m) < 10:
+                # No data = neutral (don't block)
+                return True, 'BTC data unavailable (neutral)', 'neutral'
             
-            # Check all timeframes
-            for tf_name, candles in [('5m', btc_5m), ('15m', btc_15m), ('1h', btc_1h)]:
-                closes = [c['close'] for c in candles]
-                highs = [c['high'] for c in candles]
-                lows = [c['low'] for c in candles]
-                
-                # ADX check
-                adx = self.indicators.calculate_adx(highs, lows, closes, 14)
-                if adx and adx < self.config.BTC_MIN_ADX:
-                    return False, f'BTC weak trend ({tf_name} ADX: {adx:.1f})'
-                
-                # Volatility check
-                atr = self.indicators.calculate_atr(highs, lows, closes, 14)
-                volatility = self.indicators.calculate_volatility(closes, atr)
-                if volatility and volatility > self.config.BTC_MAX_VOLATILITY:
-                    return False, f'BTC volatile ({tf_name}: {volatility:.1f}%)'
-                
-                # Dump candle check (last 3 candles)
-                for candle in candles[-3:]:
-                    body_pct = abs(candle['close'] - candle['open']) / candle['open'] * 100
-                    if candle['close'] < candle['open'] and body_pct > 2.5:
-                        return False, f'BTC dump candle ({tf_name})'
+            closes = [c['close'] for c in btc_5m]
+            highs = [c['high'] for c in btc_5m]
+            lows = [c['low'] for c in btc_5m]
             
-            return True, 'BTC stable'
+            # Only check for extreme dump (>5% red candle)
+            for candle in btc_5m[-3:]:
+                body = candle['close'] - candle['open']
+                body_pct = abs(body) / candle['open'] * 100 if candle['open'] > 0 else 0
+                
+                if body < 0 and body_pct > 5.0:
+                    return False, f'BTC extreme dump (-{body_pct:.1f}%)', 'dump'
+            
+            # Check volatility (only extreme)
+            atr = self.indicators.calculate_atr(highs, lows, closes, 14)
+            volatility = self.indicators.calculate_volatility(closes, atr)
+            
+            if volatility and volatility > 8.0:  # Very high threshold
+                return False, f'BTC extreme volatility ({volatility:.1f}%)', 'volatile'
+            
+            return True, 'BTC stable', 'stable'
             
         except Exception as e:
-            print(f"BTC stability check error: {e}")
-            return False, 'BTC check failed'
+            # On error, don't block
+            return True, f'BTC check error (neutral)', 'neutral'
 
     def check_same_candle(self, market, candle_time):
-        """Prevent duplicate signals on same candle"""
+        """Prevent duplicate signals on exact same candle"""
         if market in self.last_candle_time:
             if self.last_candle_time[market] == candle_time:
                 return False
@@ -93,11 +94,18 @@ class SignalGenerator:
         return True
 
     def analyze_market(self, candles_data):
-        """Analyze single timeframe"""
-        if not candles_data or len(candles_data) < 100:
+        """
+        Analyze with RELAXED data requirements
+        Works with 50+ candles instead of 100
+        """
+        if not candles_data:
+            return None
+        
+        # RELAXED: Accept 50+ candles
+        if len(candles_data) < self.config.MIN_CANDLES_REQUIRED:
             return None
 
-        candles = candles_data[-100:]
+        candles = candles_data[-100:] if len(candles_data) >= 100 else candles_data
         closes = [c['close'] for c in candles]
         highs = [c['high'] for c in candles]
         lows = [c['low'] for c in candles]
@@ -141,48 +149,57 @@ class SignalGenerator:
         }
 
     def apply_hard_filters(self, score, regime, adx, atr):
-        """Hard block filters"""
-        # Filter 1: Weak trend
+        """
+        RELAXED hard filters for INR futures
+        Only block extreme cases
+        """
+        # Filter 1: Very weak trend (relaxed)
         if adx and adx < self.config.MIN_ADX_THRESHOLD:
-            return False, f'Weak ADX ({adx:.1f})'
+            # Only block if score is also very low
+            if score < 50:
+                return False, f'Weak ADX ({adx:.1f}) + Low score'
         
-        # Filter 2: Ranging market
+        # Filter 2: Ranging market (relaxed)
         if regime == 'ranging' and score < self.config.BLOCK_RANGING_SCORE:
             return False, f'Ranging (score {score})'
         
-        # Filter 3: Volatile market
+        # Filter 3: Volatile market (relaxed)
         if regime == 'volatile' and score < self.config.BLOCK_VOLATILE_SCORE:
             return False, f'Volatile (score {score})'
         
-        # Filter 4: Low ATR
-        if atr and atr < 0.0001:
+        # Filter 4: ATR too low (VERY relaxed for INR)
+        if atr and atr < self.config.MIN_ATR_THRESHOLD:
             return False, 'ATR too low'
         
         return True, None
 
     def generate_signal(self, market, candles_5m, candles_15m, candles_1h):
-        """Generate signal with full MTF analysis"""
+        """Generate signal with RELAXED MTF requirements"""
         
         # Same candle check
         if candles_5m and not self.check_same_candle(market, candles_5m[-1]['time']):
             return None
         
-        # Analyze all timeframes
+        # Analyze 5m timeframe
         analysis_5m = self.analyze_market(candles_5m)
         if not analysis_5m:
             return None
         
-        # Get MTF trends
-        trend_15m = self.mtf.get_trend_direction(candles_15m)
-        bias_1h = self.mtf.get_trend_direction(candles_1h)
+        # Get MTF trends (with fallback for missing data)
+        trend_15m = self.mtf.get_trend_direction(candles_15m) if candles_15m else 'neutral'
+        bias_1h = self.mtf.get_trend_direction(candles_1h) if candles_1h else 'neutral'
         
-        # Determine direction and check MTF alignment
-        long_aligned, _ = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'LONG')
-        short_aligned, _ = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'SHORT')
+        # Check both directions with RELAXED MTF
+        long_aligned, _ = self.mtf.check_mtf_alignment(
+            trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE
+        )
+        short_aligned, _ = self.mtf.check_mtf_alignment(
+            trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE
+        )
         
-        # Calculate scores for both directions
-        long_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'LONG') if long_aligned else 0
-        short_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'SHORT') if short_aligned else 0
+        # Calculate scores
+        long_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'LONG')
+        short_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'SHORT')
         
         long_score, long_reasons, long_regime = self.scorer.calculate_score(
             analysis_5m, 'LONG', long_mtf_score
@@ -191,7 +208,7 @@ class SignalGenerator:
             analysis_5m, 'SHORT', short_mtf_score
         )
         
-        # Pick best direction
+        # Pick best direction (allow even without perfect MTF)
         if long_score >= short_score and long_score >= self.config.MIN_SIGNAL_SCORE and long_aligned:
             direction = 'LONG'
             score = long_score
@@ -205,12 +222,11 @@ class SignalGenerator:
         else:
             return None
         
-        # Apply hard filters
+        # Apply RELAXED hard filters
         passed, block_reason = self.apply_hard_filters(
             score, regime, analysis_5m['adx'], analysis_5m['atr']
         )
         if not passed:
-            print(f"      ❌ {market}: {block_reason}")
             return None
         
         # Calculate levels
