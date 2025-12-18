@@ -6,33 +6,6 @@ from mtf_logic import MTFLogic
 from scoring import ScoringEngine
 import requests
 
-# 🔥 SPOT → FUTURES Mapping
-SPOT_TO_FUTURES = {
-    'B-BTC_INR': 'F-BTC_INR',
-    'B-ETH_INR': 'F-ETH_INR',
-    'B-SOL_INR': 'F-SOL_INR',
-    'B-MATIC_INR': 'F-MATIC_INR',
-    'B-XRP_INR': 'F-XRP_INR',
-    'B-ADA_INR': 'F-ADA_INR',
-    'B-DOGE_INR': 'F-DOGE_INR',
-    'B-DOT_INR': 'F-DOT_INR',
-    'B-LTC_INR': 'F-LTC_INR',
-    'B-LINK_INR': 'F-LINK_INR',
-    'B-UNI_INR': 'F-UNI_INR',
-    'B-AVAX_INR': 'F-AVAX_INR',
-    'B-ATOM_INR': 'F-ATOM_INR',
-    'B-TRX_INR': 'F-TRX_INR',
-    'B-SHIB_INR': 'F-SHIB_INR',
-    'B-ARB_INR': 'F-ARB_INR',
-    'B-OP_INR': 'F-OP_INR',
-    'B-APT_INR': 'F-APT_INR',
-    'B-SUI_INR': 'F-SUI_INR',
-    'B-INJ_INR': 'F-INJ_INR'
-}
-
-FUTURES_TO_SPOT = {v: k for k, v in SPOT_TO_FUTURES.items()}
-
-
 class SignalGenerator:
 
     def __init__(self):
@@ -44,21 +17,14 @@ class SignalGenerator:
         self.scorer = ScoringEngine(self.config)
         self.last_candle_time = {}
 
-    # -------------------------------------------------------------------------
-    # 🔥 USE SPOT CANDLES ONLY
-    # -------------------------------------------------------------------------
-    def fetch_spot_candles(self, futures_pair, interval='5m', limit=100):
-        """Convert FUTURES → SPOT and fetch clean SPOT candles."""
-
-        if futures_pair not in FUTURES_TO_SPOT:
-            print(f"❌ No SPOT mapping for {futures_pair}")
-            return None
-
-        spot_pair = FUTURES_TO_SPOT[futures_pair]
-
+    # ======================================================================
+    # 🔥 DIRECT SPOT CANDLE FETCHER (NO MAPPING, NO BUGS)
+    # ======================================================================
+    def fetch_candles_direct(self, pair, interval='5m', limit=100):
+        """Fetch SPOT candles directly from CoinDCX."""
         try:
             url = f"{self.config.COINDCX_BASE_URL}/market_data/candles"
-            params = {'pair': spot_pair, 'interval': interval, 'limit': limit}
+            params = {'pair': pair, 'interval': interval, 'limit': limit}
 
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
@@ -72,27 +38,25 @@ class SignalGenerator:
                 candles.append({
                     'time': c['time'],
                     'open': float(c['open']),
-                    'close': float(c['close']),
                     'high': float(c['high']),
                     'low': float(c['low']),
+                    'close': float(c['close']),
                     'volume': float(c['volume'])
                 })
             return candles
 
         except Exception as e:
-            print(f"⚠️ SPOT Fetch Error {spot_pair}: {e}")
+            print(f"⚠️ Fetch error {pair}: {e}")
             return None
 
-    # -------------------------------------------------------------------------
+    # ======================================================================
     # BTC RELAXED CHECK
-    # -------------------------------------------------------------------------
+    # ======================================================================
     def check_btc_stability(self):
         if not self.config.ENABLE_BTC_CHECK:
             return True, 'BTC check disabled', 'neutral'
-
         try:
-            btc_5m = self.fetch_spot_candles(self.config.BTC_PAIR, '5m', 20)
-
+            btc_5m = self.fetch_candles_direct("B-BTC_USDT", '5m', 20)
             if not btc_5m or len(btc_5m) < 10:
                 return True, 'BTC data missing → neutral', 'neutral'
 
@@ -100,14 +64,14 @@ class SignalGenerator:
             highs = [c['high'] for c in btc_5m]
             lows = [c['low'] for c in btc_5m]
 
-            # Extreme dump check
+            # Extreme Dump (>5%)
             for candle in btc_5m[-3:]:
                 body = candle['close'] - candle['open']
                 pct = abs(body) / candle['open'] * 100
                 if body < 0 and pct > 5:
                     return False, f'BTC dump {pct:.1f}%', 'dump'
 
-            # Volatility threshold
+            # Volatility Check
             atr = self.indicators.calculate_atr(highs, lows, closes)
             vol = self.indicators.calculate_volatility(closes, atr)
             if vol and vol > 8:
@@ -118,7 +82,7 @@ class SignalGenerator:
         except:
             return True, 'BTC check error → neutral', 'neutral'
 
-    # -------------------------------------------------------------------------
+    # ======================================================================
     def check_same_candle(self, market, candle_time):
         if market in self.last_candle_time:
             if self.last_candle_time[market] == candle_time:
@@ -126,7 +90,7 @@ class SignalGenerator:
         self.last_candle_time[market] = candle_time
         return True
 
-    # -------------------------------------------------------------------------
+    # ======================================================================
     def analyze_market(self, candles):
         if not candles:
             return None
@@ -135,6 +99,7 @@ class SignalGenerator:
             return None
 
         candles = candles[-100:] if len(candles) > 100 else candles
+
         closes = [c['close'] for c in candles]
         highs = [c['high'] for c in candles]
         lows = [c['low'] for c in candles]
@@ -176,7 +141,7 @@ class SignalGenerator:
             }
         }
 
-    # -------------------------------------------------------------------------
+    # ======================================================================
     def apply_hard_filters(self, score, regime, adx, atr):
         if adx and adx < self.config.MIN_ADX_THRESHOLD and score < 50:
             return False, "Weak ADX + Low Score"
@@ -192,23 +157,25 @@ class SignalGenerator:
 
         return True, None
 
-    # -------------------------------------------------------------------------
+    # ======================================================================
+    # 🔥 FINAL SIGNAL GENERATOR (SPOT-ONLY)
+    # ======================================================================
     def generate_signal(self, market):
-        """FULL SPOT→FUTURES SYSTEM"""
+        """Pure SPOT analysis & signal generation."""
 
-        # Fetch SPOT candles
-        c5 = self.fetch_spot_candles(market, '5m', 100)
-        c15 = self.fetch_spot_candles(market, '15m', 100)
-        c1h = self.fetch_spot_candles(market, '1h', 100)
+        # Fetch SPOT candles directly
+        c5 = self.fetch_candles_direct(market, '5m', 100)
+        c15 = self.fetch_candles_direct(market, '15m', 100)
+        c1h = self.fetch_candles_direct(market, '1h', 100)
 
         if not c5:
             return None
 
-        # Duplicate candle check
+        # Same candle protect
         if not self.check_same_candle(market, c5[-1]['time']):
             return None
 
-        # Analysis
+        # Core analysis
         a5 = self.analyze_market(c5)
         if not a5:
             return None
@@ -216,7 +183,6 @@ class SignalGenerator:
         trend = self.mtf.get_trend_direction(c15) if c15 else 'neutral'
         bias = self.mtf.get_trend_direction(c1h) if c1h else 'neutral'
 
-        # Scores
         long_score, long_reasons, regime_long = self.scorer.calculate_score(
             a5, 'LONG', self.mtf.get_mtf_score(trend, bias, 'LONG')
         )
@@ -224,21 +190,23 @@ class SignalGenerator:
             a5, 'SHORT', self.mtf.get_mtf_score(trend, bias, 'SHORT')
         )
 
-        # Choose direction
+        # Pick best direction
         if long_score >= short_score and long_score >= self.config.MIN_SIGNAL_SCORE:
             direction = 'LONG'
             score = long_score
             reasons = long_reasons
             regime = regime_long
+
         elif short_score >= self.config.MIN_SIGNAL_SCORE:
             direction = 'SHORT'
             score = short_score
             reasons = short_reasons
             regime = regime_short
+
         else:
             return None
 
-        # Filters
+        # Hard filters
         ok, reason = self.apply_hard_filters(score, regime, a5['adx'], a5['atr'])
         if not ok:
             return None
@@ -246,6 +214,7 @@ class SignalGenerator:
         entry = a5['price']
         atr = a5['atr']
 
+        # Levels
         if direction == 'LONG':
             sl = entry - atr * self.config.ATR_SL_MULTIPLIER
             tp1 = entry + atr * self.config.ATR_TP1_MULTIPLIER
@@ -256,7 +225,7 @@ class SignalGenerator:
             tp2 = entry - atr * self.config.ATR_TP2_MULTIPLIER
 
         return {
-            'market': market,      # FUTURES output
+            'market': market,
             'entry': entry,
             'sl': sl,
             'tp1': tp1,
