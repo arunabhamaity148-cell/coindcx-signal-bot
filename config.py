@@ -26,19 +26,19 @@ class Config:
     
     # Scanning
     CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '3'))
-    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '30'))
+    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '20'))
     MAX_SIGNALS_PER_DAY = int(os.environ.get('MAX_SIGNALS_PER_DAY', '999'))
 
-    # Scoring
-    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '70'))
-    HIGH_QUALITY_THRESHOLD = 80
-    MEDIUM_QUALITY_THRESHOLD = 70
+    # Scoring - RELAXED for real INR futures
+    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '55'))
+    HIGH_QUALITY_THRESHOLD = 70
+    MEDIUM_QUALITY_THRESHOLD = 55
 
     # Risk Management
-    ATR_SL_MULTIPLIER = 1.8
-    ATR_TP1_MULTIPLIER = 2.5
-    ATR_TP2_MULTIPLIER = 4.0
-    MIN_RR_RATIO = 1.5
+    ATR_SL_MULTIPLIER = 2.0
+    ATR_TP1_MULTIPLIER = 3.0
+    ATR_TP2_MULTIPLIER = 5.0
+    MIN_RR_RATIO = 1.3
 
     # Technical Indicators
     RSI_PERIOD = 14
@@ -47,13 +47,21 @@ class Config:
     ADX_PERIOD = 14
     ATR_PERIOD = 14
 
-    # Smart Filters
-    MIN_ADX_THRESHOLD = 15
-    BLOCK_RANGING_SCORE = 75
-    BLOCK_VOLATILE_SCORE = 80
+    # RELAXED Filters for INR Futures
+    MIN_ADX_THRESHOLD = 12  # Lowered from 15
+    MIN_ATR_THRESHOLD = 0.00001  # Much lower for INR pairs
     
-    # BTC Stability
-    BTC_PAIR = 'F-BTC_INR'
-    BTC_MIN_ADX = 15
-    BTC_MAX_VOLATILITY = 3.5
-    BTC_CHECK_CANDLES = 10
+    # Regime scoring adjustments
+    BLOCK_RANGING_SCORE = 65  # Lowered from 75
+    BLOCK_VOLATILE_SCORE = 60  # Lowered from 80
+    
+    # BTC Check - DISABLED by default (too problematic)
+    ENABLE_BTC_CHECK = os.environ.get('ENABLE_BTC_CHECK', 'false').lower() == 'true'
+    BTC_PAIR = 'B-BTC_USDT'  # Use SPOT not futures
+    BTC_CHECK_INTERVAL_MINUTES = 10  # Check less frequently
+    
+    # Data requirements - RELAXED
+    MIN_CANDLES_REQUIRED = 50  # Lowered from 100
+    
+    # MTF - RELAXED
+    MTF_STRICT_MODE = False  # Allow signals even with partial MTF alignment
