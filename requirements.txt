@@ -3,7 +3,7 @@
 
 # Core
 requests==2.31.0
-pandas==2.2.2
+pandas==2.0.3
 numpy==1.26.3
 
 # Technical Analysis
