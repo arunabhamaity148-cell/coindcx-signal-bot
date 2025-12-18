@@ -8,29 +8,28 @@ import requests
 
 # 🔥 SPOT → FUTURES Mapping
 SPOT_TO_FUTURES = {
-    'BTC_INR': 'F-BTC_INR',
-    'ETH_INR': 'F-ETH_INR',
-    'SOL_INR': 'F-SOL_INR',
-    'MATIC_INR': 'F-MATIC_INR',
-    'XRP_INR': 'F-XRP_INR',
-    'ADA_INR': 'F-ADA_INR',
-    'DOGE_INR': 'F-DOGE_INR',
-    'DOT_INR': 'F-DOT_INR',
-    'LTC_INR': 'F-LTC_INR',
-    'LINK_INR': 'F-LINK_INR',
-    'UNI_INR': 'F-UNI_INR',
-    'AVAX_INR': 'F-AVAX_INR',
-    'ATOM_INR': 'F-ATOM_INR',
-    'TRX_INR': 'F-TRX_INR',
-    'SHIB_INR': 'F-SHIB_INR',
-    'ARB_INR': 'F-ARB_INR',
-    'OP_INR': 'F-OP_INR',
-    'APT_INR': 'F-APT_INR',
-    'SUI_INR': 'F-SUI_INR',
-    'INJ_INR': 'F-INJ_INR'
+    'B-BTC_INR': 'F-BTC_INR',
+    'B-ETH_INR': 'F-ETH_INR',
+    'B-SOL_INR': 'F-SOL_INR',
+    'B-MATIC_INR': 'F-MATIC_INR',
+    'B-XRP_INR': 'F-XRP_INR',
+    'B-ADA_INR': 'F-ADA_INR',
+    'B-DOGE_INR': 'F-DOGE_INR',
+    'B-DOT_INR': 'F-DOT_INR',
+    'B-LTC_INR': 'F-LTC_INR',
+    'B-LINK_INR': 'F-LINK_INR',
+    'B-UNI_INR': 'F-UNI_INR',
+    'B-AVAX_INR': 'F-AVAX_INR',
+    'B-ATOM_INR': 'F-ATOM_INR',
+    'B-TRX_INR': 'F-TRX_INR',
+    'B-SHIB_INR': 'F-SHIB_INR',
+    'B-ARB_INR': 'F-ARB_INR',
+    'B-OP_INR': 'F-OP_INR',
+    'B-APT_INR': 'F-APT_INR',
+    'B-SUI_INR': 'F-SUI_INR',
+    'B-INJ_INR': 'F-INJ_INR'
 }
 
-# Reverse lookup (Futures → Spot)
 FUTURES_TO_SPOT = {v: k for k, v in SPOT_TO_FUTURES.items()}
 
 
