@@ -78,40 +78,44 @@ class SignalGenerator:
         
         if self.config.BLOCK_RANGING_MARKETS and regime == 'ranging':
             adx_val = analysis['adx'] if analysis['adx'] else 0
-            blocks.append(f'BLOCKED: Ranging market (ADX: {adx_val:.1f})')
-            print(f"      ❌ {market_name}: {blocks[-1]}")
+            blocks.append(f'BLOCKED: Ranging (ADX: {adx_val:.1f})')
             return 0, [], blocks
         
         if self.config.BLOCK_HIGH_VOLATILITY and regime == 'volatile':
-            blocks.append(f'BLOCKED: High volatility market')
-            print(f"      ❌ {market_name}: {blocks[-1]}")
+            blocks.append(f'BLOCKED: High volatility')
             return 0, [], blocks
         
+        # EMA TREND (20 points)
         if direction == 'LONG':
             if analysis['ema_fast'] and analysis['ema_slow']:
                 if analysis['ema_fast'] > analysis['ema_slow']:
                     score += 20
                     reasons.append('EMA bullish')
-                else:
-                    blocks.append(f'EMA bearish')
+                elif analysis['ema_fast'] > analysis['ema_slow'] * 0.998:
+                    score += 10
+                    reasons.append('EMA near bullish')
         else:
             if analysis['ema_fast'] and analysis['ema_slow']:
                 if analysis['ema_fast'] < analysis['ema_slow']:
                     score += 20
                     reasons.append('EMA bearish')
-                else:
-                    blocks.append(f'EMA bullish')
+                elif analysis['ema_fast'] < analysis['ema_slow'] * 1.002:
+                    score += 10
+                    reasons.append('EMA near bearish')
         
+        # RSI (15 points) - RELAXED ZONES
         if analysis['rsi']:
-            if direction == 'LONG' and 30 < analysis['rsi'] < 50:
+            if direction == 'LONG' and 25 < analysis['rsi'] < 65:
                 score += 15
-                reasons.append(f'RSI oversold recovery ({analysis["rsi"]:.1f})')
-            elif direction == 'SHORT' and 50 < analysis['rsi'] < 70:
+                reasons.append(f'RSI favorable ({analysis["rsi"]:.1f})')
+            elif direction == 'SHORT' and 35 < analysis['rsi'] < 75:
                 score += 15
-                reasons.append(f'RSI overbought ({analysis["rsi"]:.1f})')
-            else:
-                blocks.append(f'RSI not in zone (RSI: {analysis["rsi"]:.1f})')
+                reasons.append(f'RSI favorable ({analysis["rsi"]:.1f})')
+            elif 30 < analysis['rsi'] < 70:
+                score += 8
+                reasons.append(f'RSI neutral ({analysis["rsi"]:.1f})')
         
+        # MACD (15 points)
         if analysis['macd'] and analysis['macd_signal']:
             if direction == 'LONG' and analysis['macd'] > analysis['macd_signal']:
                 score += 15
@@ -119,49 +123,60 @@ class SignalGenerator:
             elif direction == 'SHORT' and analysis['macd'] < analysis['macd_signal']:
                 score += 15
                 reasons.append('MACD bearish')
-            else:
-                blocks.append(f'MACD not aligned')
+            elif abs(analysis['macd'] - analysis['macd_signal']) < abs(analysis['macd']) * 0.1:
+                score += 8
+                reasons.append('MACD near crossover')
         
+        # PATTERNS (10 points) - BONUS IF PRESENT
         patterns = analysis['patterns']
         if direction == 'LONG':
             if patterns['bullish_engulfing'] or patterns['hammer'] or patterns['morning_star']:
                 score += 10
                 reasons.append('Bullish pattern')
-            else:
-                blocks.append('No bullish pattern')
         else:
             if patterns['bearish_engulfing'] or patterns['shooting_star'] or patterns['evening_star']:
                 score += 10
                 reasons.append('Bearish pattern')
-            else:
-                blocks.append('No bearish pattern')
         
-        if analysis['adx'] and analysis['adx'] > 25:
-            score += 10
-            reasons.append(f'Strong trend (ADX {analysis["adx"]:.1f})')
-        else:
-            adx_val = analysis['adx'] if analysis['adx'] else 0
-            blocks.append(f'Weak trend (ADX: {adx_val:.1f})')
+        # ADX (10 points) - RELAXED
+        if analysis['adx']:
+            if analysis['adx'] > 25:
+                score += 10
+                reasons.append(f'Strong trend (ADX {analysis["adx"]:.1f})')
+            elif analysis['adx'] > 20:
+                score += 8
+                reasons.append(f'Moderate trend (ADX {analysis["adx"]:.1f})')
+            elif analysis['adx'] > 15:
+                score += 5
+                reasons.append(f'Weak trend (ADX {analysis["adx"]:.1f})')
         
+        # SMART MONEY (10 points)
         smart = analysis['smart']
         
         if smart['liquidity_grab']:
             if (direction == 'LONG' and smart['liquidity_grab'] == 'bullish_sweep') or \
                (direction == 'SHORT' and smart['liquidity_grab'] == 'bearish_sweep'):
                 score += 10
-                reasons.append(f'Liquidity grab')
+                reasons.append('Liquidity grab')
         
+        # ORDER FLOW (10 points) - RELAXED
         if smart['order_flow']:
-            if (direction == 'LONG' and smart['order_flow'] > 0.3) or \
-               (direction == 'SHORT' and smart['order_flow'] < -0.3):
+            if (direction == 'LONG' and smart['order_flow'] > 0.2) or \
+               (direction == 'SHORT' and smart['order_flow'] < -0.2):
                 score += 10
                 reasons.append(f'Order flow ({smart["order_flow"]:.2f})')
-            else:
-                blocks.append(f'Weak order flow ({smart["order_flow"]:.2f})')
+            elif (direction == 'LONG' and smart['order_flow'] > 0) or \
+                 (direction == 'SHORT' and smart['order_flow'] < 0):
+                score += 5
+                reasons.append(f'Slight order flow ({smart["order_flow"]:.2f})')
         
+        # REGIME BONUS (10 points)
         if regime == 'trending':
             score += 10
             reasons.append('Trending regime')
+        elif regime == 'mixed':
+            score += 5
+            reasons.append('Mixed regime')
         
         return score, reasons, blocks
     
@@ -180,12 +195,11 @@ class SignalGenerator:
         best_reasons = long_reasons if long_score >= short_score else short_reasons
         best_blocks = long_blocks if long_score >= short_score else short_blocks
         
-        print(f"      📊 {market}: {best_direction} score = {best_score}/100 (need {self.config.MIN_SIGNAL_SCORE}+)")
+        print(f"      📊 {market}: {best_direction} = {best_score}/100 (need {self.config.MIN_SIGNAL_SCORE}+)")
         
         if best_score < self.config.MIN_SIGNAL_SCORE:
-            print(f"      ⚠️ Score too low. Missing:")
-            for block in best_blocks[:3]:
-                print(f"         • {block}")
+            if best_blocks:
+                print(f"         Blocked: {best_blocks[0]}")
             return None
         
         if long_score >= short_score and long_score >= self.config.MIN_SIGNAL_SCORE:
@@ -216,7 +230,7 @@ class SignalGenerator:
         rr_ratio = reward / risk if risk > 0 else 0
         
         if rr_ratio < self.config.MIN_RR_RATIO:
-            print(f"      ❌ {market}: R:R too low ({rr_ratio:.2f} < {self.config.MIN_RR_RATIO})")
+            print(f"      ❌ {market}: R:R too low ({rr_ratio:.2f})")
             return None
         
         signal = {
