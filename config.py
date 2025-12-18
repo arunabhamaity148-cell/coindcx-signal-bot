@@ -5,8 +5,8 @@ class Config:
     TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
     COINDCX_BASE_URL = "https://public.coindcx.com"
-    
-    # INR FUTURES MARKETS
+
+    # INR FUTURES MARKETS (Execution pairs - analysis will be on SPOT)
     MARKETS = os.environ.get('COINDCX_MARKETS', 
         'F-BTC_INR,F-ETH_INR,F-SOL_INR,F-MATIC_INR,F-XRP_INR,'
         'F-ADA_INR,F-DOGE_INR,F-DOT_INR,F-LTC_INR,F-LINK_INR,'
@@ -23,13 +23,13 @@ class Config:
     SIGNAL_TIMEFRAME = '5m'
     TREND_TIMEFRAME = '15m'
     BIAS_TIMEFRAME = '1h'
-    
+
     # Scanning
     CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '3'))
     COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '20'))
     MAX_SIGNALS_PER_DAY = int(os.environ.get('MAX_SIGNALS_PER_DAY', '999'))
 
-    # Scoring - RELAXED for real INR futures
+    # Scoring (RELAXED for INR futures)
     MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '55'))
     HIGH_QUALITY_THRESHOLD = 70
     MEDIUM_QUALITY_THRESHOLD = 55
@@ -47,21 +47,21 @@ class Config:
     ADX_PERIOD = 14
     ATR_PERIOD = 14
 
-    # RELAXED Filters for INR Futures
-    MIN_ADX_THRESHOLD = 12  # Lowered from 15
-    MIN_ATR_THRESHOLD = 0.00001  # Much lower for INR pairs
-    
-    # Regime scoring adjustments
-    BLOCK_RANGING_SCORE = 65  # Lowered from 75
-    BLOCK_VOLATILE_SCORE = 60  # Lowered from 80
-    
-    # BTC Check - DISABLED by default (too problematic)
+    # Relaxed Filters for INR Futures
+    MIN_ADX_THRESHOLD = 12        # Lowered from 15
+    MIN_ATR_THRESHOLD = 0.00001   # Works with INR altcoins
+
+    # Regime scoring thresholds (relaxed)
+    BLOCK_RANGING_SCORE = 65
+    BLOCK_VOLATILE_SCORE = 60
+
+    # BTC Check (DISABLED by default)
     ENABLE_BTC_CHECK = os.environ.get('ENABLE_BTC_CHECK', 'false').lower() == 'true'
-    BTC_PAIR = 'B-BTC_USDT'  # Use SPOT not futures
-    BTC_CHECK_INTERVAL_MINUTES = 10  # Check less frequently
-    
-    # Data requirements - RELAXED
-    MIN_CANDLES_REQUIRED = 50  # Lowered from 100
-    
-    # MTF - RELAXED
-    MTF_STRICT_MODE = False  # Allow signals even with partial MTF alignment
+    BTC_PAIR = 'B-BTC_USDT'  # Spot BTC for safety
+    BTC_CHECK_INTERVAL_MINUTES = 10
+
+    # Candle data requirement (RELAXED)
+    MIN_CANDLES_REQUIRED = 50
+
+    # MTF Configuration (RELAXED mode)
+    MTF_STRICT_MODE = False
