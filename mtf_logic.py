@@ -17,52 +17,78 @@ class MTFLogic:
         if not ema_fast or not ema_slow:
             return 'neutral'
         
-        if ema_fast > ema_slow * 1.002:
+        # RELAXED threshold - 0.5% difference
+        if ema_fast > ema_slow * 1.005:
             return 'bullish'
-        elif ema_fast < ema_slow * 0.998:
+        elif ema_fast < ema_slow * 0.995:
             return 'bearish'
         else:
             return 'neutral'
     
-    def check_mtf_alignment(self, trend_15m, bias_1h, signal_direction):
+    def check_mtf_alignment(self, trend_15m, bias_1h, signal_direction, strict_mode=False):
         """
-        Check if 5m signal aligns with higher timeframes
-        Returns: (aligned: bool, reason: str)
+        RELAXED MTF alignment for INR futures
+        strict_mode=False allows more signals through
         """
-        if signal_direction == 'LONG':
-            # LONG allowed if 15m bullish and 1h bullish/neutral
-            if trend_15m == 'bullish' and bias_1h in ['bullish', 'neutral']:
-                return True, 'MTF aligned'
-            else:
-                return False, f'MTF mismatch: 15m={trend_15m}, 1h={bias_1h}'
+        if not strict_mode:
+            # RELAXED MODE: Allow if not opposing
+            if signal_direction == 'LONG':
+                # Block only if 15m is clearly bearish
+                if trend_15m == 'bearish':
+                    return False, f'15m bearish blocks LONG'
+                return True, 'MTF acceptable'
+            
+            elif signal_direction == 'SHORT':
+                # Block only if 15m is clearly bullish
+                if trend_15m == 'bullish':
+                    return False, f'15m bullish blocks SHORT'
+                return True, 'MTF acceptable'
         
-        elif signal_direction == 'SHORT':
-            # SHORT allowed if 15m bearish and 1h bearish/neutral
-            if trend_15m == 'bearish' and bias_1h in ['bearish', 'neutral']:
-                return True, 'MTF aligned'
-            else:
+        else:
+            # STRICT MODE: Require full alignment
+            if signal_direction == 'LONG':
+                if trend_15m == 'bullish' and bias_1h in ['bullish', 'neutral']:
+                    return True, 'MTF aligned'
+                return False, f'MTF mismatch: 15m={trend_15m}, 1h={bias_1h}'
+            
+            elif signal_direction == 'SHORT':
+                if trend_15m == 'bearish' and bias_1h in ['bearish', 'neutral']:
+                    return True, 'MTF aligned'
                 return False, f'MTF mismatch: 15m={trend_15m}, 1h={bias_1h}'
         
         return False, 'Unknown direction'
     
     def get_mtf_score(self, trend_15m, bias_1h, signal_direction):
-        """Returns MTF alignment score (0-10)"""
-        aligned, _ = self.check_mtf_alignment(trend_15m, bias_1h, signal_direction)
-        
-        if not aligned:
-            return 0
-        
-        # Full alignment = 10 points
+        """
+        Returns MTF alignment score (0-10)
+        More generous scoring for INR futures
+        """
         if signal_direction == 'LONG':
             if trend_15m == 'bullish' and bias_1h == 'bullish':
                 return 10
             elif trend_15m == 'bullish' and bias_1h == 'neutral':
                 return 8
+            elif trend_15m == 'neutral' and bias_1h == 'bullish':
+                return 7
+            elif trend_15m == 'neutral' and bias_1h == 'neutral':
+                return 5
+            elif trend_15m == 'bearish':
+                return 0
+            else:
+                return 3
         
         elif signal_direction == 'SHORT':
             if trend_15m == 'bearish' and bias_1h == 'bearish':
                 return 10
             elif trend_15m == 'bearish' and bias_1h == 'neutral':
                 return 8
+            elif trend_15m == 'neutral' and bias_1h == 'bearish':
+                return 7
+            elif trend_15m == 'neutral' and bias_1h == 'neutral':
+                return 5
+            elif trend_15m == 'bullish':
+                return 0
+            else:
+                return 3
         
-        return 5
+        return 0
