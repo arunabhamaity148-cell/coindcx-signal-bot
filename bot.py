@@ -20,8 +20,8 @@ class TradingBot:
         self.signals_sent_today = 0
         self.last_reset_date = datetime.now().date()
         self.btc_last_check_time = None
-        self.btc_is_stable = True
-        self.btc_block_notified = False
+        self.btc_status = 'neutral'
+        self.btc_last_block_reason = None
         
         self.state_file = 'bot_state.json'
         self.load_state()
@@ -73,36 +73,53 @@ class TradingBot:
         return self.signals_sent_today < self.config.MAX_SIGNALS_PER_DAY
 
     def check_btc_stability_periodic(self):
-        """Check BTC stability every 5 minutes"""
+        """
+        OPTIONAL BTC check - only if enabled in config
+        Checks less frequently (10 minutes)
+        """
+        if not self.config.ENABLE_BTC_CHECK:
+            return True
+        
         now = datetime.now()
         
+        # Check every 10 minutes (configurable)
         if self.btc_last_check_time:
             time_since = (now - self.btc_last_check_time).total_seconds()
-            if time_since < 300:  # 5 minutes
-                return self.btc_is_stable
+            if time_since < (self.config.BTC_CHECK_INTERVAL_MINUTES * 60):
+                # Return cached result
+                return self.btc_status not in ['volatile', 'dump']
         
         print("\n🔍 Checking BTC stability...")
-        stable, reason = self.signal_generator.check_btc_stability()
+        is_stable, reason, status = self.signal_generator.check_btc_stability()
         
         self.btc_last_check_time = now
+        prev_status = self.btc_status
+        self.btc_status = status
         
-        # State changed
-        if stable != self.btc_is_stable:
-            self.btc_is_stable = stable
-            
-            if not stable:
-                print(f"   ⚠️ BTC UNSTABLE: {reason}")
-                if not self.btc_block_notified:
-                    self.telegram.send_btc_block_message(reason)
-                    self.btc_block_notified = True
-            else:
-                print(f"   ✅ BTC STABLE")
-                self.btc_block_notified = False
+        # Log status
+        if status == 'stable':
+            print(f"   ✅ BTC STABLE")
+        elif status == 'neutral':
+            print(f"   ℹ️ BTC NEUTRAL (allowing signals)")
+        elif status == 'volatile':
+            print(f"   ⚠️ BTC VOLATILE: {reason}")
+        elif status == 'dump':
+            print(f"   🔴 BTC DUMP: {reason}")
         
-        return self.btc_is_stable
+        # Send notification only on critical status change
+        if status != prev_status and status in ['volatile', 'dump']:
+            self.telegram.send_btc_block_message(reason)
+            self.btc_last_block_reason = reason
+        elif prev_status in ['volatile', 'dump'] and status in ['stable', 'neutral']:
+            msg = f"✅ <b>BTC STABILIZED</b>\n\n"
+            msg += f"Bot resuming normal operations.\n"
+            msg += f"Time: {datetime.now().strftime('%H:%M:%S')}"
+            self.telegram.send_message(msg)
+        
+        return status not in ['volatile', 'dump']
 
     def scan_market(self, market):
-        print(f"\n📊 Scanning {market}...")
+        print(f"\n📊 {market}...", end=' ')
 
         # Cooldown check
         if not self.check_cooldown(market):
@@ -110,18 +127,24 @@ class TradingBot:
                 (timedelta(minutes=self.config.COOLDOWN_MINUTES) - 
                 (datetime.now() - self.last_signal_time[market])).total_seconds() / 60
             )
-            print(f"   ⏳ Cooldown active ({mins_left} min left)")
+            print(f"⏳ Cooldown ({mins_left}m)")
             return None
 
         # Daily limit check
         if not self.check_daily_limit():
-            print(f"   ⚠️ Daily limit reached ({self.config.MAX_SIGNALS_PER_DAY})")
+            print(f"⚠️ Daily limit")
             return None
 
         # Fetch all timeframes
         candles_5m = self.signal_generator.fetch_candles(
             market, self.config.SIGNAL_TIMEFRAME, 100
         )
+        
+        if not candles_5m:
+            print(f"❌ No 5m data")
+            return None
+        
+        # MTF data (allow partial)
         candles_15m = self.signal_generator.fetch_candles(
             market, self.config.TREND_TIMEFRAME, 100
         )
@@ -129,99 +152,107 @@ class TradingBot:
             market, self.config.BIAS_TIMEFRAME, 100
         )
 
-        if not candles_5m or not candles_15m or not candles_1h:
-            print(f"   ❌ Incomplete data")
-            return None
-
-        # Generate signal
+        # Generate signal (works even with partial MTF data)
         signal = self.signal_generator.generate_signal(
             market, candles_5m, candles_15m, candles_1h
         )
 
         if signal:
-            print(f"   🎯 SIGNAL! {signal['direction']} Score: {signal['score']}")
+            print(f"🎯 {signal['direction']} {signal['score']}")
             return signal
         else:
-            print(f"   ⏭️ No signal")
+            print(f"⏭️")
             return None
 
     def scan_all_markets(self):
         print(f"\n{'=' * 60}")
-        print(f"🔍 SCAN START - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"🔍 SCAN - {datetime.now().strftime('%H:%M:%S')}")
         print(f"{'=' * 60}")
 
-        # BTC stability check
-        if not self.check_btc_stability_periodic():
-            print("\n⛔ BTC UNSTABLE - All scans blocked")
-            print(f"{'=' * 60}\n")
-            return []
+        # BTC check (if enabled)
+        if self.config.ENABLE_BTC_CHECK:
+            btc_stable = self.check_btc_stability_periodic()
+            if not btc_stable:
+                print(f"\n⛔ BTC {self.btc_status.upper()} - Blocking signals")
+                print(f"{'=' * 60}\n")
+                return []
+        else:
+            print("ℹ️ BTC check disabled")
 
         signals_found = []
+        errors = 0
 
         for market in self.config.MARKETS:
             try:
                 signal = self.scan_market(market)
                 if signal:
                     signals_found.append(signal)
-                time.sleep(0.5)
+                time.sleep(0.3)  # Rate limiting
             except Exception as e:
+                errors += 1
                 print(f"   ❌ Error: {e}")
+                if errors > 5:
+                    print("   ⚠️ Too many errors, continuing...")
+                    break
 
         return signals_found
 
     def process_signals(self, signals):
         if not signals:
-            print(f"\n📭 No signals found this scan")
+            print(f"\n📭 No signals this scan")
             print(f"{'=' * 60}\n")
             return
 
         print(f"\n{'=' * 60}")
-        print(f"🎉 Found {len(signals)} signal(s)!")
-        print(f"{'=' * 60}\n")
+        print(f"🎉 {len(signals)} signal(s) found!")
+        print(f"{'=' * 60}")
 
         for signal in signals:
             if self.telegram.send_signal(signal, self.config.LEVERAGE):
                 self.last_signal_time[signal['market']] = datetime.now()
                 self.signals_sent_today += 1
                 self.save_state()
-                print(f"✅ Sent: {signal['market']} {signal['direction']}")
-                print(f"   Today Total: {self.signals_sent_today}/{self.config.MAX_SIGNALS_PER_DAY}\n")
-            time.sleep(2)
+                print(f"✅ Sent: {signal['market']} {signal['direction']} (Score: {signal['score']})")
+                print(f"   Today: {self.signals_sent_today}/{self.config.MAX_SIGNALS_PER_DAY}")
+            time.sleep(1.5)
 
         print(f"{'=' * 60}\n")
 
     def run(self):
         print("\n" + "=" * 60)
-        print("🤖 COINDCX INR FUTURES SIGNAL BOT")
+        print("🤖 COINDCX INR FUTURES BOT v2.0")
         print("=" * 60)
-        print(f"📊 Markets: {len(self.config.MARKETS)} INR Futures pairs")
+        print(f"📊 Markets: {len(self.config.MARKETS)} pairs")
         print(f"⚡ Leverage: {self.config.LEVERAGE}x")
-        print(f"⏱️ Signal TF: {self.config.SIGNAL_TIMEFRAME}")
+        print(f"⏱️ Signal: {self.config.SIGNAL_TIMEFRAME}")
         print(f"🎯 Min Score: {self.config.MIN_SIGNAL_SCORE}")
-        print(f"🔄 Scan Every: {self.config.CHECK_INTERVAL_MINUTES} min")
-        print(f"⏳ Cooldown: {self.config.COOLDOWN_MINUTES} min")
-        print(f"📈 Daily Limit: {self.config.MAX_SIGNALS_PER_DAY}")
+        print(f"🔄 Scan: {self.config.CHECK_INTERVAL_MINUTES}min")
+        print(f"⏳ Cooldown: {self.config.COOLDOWN_MINUTES}min")
+        print(f"🔍 BTC Check: {'ON' if self.config.ENABLE_BTC_CHECK else 'OFF'}")
+        print(f"📈 MTF Mode: {'STRICT' if self.config.MTF_STRICT_MODE else 'RELAXED'}")
         print("=" * 60 + "\n")
 
         self.telegram.send_startup_message(self.config)
 
         heartbeat_counter = 0
+        scan_count = 0
 
         while True:
             try:
+                scan_count += 1
                 signals = self.scan_all_markets()
                 self.process_signals(signals)
 
                 heartbeat_counter += 1
-                if heartbeat_counter >= 20:  # Every ~1 hour
+                if heartbeat_counter >= 20:
                     self.telegram.send_heartbeat(self.signals_sent_today)
                     heartbeat_counter = 0
 
                 next_scan = datetime.now() + timedelta(
                     minutes=self.config.CHECK_INTERVAL_MINUTES
                 )
-                print(f"⏰ Next scan: {next_scan.strftime('%H:%M:%S')}")
-                print(f"💤 Sleeping {self.config.CHECK_INTERVAL_MINUTES} min...\n")
+                print(f"⏰ Next: {next_scan.strftime('%H:%M:%S')} | Scans: {scan_count} | Signals: {self.signals_sent_today}")
+                print(f"💤 Sleeping {self.config.CHECK_INTERVAL_MINUTES}m...\n")
 
                 time.sleep(self.config.CHECK_INTERVAL_MINUTES * 60)
 
@@ -230,8 +261,8 @@ class TradingBot:
                 self.telegram.send_message("🛑 Bot stopped manually")
                 break
             except Exception as e:
-                print(f"\n❌ Error in main loop: {str(e)}")
-                print("🔄 Retrying in 2 min...\n")
+                print(f"\n❌ Main loop error: {str(e)}")
+                print("🔄 Retrying in 2min...\n")
                 time.sleep(120)
 
 
