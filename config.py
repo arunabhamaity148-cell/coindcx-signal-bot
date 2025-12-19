@@ -1,20 +1,24 @@
+# config.py
 import os
 
-class Config:
-    TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-    TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-    COINDCX_BASE_URL = "https://public.coindcx.com"
-    COINDCX_API_KEY = os.environ.get('COINDCX_API_KEY', '')
+class Config:
+    # ---------- Telegram ----------
+    TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+    TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
+
+    # ---------- CoinDCX ----------
+    COINDCX_BASE_URL   = "https://public.coindcx.com"
+    COINDCX_API_KEY    = os.environ.get('COINDCX_API_KEY', '')
     COINDCX_API_SECRET = os.environ.get('COINDCX_API_SECRET', '')
-    
     USE_AUTHENTICATED_API = os.environ.get('USE_AUTHENTICATED_API', 'true').lower() == 'true'
-    
-    # Working pairs only
-    FUTURES_MARKETS = os.environ.get('FUTURES_MARKETS', 
+
+    # ---------- Markets ----------
+    FUTURES_MARKETS = os.environ.get(
+        'FUTURES_MARKETS',
         'F-BTC_INR,F-ETH_INR,F-SOL_INR,F-MATIC_INR,F-ADA_INR,F-DOGE_INR'
     ).split(',')
-    
+
     SPOT_TO_FUTURES_MAP = {
         'B-BTC_USDT': 'F-BTC_INR',
         'B-ETH_USDT': 'F-ETH_INR',
@@ -28,73 +32,71 @@ class Config:
         'B-ARB_USDT': 'F-ARB_INR',
         'B-SUI_USDT': 'F-SUI_INR'
     }
-    
+
     @property
     def MARKETS(self):
         if self.USE_AUTHENTICATED_API and self.COINDCX_API_KEY:
             return self.FUTURES_MARKETS
-        else:
-            return list(self.SPOT_TO_FUTURES_MAP.keys())
+        return list(self.SPOT_TO_FUTURES_MAP.keys())
 
+    # ---------- Trading ----------
     LEVERAGE = int(os.environ.get('LEVERAGE', '12'))
-    
-    # Timeframes
+
+    # ---------- Timeframes ----------
     SIGNAL_TIMEFRAME = '5m'
-    TREND_TIMEFRAME = '15m'
-    BIAS_TIMEFRAME = '1h'
-    
-    # COINDCX OPTIMIZED - More signals, realistic thresholds
-    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '15'))
-    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '45'))
-    MAX_SIGNALS_PER_DAY = 20
-    
-    # RELAXED SCORING - CoinDCX style
+    TREND_TIMEFRAME  = '15m'
+    BIAS_TIMEFRAME   = '1h'
+
+    # ---------- Scanning ----------
+    CHECK_INTERVAL_MINUTES   = int(os.environ.get('CHECK_INTERVAL_MINUTES', '15'))
+    COOLDOWN_MINUTES         = int(os.environ.get('COOLDOWN_MINUTES', '45'))
+    MAX_SIGNALS_PER_DAY      = 20
+
+    # ---------- Scoring ----------
     MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '45'))
-    HIGH_QUALITY_THRESHOLD = 60
-    PERFECT_SETUP_THRESHOLD = 70
-    
-    # Risk Management - INR specific
-    ATR_SL_MULTIPLIER = 1.8
+    HIGH_QUALITY_THRESHOLD   = 60
+    PERFECT_SETUP_THRESHOLD  = 70
+
+    # Alias for backward compatibility (used inside bot.py / telegram_utils.py)
+    BASE_MIN_SCORE = MIN_SIGNAL_SCORE
+
+    # ---------- Risk ----------
+    ATR_SL_MULTIPLIER  = 1.8
     ATR_TP1_MULTIPLIER = 2.5
     ATR_TP2_MULTIPLIER = 4.0
-    MIN_RR_RATIO = 1.3
-    
-    # Technical Indicators
+    MIN_RR_RATIO       = 1.3
+
+    # ---------- Indicators ----------
     RSI_PERIOD = 14
-    EMA_FAST = 9
-    EMA_SLOW = 21
+    EMA_FAST   = 9
+    EMA_SLOW   = 21
     ADX_PERIOD = 14
     ATR_PERIOD = 14
-    
-    # COINDCX FRIENDLY FILTERS - Much more relaxed
-    MIN_ADX_THRESHOLD = 8  # INR markets often range
-    MIN_ATR_THRESHOLD = 0.000001  # Very low for INR
-    BLOCK_RANGING_SCORE = 40  # Allow ranging trades
-    BLOCK_VOLATILE_SCORE = 50  # Allow volatile trades
-    
-    # BTC Check - Relaxed
+
+    # ---------- Filters ----------
+    MIN_ADX_THRESHOLD      = 8
+    MIN_ATR_THRESHOLD      = 0.000001
+    BLOCK_RANGING_SCORE    = 40
+    BLOCK_VOLATILE_SCORE   = 50
+
+    # ---------- BTC Check ----------
     ENABLE_BTC_CHECK = os.environ.get('ENABLE_BTC_CHECK', 'false').lower() == 'true'
-    BTC_PAIR = 'B-BTC_USDT'
+    BTC_PAIR         = 'B-BTC_USDT'
     BTC_CHECK_INTERVAL_MINUTES = 15
-    BTC_VOLATILITY_THRESHOLD = 8.0  # Higher tolerance
-    BTC_DUMP_THRESHOLD = 5.0  # Only extreme dumps
-    
-    MIN_CANDLES_REQUIRED = 40  # Lower requirement
-    
-    # MTF - VERY RELAXED for CoinDCX
-    MTF_STRICT_MODE = False
-    REQUIRE_MTF_ALIGNMENT = False  # DISABLED - price action priority
-    
-    # BONUSES - Optional, not required
-    VOLUME_SURGE_BONUS = 10
-    WHALE_CANDLE_BONUS = 8
-    LIQUIDITY_SWEEP_BONUS = 8
-    TIME_OF_DAY_MULTIPLIER = False  # DISABLED
-    
-    # NO FORCED CONFIRMATIONS - Let price action speak
-    REQUIRE_VOLUME_OR_WHALE = False
+    BTC_VOLATILITY_THRESHOLD   = 8.0
+    BTC_DUMP_THRESHOLD         = 5.0
+
+    # ---------- Misc ----------
+    MIN_CANDLES_REQUIRED = 40
+    MTF_STRICT_MODE      = False
+    REQUIRE_MTF_ALIGNMENT = False
+
+    # ---------- Bonuses ----------
+    VOLUME_SURGE_BONUS      = 10
+    WHALE_CANDLE_BONUS      = 8
+    LIQUIDITY_SWEEP_BONUS   = 8
+    TIME_OF_DAY_MULTIPLIER  = False
+
+    # ---------- Confirmations ----------
+    REQUIRE_VOLUME_OR_WHALE    = False
     PERFECT_SETUP_INSTANT_SEND = False
-# Alias for backward compatibility
-BASE_MIN_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '55'))
-
-
