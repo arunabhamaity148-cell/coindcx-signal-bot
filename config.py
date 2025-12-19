@@ -25,7 +25,7 @@ class Config:
         'BTCUSDT',
         'ETHUSDT',
         'SOLUSDT',
-        'MATICUSDT',
+        'XRPUSDT',
         'ADAUSDT',
         'DOGEUSDT'
     ]
