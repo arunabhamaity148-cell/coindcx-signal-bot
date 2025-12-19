@@ -147,9 +147,13 @@ class TradingBot:
         return signal
 
     def scan_all_markets(self):
-        """Scan all markets, prioritize HIGH quality"""
+        """Scan all markets with SMART 4-hour window limit"""
         print(f"\n{'=' * 60}")
         print(f"🔍 {datetime.now().strftime('%H:%M:%S')} | Daily: {self.signals_sent_today}/{self.config.MAX_SIGNALS_PER_DAY}")
+        
+        # Check 4-hour window
+        signals_in_4h = self.signal_generator.tracker.get_signals_in_window(hours=4)
+        print(f"📊 Last 4h: {signals_in_4h}/{self.config.MAX_SIGNALS_PER_4_HOURS}")
         print(f"{'=' * 60}")
 
         # Reset scan counter
@@ -162,7 +166,12 @@ class TradingBot:
                 print(f"⛔ BTC {self.btc_status.upper()}\n")
                 return []
         
-        # Collect all signals first
+        # Check 4-hour limit
+        if signals_in_4h >= self.config.MAX_SIGNALS_PER_4_HOURS:
+            print(f"⏸️ 4-hour limit reached ({signals_in_4h}/{self.config.MAX_SIGNALS_PER_4_HOURS})\n")
+            return []
+        
+        # Collect signals
         all_signals = []
         
         for market in self.config.MARKETS:
@@ -177,48 +186,44 @@ class TradingBot:
         if not all_signals:
             return []
         
-        # PRIORITY SORTING: HIGH score first
+        # PRIORITY: Sort by score
         all_signals.sort(key=lambda x: x['score'], reverse=True)
         
-        # Take only top signals based on quality
-        high_priority = [s for s in all_signals if s['score'] >= self.config.PRIORITY_HIGH_SCORE]
-        medium_priority = [s for s in all_signals if self.config.PRIORITY_MEDIUM_SCORE <= s['score'] < self.config.PRIORITY_HIGH_SCORE]
+        # Select top signals
+        remaining_slots = min(
+            self.config.MAX_SIGNALS_PER_4_HOURS - signals_in_4h,
+            self.config.MAX_SIGNALS_PER_DAY - self.signals_sent_today
+        )
         
-        # Select best signals
-        selected_signals = []
+        selected = all_signals[:remaining_slots]
         
-        # Always send HIGH quality
-        selected_signals.extend(high_priority[:self.config.MAX_SIGNALS_PER_SCAN])
+        print(f"\n🎯 Found: {len(all_signals)} | Selected: {len(selected)} (TOP quality)")
+        if selected:
+            print(f"   Scores: {[s['score'] for s in selected]}")
         
-        # Fill remaining slots with MEDIUM if space available
-        remaining_slots = self.config.MAX_SIGNALS_PER_SCAN - len(selected_signals)
-        if remaining_slots > 0:
-            selected_signals.extend(medium_priority[:remaining_slots])
-        
-        # Print summary
-        print(f"\n📊 Found: {len(all_signals)} | Selected: {len(selected_signals)} (Top quality)")
-        if all_signals:
-            print(f"   Scores: {[s['score'] for s in selected_signals]}")
-        
-        return selected_signals
+        return selected
 
     def process_signals(self, signals):
-        """Process selected signals"""
+        """Process and track signals"""
         if not signals:
             print(f"📭 No quality signals\n{'=' * 60}\n")
             return
 
         print(f"\n{'=' * 60}")
-        print(f"🎯 SENDING {len(signals)} SIGNAL(S)")
+        print(f"🚀 SENDING {len(signals)} SIGNAL(S)")
         print(f"{'=' * 60}\n")
 
         for signal in signals:
             if self.telegram.send_signal(signal, self.config.LEVERAGE):
+                # Track signal
+                self.signal_generator.tracker.add_signal(signal)
+                
                 self.last_signal_time[signal['market']] = datetime.now()
                 self.signals_sent_today += 1
                 self.signals_sent_this_scan += 1
                 self.save_state()
-                print(f"✅ {signal['market']} {signal['direction']} | Score: {signal['score']} {signal['quality_emoji']}")
+                
+                print(f"✅ {signal['market']} {signal['direction']} | {signal['score']} {signal['quality_emoji']}")
             time.sleep(2)
 
         print(f"\n{'=' * 60}\n")
@@ -226,7 +231,7 @@ class TradingBot:
     def run(self):
         """Main bot loop"""
         print("\n" + "=" * 60)
-        print("🤖 COINDCX SIGNAL BOT - QUALITY MODE")
+        print("🤖 COINDCX ULTIMATE SMART BOT")
         print("=" * 60)
         
         if self.config.USE_AUTHENTICATED_API and self.config.COINDCX_API_KEY:
@@ -235,13 +240,15 @@ class TradingBot:
             print(f"📊 PUBLIC SPOT → FUTURES")
         
         print(f"⚡ Leverage: {self.config.LEVERAGE}x")
-        print(f"🎯 Min Score: {self.config.MIN_SIGNAL_SCORE}")
-        print(f"📊 Max/Scan: {self.config.MAX_SIGNALS_PER_SCAN}")
+        print(f"🎯 Base Score: {self.config.BASE_MIN_SCORE}+")
+        print(f"🏆 Perfect: {self.config.PERFECT_SETUP_THRESHOLD}+")
+        print(f"📊 Max/4h: {self.config.MAX_SIGNALS_PER_4_HOURS}")
         print(f"📈 Max/Day: {self.config.MAX_SIGNALS_PER_DAY}")
         print(f"🔄 Scan: {self.config.CHECK_INTERVAL_MINUTES}min")
         print(f"⏳ Cooldown: {self.config.COOLDOWN_MINUTES}min")
-        print(f"🔍 BTC Check: {'ON' if self.config.ENABLE_BTC_CHECK else 'OFF'}")
-        print(f"📈 MTF: {'STRICT' if self.config.MTF_STRICT_MODE else 'RELAXED'}")
+        print(f"🔍 BTC: {'ON' if self.config.ENABLE_BTC_CHECK else 'OFF'}")
+        print(f"📈 MTF: {'STRICT' if self.config.MTF_STRICT_MODE else 'BALANCED'}")
+        print(f"🐋 Volume/Whale: {'REQUIRED' if self.config.REQUIRE_VOLUME_OR_WHALE else 'BONUS'}")
         print("=" * 60 + "\n")
 
         self.telegram.send_startup_message(self.config)
