@@ -63,20 +63,25 @@ class Config:
     BIAS_TIMEFRAME = '1h'
     
     # Scanning
-    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '3'))
-    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '20'))
-    MAX_SIGNALS_PER_DAY = int(os.environ.get('MAX_SIGNALS_PER_DAY', '999'))
+    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '5'))
+    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '30'))
+    MAX_SIGNALS_PER_DAY = int(os.environ.get('MAX_SIGNALS_PER_DAY', '15'))
+    MAX_SIGNALS_PER_SCAN = int(os.environ.get('MAX_SIGNALS_PER_SCAN', '3'))
 
-    # Scoring - RELAXED for real INR futures
-    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '55'))
-    HIGH_QUALITY_THRESHOLD = 70
-    MEDIUM_QUALITY_THRESHOLD = 55
+    # STRICT SCORING - Quality over quantity
+    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '65'))
+    HIGH_QUALITY_THRESHOLD = 80
+    MEDIUM_QUALITY_THRESHOLD = 65
+    
+    # PRIORITY scoring - send best signals first
+    PRIORITY_HIGH_SCORE = 80  # Instant send
+    PRIORITY_MEDIUM_SCORE = 70  # Send if slots available
 
     # Risk Management
     ATR_SL_MULTIPLIER = 2.0
     ATR_TP1_MULTIPLIER = 3.0
     ATR_TP2_MULTIPLIER = 5.0
-    MIN_RR_RATIO = 1.3
+    MIN_RR_RATIO = 1.5  # Stricter R:R
 
     # Technical Indicators
     RSI_PERIOD = 14
@@ -85,21 +90,24 @@ class Config:
     ADX_PERIOD = 14
     ATR_PERIOD = 14
 
-    # RELAXED Filters for INR Futures
-    MIN_ADX_THRESHOLD = 12
+    # STRICTER Filters
+    MIN_ADX_THRESHOLD = 15  # Back to 15
     MIN_ATR_THRESHOLD = 0.00001
     
-    # Regime scoring adjustments
-    BLOCK_RANGING_SCORE = 65
-    BLOCK_VOLATILE_SCORE = 60
+    # Regime scoring - STRICTER
+    BLOCK_RANGING_SCORE = 70  # Up from 65
+    BLOCK_VOLATILE_SCORE = 75  # Up from 60
     
-    # BTC Check - DISABLED by default
-    ENABLE_BTC_CHECK = os.environ.get('ENABLE_BTC_CHECK', 'false').lower() == 'true'
+    # BTC Check - ENABLED for quality
+    ENABLE_BTC_CHECK = os.environ.get('ENABLE_BTC_CHECK', 'true').lower() == 'true'
     BTC_PAIR = 'B-BTC_USDT'
     BTC_CHECK_INTERVAL_MINUTES = 10
+    BTC_VOLATILITY_THRESHOLD = 5.0  # Stricter
+    BTC_DUMP_THRESHOLD = 3.0  # Stricter
     
-    # Data requirements - RELAXED
+    # Data requirements
     MIN_CANDLES_REQUIRED = 50
     
-    # MTF - RELAXED
-    MTF_STRICT_MODE = False
+    # MTF - SEMI-STRICT
+    MTF_STRICT_MODE = True  # Enable strict MTF
+    REQUIRE_MTF_ALIGNMENT = True  # Must have MTF alignment
