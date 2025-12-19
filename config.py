@@ -63,7 +63,7 @@ class Config:
     BIAS_TIMEFRAME = '1h'
     
     # Scanning
-    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '5'))
+    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '10'))
     COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '30'))
     MAX_SIGNALS_PER_DAY = int(os.environ.get('MAX_SIGNALS_PER_DAY', '15'))
     MAX_SIGNALS_PER_SCAN = int(os.environ.get('MAX_SIGNALS_PER_SCAN', '3'))
