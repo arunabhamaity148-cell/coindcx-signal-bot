@@ -252,12 +252,12 @@ class SignalGenerator:
 
     def generate_signal(self, market, candles_5m, candles_15m, candles_1h):
         """
-        ULTIMATE SMART SIGNAL with volume/whale/liquidity detection
+        ULTIMATE SMART SIGNAL with DETAILED REJECTION LOGGING
         """
         
         analysis_5m = self.analyze_market(candles_5m)
         if not analysis_5m:
-            print(f"SKIP: Analysis failed")
+            print(f"      ⚠️ SKIP: Analysis failed (need {self.config.MIN_CANDLES_REQUIRED}+ candles)")
             return None
         
         # ADVANCED: Volume surge detection
@@ -274,12 +274,14 @@ class SignalGenerator:
         bias_1h = self.mtf.get_trend_direction(candles_1h) if candles_1h else 'neutral'
         
         # MTF alignment
-        long_aligned, _ = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE)
-        short_aligned, _ = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE)
+        long_aligned, long_mtf_reason = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE)
+        short_aligned, short_mtf_reason = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE)
         
         if self.config.REQUIRE_MTF_ALIGNMENT:
             if not long_aligned and not short_aligned:
-                print(f"SKIP: MTF (15m={trend_15m}, 1h={bias_1h})")
+                print(f"      ⛔ SKIP: MTF blocked")
+                print(f"         LONG: {long_mtf_reason} (15m={trend_15m}, 1h={bias_1h})")
+                print(f"         SHORT: {short_mtf_reason}")
                 return None
         
         # Calculate MTF scores
@@ -302,7 +304,9 @@ class SignalGenerator:
             reasons = short_reasons
             regime = short_regime
         else:
-            print(f"SKIP: No aligned direction (L:{long_base}, S:{short_base})")
+            print(f"      ⛔ SKIP: No aligned direction")
+            print(f"         LONG: base={long_base}, aligned={long_aligned}")
+            print(f"         SHORT: base={short_base}, aligned={short_aligned}")
             return None
         
         # APPLY ADVANCED BONUSES
@@ -314,25 +318,44 @@ class SignalGenerator:
             base_score, reasons, analysis_5m, direction, volume_data, whale_data, liquidity_data
         )
         
+        # Log bonus status
+        if bonus_applied:
+            print(f"      💎 Bonuses applied: Base={base_score} → Final={final_score}")
+            if volume_surge:
+                print(f"         📊 Volume surge: {surge_ratio:.1f}x ({vol_direction})")
+            if whale_detected:
+                print(f"         🐋 Whale candle: {whale_pct:.1f}% ({whale_direction})")
+            if liq_sweep:
+                print(f"         💧 Liquidity sweep: {sweep_type} (strength={sweep_strength})")
+        
         # REQUIRE at least volume OR whale confirmation
         if self.config.REQUIRE_VOLUME_OR_WHALE:
             if not bonus_applied and final_score < self.config.PERFECT_SETUP_THRESHOLD:
-                print(f"SKIP: No volume/whale confirmation (Score:{final_score})")
+                print(f"      ⛔ SKIP: No volume/whale confirmation required")
+                print(f"         Score={final_score} (need {self.config.PERFECT_SETUP_THRESHOLD}+ to bypass)")
+                print(f"         Volume surge: {volume_surge}, Whale: {whale_detected}, Liq sweep: {liq_sweep}")
                 return None
         
         # Apply time multiplier
         current_hour = datetime.utcnow().hour
+        score_before_time = final_score
         final_score = self.scorer.apply_time_multiplier(final_score, current_hour)
+        
+        if final_score != score_before_time:
+            print(f"      ⏰ Time multiplier: {score_before_time} → {final_score} (hour={current_hour} UTC)")
         
         # Check minimum score
         if final_score < self.config.BASE_MIN_SCORE:
-            print(f"SKIP: Low score ({final_score}, need {self.config.BASE_MIN_SCORE}+)")
+            print(f"      ⛔ SKIP: Score too low")
+            print(f"         Final score: {final_score} (need {self.config.BASE_MIN_SCORE}+)")
+            print(f"         Base: {base_score}, Bonuses: {final_score - base_score}")
             return None
         
         # Hard filters
         passed, block_reason = self.apply_hard_filters(final_score, regime, analysis_5m['adx'], analysis_5m['atr'])
         if not passed:
-            print(f"SKIP: {block_reason}")
+            print(f"      ⛔ SKIP: Hard filter blocked - {block_reason}")
+            print(f"         ADX: {analysis_5m['adx']:.1f}, ATR: {analysis_5m['atr']:.6f}, Regime: {regime}")
             return None
         
         # Get futures price
@@ -345,17 +368,18 @@ class SignalGenerator:
             futures_price, bid, ask = self.get_live_futures_price(futures_market)
             
             if not futures_price:
-                print(f"SKIP: No futures price for {futures_market}")
+                print(f"      ⛔ SKIP: No futures price for {futures_market}")
                 return None
             
             is_valid, reason = self.validate_price_sanity(spot_price, futures_price, futures_market)
             
             if not is_valid:
-                print(f"SKIP: {reason}")
+                print(f"      ⛔ SKIP: Price validation failed - {reason}")
+                print(f"         Spot: {spot_price:.4f}, Futures: {futures_price:.2f}")
                 return None
             
             entry_price = futures_price
-            print(f"OK: ₹{futures_price:.2f} |", end=' ')
+            print(f"      ✓ Price OK: Spot={spot_price:.4f} USDT, Futures=₹{futures_price:.2f}")
         
         # Calculate levels
         atr = analysis_5m['atr']
@@ -378,7 +402,9 @@ class SignalGenerator:
         rr_ratio = reward / risk if risk > 0 else 0
         
         if rr_ratio < self.config.MIN_RR_RATIO:
-            print(f"SKIP: R:R {rr_ratio:.2f}")
+            print(f"      ⛔ SKIP: R:R too low")
+            print(f"         R:R: {rr_ratio:.2f} (need {self.config.MIN_RR_RATIO}+)")
+            print(f"         Risk: ₹{risk:.2f}, Reward: ₹{reward:.2f}")
             return None
         
         quality_tier, emoji = self.scorer.get_quality_tier(final_score)
