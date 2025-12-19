@@ -76,8 +76,11 @@ class WebSocketFeed:
             """Run WebSocket in thread"""
             websocket.enableTrace(False)
             
+            # CoinDCX public WebSocket URL
+            ws_url = "wss://stream.coindcx.com/socket.io/?EIO=3&transport=websocket"
+            
             self.ws = websocket.WebSocketApp(
-                config.WS_URL,
+                ws_url,
                 on_message=self.on_message,
                 on_error=self.on_error,
                 on_close=self.on_close,
