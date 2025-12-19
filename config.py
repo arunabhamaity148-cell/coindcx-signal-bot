@@ -105,3 +105,5 @@ class Config:
     # CONFIRMATIONS REQUIRED (multi-layer)
     REQUIRE_VOLUME_OR_WHALE = True  # At least one
     PERFECT_SETUP_INSTANT_SEND = True  # Score 80+ bypasses some checks
+    # Alias for backward compatibility
+    MIN_SIGNAL_SCORE = BASE_MIN_SCORE
