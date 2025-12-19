@@ -94,5 +94,4 @@ class Config:
     # NO FORCED CONFIRMATIONS - Let price action speak
     REQUIRE_VOLUME_OR_WHALE = False
     PERFECT_SETUP_INSTANT_SEND = False
-    # Alias for backward compatibility
-    MIN_SIGNAL_SCORE = BASE_MIN_SCORE
+
