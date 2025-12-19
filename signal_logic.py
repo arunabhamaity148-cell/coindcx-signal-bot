@@ -21,6 +21,7 @@ class SignalGenerator:
         self.scorer = ScoringEngine(self.config)
         self.last_candle_time = {}
         self.futures_prices = {}
+        self.price_validation_tolerance = 0.30  # 30% tolerance
 
     def get_authenticated_headers(self, secret_key, api_key, payload):
         """Generate authenticated headers for CoinDCX API"""
@@ -113,15 +114,13 @@ class SignalGenerator:
         except:
             return None
 
-    def get_futures_price(self, futures_market):
-        """Get current futures price"""
+    def get_live_futures_price(self, futures_market):
+        """
+        CRITICAL: Get ACCURATE live futures price
+        Returns: (price, bid, ask) or None
+        """
         try:
-            cache_key = futures_market
-            if cache_key in self.futures_prices:
-                cached_time, cached_price = self.futures_prices[cache_key]
-                if time.time() - cached_time < 30:
-                    return cached_price
-            
+            # Don't use stale cache
             url = f"{self.config.COINDCX_BASE_URL}/exchange/ticker"
             response = requests.get(url, timeout=5)
             response.raise_for_status()
@@ -129,13 +128,50 @@ class SignalGenerator:
             
             for ticker in data:
                 if ticker.get('market') == futures_market:
-                    price = float(ticker.get('last_price', 0))
-                    self.futures_prices[cache_key] = (time.time(), price)
-                    return price
+                    # Get multiple price points for validation
+                    last_price = float(ticker.get('last_price', 0))
+                    bid = float(ticker.get('bid', 0))
+                    ask = float(ticker.get('ask', 0))
+                    
+                    # Validate prices exist
+                    if last_price > 0 and bid > 0 and ask > 0:
+                        # Use mid price for accuracy
+                        mid_price = (bid + ask) / 2
+                        
+                        # Cache for 10 seconds only
+                        self.futures_prices[futures_market] = (time.time(), mid_price, bid, ask)
+                        
+                        return mid_price, bid, ask
             
-            return None
-        except:
-            return None
+            return None, None, None
+            
+        except Exception as e:
+            print(f"   ⚠️ Price fetch error: {e}")
+            return None, None, None
+
+    def validate_price_sanity(self, spot_price, futures_price, market_name):
+        """
+        Validate that futures price is reasonable vs spot
+        Prevents wrong decimal/conversion bugs
+        """
+        if not spot_price or not futures_price:
+            return False, "Missing price data"
+        
+        # Calculate difference percentage
+        diff_pct = abs(futures_price - spot_price) / spot_price * 100
+        
+        # Futures should be within 30% of spot (generous for INR conversion)
+        if diff_pct > 30:
+            return False, f"Price mismatch: Spot={spot_price:.4f}, Futures={futures_price:.4f} ({diff_pct:.1f}% diff)"
+        
+        # Check for decimal point errors (10x, 100x, 0.1x, 0.01x)
+        ratio = futures_price / spot_price if spot_price > 0 else 0
+        
+        # Should be close to 1.0, not 10, 100, 0.1, 0.01
+        if ratio > 5 or ratio < 0.2:
+            return False, f"Decimal error: ratio={ratio:.2f}"
+        
+        return True, "OK"
 
     def fetch_candles(self, market, interval='5m', limit=100):
         """Smart candle fetching with fallback"""
@@ -169,7 +205,6 @@ class SignalGenerator:
             highs = [c['high'] for c in btc_5m]
             lows = [c['low'] for c in btc_5m]
             
-            # STRICTER dump check (>3% red candle)
             for candle in btc_5m[-3:]:
                 body = candle['close'] - candle['open']
                 body_pct = abs(body) / candle['open'] * 100 if candle['open'] > 0 else 0
@@ -177,7 +212,6 @@ class SignalGenerator:
                 if body < 0 and body_pct > self.config.BTC_DUMP_THRESHOLD:
                     return False, f'BTC dump (-{body_pct:.1f}%)', 'dump'
             
-            # STRICTER volatility (>5%)
             atr = self.indicators.calculate_atr(highs, lows, closes, 14)
             volatility = self.indicators.calculate_volatility(closes, atr)
             
@@ -247,11 +281,9 @@ class SignalGenerator:
 
     def apply_hard_filters(self, score, regime, adx, atr):
         """STRICTER filters"""
-        # ADX check - stricter
         if adx and adx < self.config.MIN_ADX_THRESHOLD:
             return False, f'Weak ADX ({adx:.1f})'
         
-        # Regime checks - stricter
         if regime == 'ranging' and score < self.config.BLOCK_RANGING_SCORE:
             return False, f'Ranging (need {self.config.BLOCK_RANGING_SCORE}+)'
         
@@ -264,7 +296,9 @@ class SignalGenerator:
         return True, None
 
     def generate_signal(self, market, candles_5m, candles_15m, candles_1h):
-        """Generate HIGH QUALITY signal only"""
+        """
+        FIXED: Generate signal with CORRECT futures price
+        """
         
         if candles_5m and not self.check_same_candle(market, candles_5m[-1]['time']):
             return None
@@ -277,7 +311,7 @@ class SignalGenerator:
         trend_15m = self.mtf.get_trend_direction(candles_15m) if candles_15m else 'neutral'
         bias_1h = self.mtf.get_trend_direction(candles_1h) if candles_1h else 'neutral'
         
-        # STRICT MTF alignment check
+        # STRICT MTF alignment
         long_aligned, _ = self.mtf.check_mtf_alignment(
             trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE
         )
@@ -285,7 +319,6 @@ class SignalGenerator:
             trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE
         )
         
-        # If REQUIRE_MTF_ALIGNMENT, both directions need check
         if self.config.REQUIRE_MTF_ALIGNMENT:
             if not long_aligned and not short_aligned:
                 return None
@@ -301,7 +334,7 @@ class SignalGenerator:
             analysis_5m, 'SHORT', short_mtf_score
         )
         
-        # Pick BEST direction
+        # Pick direction
         if long_score >= short_score and long_score >= self.config.MIN_SIGNAL_SCORE and long_aligned:
             direction = 'LONG'
             score = long_score
@@ -322,29 +355,54 @@ class SignalGenerator:
         if not passed:
             return None
         
-        # Get price
-        entry = analysis_5m['price']
+        # CRITICAL: Get CORRECT futures price
+        spot_price = analysis_5m['price']
+        entry_price = spot_price
         futures_market = None
         
+        # If using spot data for futures signal
         if market.startswith('B-') and market in self.config.SPOT_TO_FUTURES_MAP:
             futures_market = self.config.SPOT_TO_FUTURES_MAP[market]
-            futures_price = self.get_futures_price(futures_market)
-            if futures_price:
-                entry = futures_price
+            
+            # Get live futures price
+            futures_price, bid, ask = self.get_live_futures_price(futures_market)
+            
+            if not futures_price:
+                print(f"   ❌ No futures price for {futures_market}")
+                return None
+            
+            # VALIDATE price sanity
+            is_valid, reason = self.validate_price_sanity(spot_price, futures_price, futures_market)
+            
+            if not is_valid:
+                print(f"   ❌ Price validation failed: {reason}")
+                return None
+            
+            # Use validated futures price
+            entry_price = futures_price
+            
+            print(f"   ✓ Price validated: Spot={spot_price:.4f}, Futures={futures_price:.4f}")
         
+        # Use spot price's ATR for SL/TP calculation (same volatility)
         atr = analysis_5m['atr']
         
-        if direction == 'LONG':
-            sl = entry - (atr * self.config.ATR_SL_MULTIPLIER)
-            tp1 = entry + (atr * self.config.ATR_TP1_MULTIPLIER)
-            tp2 = entry + (atr * self.config.ATR_TP2_MULTIPLIER)
-        else:
-            sl = entry + (atr * self.config.ATR_SL_MULTIPLIER)
-            tp1 = entry - (atr * self.config.ATR_TP1_MULTIPLIER)
-            tp2 = entry - (atr * self.config.ATR_TP2_MULTIPLIER)
+        # Scale ATR proportionally if prices differ significantly
+        if futures_market and abs(entry_price - spot_price) / spot_price > 0.05:
+            atr_scale = entry_price / spot_price
+            atr = atr * atr_scale
         
-        risk = abs(entry - sl)
-        reward = abs(tp2 - entry)
+        # Calculate levels based on CORRECT entry price
+        if direction == 'LONG':
+            sl = entry_price - (atr * self.config.ATR_SL_MULTIPLIER)
+            tp1 = entry_price + (atr * self.config.ATR_TP1_MULTIPLIER)
+            tp2 = entry_price + (atr * self.config.ATR_TP2_MULTIPLIER)
+        else:
+            sl = entry_price + (atr * self.config.ATR_SL_MULTIPLIER)
+            tp1 = entry_price - (atr * self.config.ATR_TP1_MULTIPLIER)
+            tp2 = entry_price - (atr * self.config.ATR_TP2_MULTIPLIER)
+        
+        risk = abs(entry_price - sl)
+        reward = abs(tp2 - entry_price)
         rr_ratio = reward / risk if risk > 0 else 0
         
         # STRICTER R:R
@@ -358,7 +416,7 @@ class SignalGenerator:
         return {
             'market': display_market,
             'direction': direction,
-            'entry': entry,
+            'entry': entry_price,
             'sl': sl,
             'tp1': tp1,
             'tp2': tp2,
