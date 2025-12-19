@@ -111,27 +111,27 @@ class TradingBot:
         return status not in ['volatile', 'dump']
 
     def scan_market(self, market):
-        """Scan single market with detailed logging"""
-        print(f"   📊 {market}...", end=' ')
+        """Scan single market with detailed rejection logging"""
+        print(f"\n   📊 {market}")
         
         if not self.check_cooldown(market):
             mins_left = int((timedelta(minutes=self.config.COOLDOWN_MINUTES) - 
                            (datetime.now() - self.last_signal_time[market])).total_seconds() / 60)
-            print(f"⏳ Cooldown ({mins_left}m left)")
+            print(f"      ⏳ SKIP: Cooldown ({mins_left}m)")
             return None
 
         if not self.check_daily_limit():
-            print(f"🚫 Daily limit ({self.signals_sent_today}/{self.config.MAX_SIGNALS_PER_DAY})")
+            print(f"      🚫 SKIP: Daily limit")
             return None
         
         if not self.check_scan_limit():
-            print(f"🚫 Scan limit ({self.signals_sent_this_scan}/{self.config.MAX_SIGNALS_PER_SCAN})")
+            print(f"      🚫 SKIP: Scan limit")
             return None
 
         candles_5m = self.signal_generator.fetch_candles(market, self.config.SIGNAL_TIMEFRAME, 100)
         
         if not candles_5m:
-            print(f"❌ No 5m data")
+            print(f"      ❌ SKIP: No 5m data")
             return None
         
         candles_15m = self.signal_generator.fetch_candles(market, self.config.TREND_TIMEFRAME, 100)
@@ -140,9 +140,7 @@ class TradingBot:
         signal = self.signal_generator.generate_signal(market, candles_5m, candles_15m, candles_1h)
 
         if signal:
-            print(f"✅ {signal['direction']} {signal['score']} {signal['quality_emoji']}")
-        else:
-            print(f"—")
+            print(f"      ✅ SIGNAL: {signal['direction']} Score={signal['score']} {signal['quality_emoji']}")
         
         return signal
 
@@ -278,4 +276,4 @@ class TradingBot:
 
 if __name__ == "__main__":
     bot = TradingBot()
-    bot.run() 
+    bot.run()
