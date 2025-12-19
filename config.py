@@ -94,4 +94,7 @@ class Config:
     # NO FORCED CONFIRMATIONS - Let price action speak
     REQUIRE_VOLUME_OR_WHALE = False
     PERFECT_SETUP_INSTANT_SEND = False
+# Alias for backward compatibility
+BASE_MIN_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '55'))
+
 
