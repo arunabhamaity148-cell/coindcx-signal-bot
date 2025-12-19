@@ -21,13 +21,17 @@ class Config:
     
     # Trading Pairs - CoinDCX format
     # Use exact market names from CoinDCX
+   
     PAIRS = [
         'BTCUSDT',
         'ETHUSDT',
         'SOLUSDT',
         'XRPUSDT',
         'ADAUSDT',
-        'DOGEUSDT'
+        'DOGEUSDT',
+        'BNBUSDT',
+        'BCHUSDT',
+        'SUIUSDT'
     ]
     
     # Mode Configurations
