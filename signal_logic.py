@@ -252,10 +252,170 @@ class SignalGenerator:
 
     def generate_signal(self, market, candles_5m, candles_15m, candles_1h):
         """
-        ULTIMATE SMART SIGNAL with DETAILED REJECTION LOGGING
+        COINDCX INR OPTIMIZED - Price action priority, detailed logging
         """
+        print(f"      📈 Analyzing...")
         
         analysis_5m = self.analyze_market(candles_5m)
+        if not analysis_5m:
+            print(f"      ❌ REJECT: Need {self.config.MIN_CANDLES_REQUIRED}+ candles, got {len(candles_5m) if candles_5m else 0}")
+            return None
+        
+        print(f"         RSI: {analysis_5m['rsi']:.1f}, ADX: {analysis_5m['adx']:.1f}, Regime: {analysis_5m['smart']['market_regime']}")
+        
+        # Volume/Whale/Liquidity detection
+        volume_surge, surge_ratio, vol_direction = self.volume_whale.detect_volume_surge(candles_5m)
+        whale_detected, whale_pct, whale_direction = self.volume_whale.detect_whale_candle(candles_5m[-1])
+        liq_sweep, sweep_type, sweep_strength = self.volume_whale.detect_liquidity_sweep_advanced(candles_5m)
+        
+        if volume_surge or whale_detected or liq_sweep:
+            print(f"         🎯 Special: Vol={volume_surge}, Whale={whale_detected}, Sweep={liq_sweep}")
+        
+        # MTF (optional for CoinDCX)
+        trend_15m = self.mtf.get_trend_direction(candles_15m) if candles_15m else 'neutral'
+        bias_1h = self.mtf.get_trend_direction(candles_1h) if candles_1h else 'neutral'
+        
+        print(f"         MTF: 15m={trend_15m}, 1h={bias_1h}")
+        
+        long_aligned, _ = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE)
+        short_aligned, _ = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE)
+        
+        # MTF check only if required (disabled by default)
+        if self.config.REQUIRE_MTF_ALIGNMENT:
+            if not long_aligned and not short_aligned:
+                print(f"      ❌ REJECT: MTF - LONG blocked, SHORT blocked")
+                return None
+        
+        # Scores
+        long_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'LONG')
+        short_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'SHORT')
+        
+        long_base, long_reasons, long_regime = self.scorer.calculate_base_score(analysis_5m, 'LONG', long_mtf_score)
+        short_base, short_reasons, short_regime = self.scorer.calculate_base_score(analysis_5m, 'SHORT', short_mtf_score)
+        
+        print(f"         Scores: LONG={long_base}, SHORT={short_base}")
+        
+        # Pick direction - both allowed if not strict MTF
+        if long_base >= short_base and (long_aligned or not self.config.REQUIRE_MTF_ALIGNMENT):
+            direction = 'LONG'
+            base_score = long_base
+            reasons = long_reasons
+            regime = long_regime
+        elif short_aligned or not self.config.REQUIRE_MTF_ALIGNMENT:
+            direction = 'SHORT'
+            base_score = short_base
+            reasons = short_reasons
+            regime = short_regime
+        else:
+            print(f"      ❌ REJECT: No valid direction (L:{long_base}/{long_aligned}, S:{short_base}/{short_aligned})")
+            return None
+        
+        # Bonuses
+        volume_data = {'is_surge': volume_surge, 'surge_ratio': surge_ratio, 'direction': vol_direction}
+        whale_data = {'is_whale': whale_detected, 'move_pct': whale_pct, 'direction': whale_direction}
+        liquidity_data = {'is_sweep': liq_sweep, 'type': sweep_type, 'strength': sweep_strength}
+        
+        final_score, final_reasons, bonus_applied = self.scorer.apply_advanced_bonuses(
+            base_score, reasons, analysis_5m, direction, volume_data, whale_data, liquidity_data
+        )
+        
+        if bonus_applied:
+            print(f"         💎 Bonus: {base_score} → {final_score}")
+        
+        # Volume/Whale requirement check (disabled by default for CoinDCX)
+        if self.config.REQUIRE_VOLUME_OR_WHALE:
+            if not bonus_applied and final_score < self.config.PERFECT_SETUP_THRESHOLD:
+                print(f"      ❌ REJECT: Need volume/whale confirmation (score={final_score})")
+                return None
+        
+        # Time multiplier (disabled for CoinDCX)
+        final_score = self.scorer.apply_time_multiplier(final_score, datetime.utcnow().hour)
+        
+        # MIN SCORE CHECK
+        if final_score < self.config.MIN_SIGNAL_SCORE:
+            print(f"      ❌ REJECT: Score {final_score} < {self.config.MIN_SIGNAL_SCORE} (Base:{base_score}, Bonus:{final_score-base_score})")
+            return None
+        
+        # Hard filters (very relaxed)
+        passed, block_reason = self.apply_hard_filters(final_score, regime, analysis_5m['adx'], analysis_5m['atr'])
+        if not passed:
+            print(f"      ❌ REJECT: Filter - {block_reason}")
+            return None
+        
+        # Price validation
+        spot_price = analysis_5m['price']
+        entry_price = spot_price
+        futures_market = None
+        
+        if market.startswith('B-') and market in self.config.SPOT_TO_FUTURES_MAP:
+            futures_market = self.config.SPOT_TO_FUTURES_MAP[market]
+            futures_price, bid, ask = self.get_live_futures_price(futures_market)
+            
+            if not futures_price:
+                print(f"      ❌ REJECT: No futures price for {futures_market}")
+                return None
+            
+            is_valid, reason = self.validate_price_sanity(spot_price, futures_price, futures_market)
+            
+            if not is_valid:
+                print(f"      ❌ REJECT: Price invalid - {reason}")
+                return None
+            
+            entry_price = futures_price
+            print(f"         ✓ Price: ₹{futures_price:.2f}")
+        
+        # Levels
+        atr = analysis_5m['atr']
+        
+        if futures_market and abs(entry_price - spot_price) / spot_price > 0.05:
+            atr_scale = entry_price / spot_price
+            atr = atr * atr_scale
+        
+        if direction == 'LONG':
+            sl = entry_price - (atr * self.config.ATR_SL_MULTIPLIER)
+            tp1 = entry_price + (atr * self.config.ATR_TP1_MULTIPLIER)
+            tp2 = entry_price + (atr * self.config.ATR_TP2_MULTIPLIER)
+        else:
+            sl = entry_price + (atr * self.config.ATR_SL_MULTIPLIER)
+            tp1 = entry_price - (atr * self.config.ATR_TP1_MULTIPLIER)
+            tp2 = entry_price - (atr * self.config.ATR_TP2_MULTIPLIER)
+        
+        risk = abs(entry_price - sl)
+        reward = abs(tp2 - entry_price)
+        rr_ratio = reward / risk if risk > 0 else 0
+        
+        if rr_ratio < self.config.MIN_RR_RATIO:
+            print(f"      ❌ REJECT: R:R {rr_ratio:.2f} < {self.config.MIN_RR_RATIO}")
+            return None
+        
+        quality_tier, emoji = self.scorer.get_quality_tier(final_score)
+        
+        display_market = futures_market if futures_market else market
+        
+        print(f"      ✅ SIGNAL APPROVED: {direction} {final_score} {emoji} R:R={rr_ratio:.2f}")
+        
+        return {
+            'market': display_market,
+            'direction': direction,
+            'entry': entry_price,
+            'sl': sl,
+            'tp1': tp1,
+            'tp2': tp2,
+            'score': final_score,
+            'quality_tier': quality_tier,
+            'quality_emoji': emoji,
+            'rr_ratio': rr_ratio,
+            'reasons': final_reasons,
+            'mtf': {
+                'trend_15m': trend_15m,
+                'bias_1h': bias_1h
+            },
+            'analysis': {
+                'rsi': analysis_5m['rsi'],
+                'adx': analysis_5m['adx'],
+                'market_regime': regime
+            }
+        }
         if not analysis_5m:
             print(f"      ⚠️ SKIP: Analysis failed (need {self.config.MIN_CANDLES_REQUIRED}+ candles)")
             return None
@@ -305,131 +465,4 @@ class SignalGenerator:
             regime = short_regime
         else:
             print(f"      ⛔ SKIP: No aligned direction")
-            print(f"         LONG: base={long_base}, aligned={long_aligned}")
-            print(f"         SHORT: base={short_base}, aligned={short_aligned}")
-            return None
         
-        # APPLY ADVANCED BONUSES
-        volume_data = {'is_surge': volume_surge, 'surge_ratio': surge_ratio, 'direction': vol_direction}
-        whale_data = {'is_whale': whale_detected, 'move_pct': whale_pct, 'direction': whale_direction}
-        liquidity_data = {'is_sweep': liq_sweep, 'type': sweep_type, 'strength': sweep_strength}
-        
-        final_score, final_reasons, bonus_applied = self.scorer.apply_advanced_bonuses(
-            base_score, reasons, analysis_5m, direction, volume_data, whale_data, liquidity_data
-        )
-        
-        # Log bonus status
-        if bonus_applied:
-            print(f"      💎 Bonuses applied: Base={base_score} → Final={final_score}")
-            if volume_surge:
-                print(f"         📊 Volume surge: {surge_ratio:.1f}x ({vol_direction})")
-            if whale_detected:
-                print(f"         🐋 Whale candle: {whale_pct:.1f}% ({whale_direction})")
-            if liq_sweep:
-                print(f"         💧 Liquidity sweep: {sweep_type} (strength={sweep_strength})")
-        
-        # REQUIRE at least volume OR whale confirmation
-        if self.config.REQUIRE_VOLUME_OR_WHALE:
-            if not bonus_applied and final_score < self.config.PERFECT_SETUP_THRESHOLD:
-                print(f"      ⛔ SKIP: No volume/whale confirmation required")
-                print(f"         Score={final_score} (need {self.config.PERFECT_SETUP_THRESHOLD}+ to bypass)")
-                print(f"         Volume surge: {volume_surge}, Whale: {whale_detected}, Liq sweep: {liq_sweep}")
-                return None
-        
-        # Apply time multiplier
-        current_hour = datetime.utcnow().hour
-        score_before_time = final_score
-        final_score = self.scorer.apply_time_multiplier(final_score, current_hour)
-        
-        if final_score != score_before_time:
-            print(f"      ⏰ Time multiplier: {score_before_time} → {final_score} (hour={current_hour} UTC)")
-        
-        # Check minimum score
-        if final_score < self.config.BASE_MIN_SCORE:
-            print(f"      ⛔ SKIP: Score too low")
-            print(f"         Final score: {final_score} (need {self.config.BASE_MIN_SCORE}+)")
-            print(f"         Base: {base_score}, Bonuses: {final_score - base_score}")
-            return None
-        
-        # Hard filters
-        passed, block_reason = self.apply_hard_filters(final_score, regime, analysis_5m['adx'], analysis_5m['atr'])
-        if not passed:
-            print(f"      ⛔ SKIP: Hard filter blocked - {block_reason}")
-            print(f"         ADX: {analysis_5m['adx']:.1f}, ATR: {analysis_5m['atr']:.6f}, Regime: {regime}")
-            return None
-        
-        # Get futures price
-        spot_price = analysis_5m['price']
-        entry_price = spot_price
-        futures_market = None
-        
-        if market.startswith('B-') and market in self.config.SPOT_TO_FUTURES_MAP:
-            futures_market = self.config.SPOT_TO_FUTURES_MAP[market]
-            futures_price, bid, ask = self.get_live_futures_price(futures_market)
-            
-            if not futures_price:
-                print(f"      ⛔ SKIP: No futures price for {futures_market}")
-                return None
-            
-            is_valid, reason = self.validate_price_sanity(spot_price, futures_price, futures_market)
-            
-            if not is_valid:
-                print(f"      ⛔ SKIP: Price validation failed - {reason}")
-                print(f"         Spot: {spot_price:.4f}, Futures: {futures_price:.2f}")
-                return None
-            
-            entry_price = futures_price
-            print(f"      ✓ Price OK: Spot={spot_price:.4f} USDT, Futures=₹{futures_price:.2f}")
-        
-        # Calculate levels
-        atr = analysis_5m['atr']
-        
-        if futures_market and abs(entry_price - spot_price) / spot_price > 0.05:
-            atr_scale = entry_price / spot_price
-            atr = atr * atr_scale
-        
-        if direction == 'LONG':
-            sl = entry_price - (atr * self.config.ATR_SL_MULTIPLIER)
-            tp1 = entry_price + (atr * self.config.ATR_TP1_MULTIPLIER)
-            tp2 = entry_price + (atr * self.config.ATR_TP2_MULTIPLIER)
-        else:
-            sl = entry_price + (atr * self.config.ATR_SL_MULTIPLIER)
-            tp1 = entry_price - (atr * self.config.ATR_TP1_MULTIPLIER)
-            tp2 = entry_price - (atr * self.config.ATR_TP2_MULTIPLIER)
-        
-        risk = abs(entry_price - sl)
-        reward = abs(tp2 - entry_price)
-        rr_ratio = reward / risk if risk > 0 else 0
-        
-        if rr_ratio < self.config.MIN_RR_RATIO:
-            print(f"      ⛔ SKIP: R:R too low")
-            print(f"         R:R: {rr_ratio:.2f} (need {self.config.MIN_RR_RATIO}+)")
-            print(f"         Risk: ₹{risk:.2f}, Reward: ₹{reward:.2f}")
-            return None
-        
-        quality_tier, emoji = self.scorer.get_quality_tier(final_score)
-        
-        display_market = futures_market if futures_market else market
-        
-        return {
-            'market': display_market,
-            'direction': direction,
-            'entry': entry_price,
-            'sl': sl,
-            'tp1': tp1,
-            'tp2': tp2,
-            'score': final_score,
-            'quality_tier': quality_tier,
-            'quality_emoji': emoji,
-            'rr_ratio': rr_ratio,
-            'reasons': final_reasons,
-            'mtf': {
-                'trend_15m': trend_15m,
-                'bias_1h': bias_1h
-            },
-            'analysis': {
-                'rsi': analysis_5m['rsi'],
-                'adx': analysis_5m['adx'],
-                'market_regime': regime
-            }
-        }
