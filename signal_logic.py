@@ -4,11 +4,14 @@ from patterns import CandlestickPatterns
 from smart_logic import SmartMoneyLogic
 from mtf_logic import MTFLogic
 from scoring import ScoringEngine
+from volume_whale import VolumeWhaleDetector
+from signal_tracker import SignalTracker
 import requests
 import hmac
 import hashlib
 import json
 import time
+from datetime import datetime
 
 class SignalGenerator:
 
@@ -19,12 +22,12 @@ class SignalGenerator:
         self.smart = SmartMoneyLogic()
         self.mtf = MTFLogic()
         self.scorer = ScoringEngine(self.config)
-        # REMOVED: last_candle_time tracking (causing permanent block)
+        self.volume_whale = VolumeWhaleDetector()
+        self.tracker = SignalTracker()
         self.futures_prices = {}
-        self.price_validation_tolerance = 0.30  # 30% tolerance
+        self.price_validation_tolerance = 0.30
 
     def get_authenticated_headers(self, secret_key, api_key, payload):
-        """Generate authenticated headers for CoinDCX API"""
         try:
             json_payload = json.dumps(payload, separators=(',', ':'))
             signature = hmac.new(
@@ -38,28 +41,16 @@ class SignalGenerator:
                 'X-AUTH-APIKEY': api_key,
                 'X-AUTH-SIGNATURE': signature
             }
-        except Exception as e:
-            print(f"   ⚠️ Auth error: {e}")
+        except:
             return None
 
     def fetch_candles_authenticated(self, market, interval='5m', limit=100):
-        """Fetch candles using authenticated API"""
         try:
             url = f"{self.config.COINDCX_BASE_URL}/exchange/v1/candles"
-            
             interval_map = {'5m': '5m', '15m': '15m', '1h': '1h', '1d': '1d'}
             
-            payload = {
-                'pair': market,
-                'interval': interval_map.get(interval, interval),
-                'limit': limit
-            }
-            
-            headers = self.get_authenticated_headers(
-                self.config.COINDCX_API_SECRET,
-                self.config.COINDCX_API_KEY,
-                payload
-            )
+            payload = {'pair': market, 'interval': interval_map.get(interval, interval), 'limit': limit}
+            headers = self.get_authenticated_headers(self.config.COINDCX_API_SECRET, self.config.COINDCX_API_KEY, payload)
             
             if not headers:
                 return None
@@ -83,12 +74,10 @@ class SignalGenerator:
                 })
             
             return candles
-            
         except:
             return None
 
     def fetch_candles_public(self, market, interval='5m', limit=100):
-        """Fetch candles using public API"""
         try:
             url = f"{self.config.COINDCX_BASE_URL}/market_data/candles"
             params = {'pair': market, 'interval': interval, 'limit': limit}
@@ -115,12 +104,7 @@ class SignalGenerator:
             return None
 
     def get_live_futures_price(self, futures_market):
-        """
-        CRITICAL: Get ACCURATE live futures price
-        Returns: (price, bid, ask) or None
-        """
         try:
-            # Don't use stale cache
             url = f"{self.config.COINDCX_BASE_URL}/exchange/ticker"
             response = requests.get(url, timeout=5)
             response.raise_for_status()
@@ -128,53 +112,36 @@ class SignalGenerator:
             
             for ticker in data:
                 if ticker.get('market') == futures_market:
-                    # Get multiple price points for validation
                     last_price = float(ticker.get('last_price', 0))
                     bid = float(ticker.get('bid', 0))
                     ask = float(ticker.get('ask', 0))
                     
-                    # Validate prices exist
                     if last_price > 0 and bid > 0 and ask > 0:
-                        # Use mid price for accuracy
                         mid_price = (bid + ask) / 2
-                        
-                        # Cache for 10 seconds only
                         self.futures_prices[futures_market] = (time.time(), mid_price, bid, ask)
-                        
                         return mid_price, bid, ask
             
             return None, None, None
-            
-        except Exception as e:
-            print(f"   ⚠️ Price fetch error: {e}")
+        except:
             return None, None, None
 
     def validate_price_sanity(self, spot_price, futures_price, market_name):
-        """
-        Validate that futures price is reasonable vs spot
-        Prevents wrong decimal/conversion bugs
-        """
         if not spot_price or not futures_price:
-            return False, "Missing price data"
+            return False, "Missing price"
         
-        # Calculate difference percentage
         diff_pct = abs(futures_price - spot_price) / spot_price * 100
         
-        # Futures should be within 30% of spot (generous for INR conversion)
         if diff_pct > 30:
-            return False, f"Price mismatch: Spot={spot_price:.4f}, Futures={futures_price:.4f} ({diff_pct:.1f}% diff)"
+            return False, f"Price mismatch {diff_pct:.1f}%"
         
-        # Check for decimal point errors (10x, 100x, 0.1x, 0.01x)
         ratio = futures_price / spot_price if spot_price > 0 else 0
         
-        # Should be close to 1.0, not 10, 100, 0.1, 0.01
         if ratio > 5 or ratio < 0.2:
-            return False, f"Decimal error: ratio={ratio:.2f}"
+            return False, f"Decimal error ratio={ratio:.2f}"
         
         return True, "OK"
 
     def fetch_candles(self, market, interval='5m', limit=100):
-        """Smart candle fetching with fallback"""
         if self.config.USE_AUTHENTICATED_API and self.config.COINDCX_API_KEY:
             if market.startswith('F-'):
                 candles = self.fetch_candles_authenticated(market, interval, limit)
@@ -191,7 +158,6 @@ class SignalGenerator:
         return self.fetch_candles_public(market, interval, limit)
 
     def check_btc_stability(self):
-        """STRICT BTC check for quality control"""
         if not self.config.ENABLE_BTC_CHECK:
             return True, 'BTC check disabled', 'neutral'
         
@@ -199,7 +165,7 @@ class SignalGenerator:
             btc_5m = self.fetch_candles(self.config.BTC_PAIR, '5m', 20)
             
             if not btc_5m or len(btc_5m) < 10:
-                return True, 'BTC data unavailable (neutral)', 'neutral'
+                return True, 'BTC data unavailable', 'neutral'
             
             closes = [c['close'] for c in btc_5m]
             highs = [c['high'] for c in btc_5m]
@@ -210,21 +176,19 @@ class SignalGenerator:
                 body_pct = abs(body) / candle['open'] * 100 if candle['open'] > 0 else 0
                 
                 if body < 0 and body_pct > self.config.BTC_DUMP_THRESHOLD:
-                    return False, f'BTC dump (-{body_pct:.1f}%)', 'dump'
+                    return False, f'BTC dump -{body_pct:.1f}%', 'dump'
             
             atr = self.indicators.calculate_atr(highs, lows, closes, 14)
             volatility = self.indicators.calculate_volatility(closes, atr)
             
             if volatility and volatility > self.config.BTC_VOLATILITY_THRESHOLD:
-                return False, f'BTC volatile ({volatility:.1f}%)', 'volatile'
+                return False, f'BTC volatile {volatility:.1f}%', 'volatile'
             
             return True, 'BTC stable', 'stable'
-            
         except:
-            return None, None, None
+            return True, 'BTC check error', 'neutral'
 
     def analyze_market(self, candles_data):
-        """Analyze market with indicators"""
         if not candles_data or len(candles_data) < self.config.MIN_CANDLES_REQUIRED:
             return None
 
@@ -272,7 +236,6 @@ class SignalGenerator:
         }
 
     def apply_hard_filters(self, score, regime, adx, atr):
-        """STRICTER filters"""
         if adx and adx < self.config.MIN_ADX_THRESHOLD:
             return False, f'Weak ADX ({adx:.1f})'
         
@@ -289,8 +252,7 @@ class SignalGenerator:
 
     def generate_signal(self, market, candles_5m, candles_15m, candles_1h):
         """
-        Generate signal with CORRECT futures price + FULL LOGGING
-        FIXED: Removed same candle check (was causing permanent block)
+        ULTIMATE SMART SIGNAL with volume/whale/liquidity detection
         """
         
         analysis_5m = self.analyze_market(candles_5m)
@@ -298,96 +260,110 @@ class SignalGenerator:
             print(f"SKIP: Analysis failed")
             return None
         
+        # ADVANCED: Volume surge detection
+        volume_surge, surge_ratio, vol_direction = self.volume_whale.detect_volume_surge(candles_5m)
+        
+        # ADVANCED: Whale candle detection
+        whale_detected, whale_pct, whale_direction = self.volume_whale.detect_whale_candle(candles_5m[-1])
+        
+        # ADVANCED: Liquidity sweep detection
+        liq_sweep, sweep_type, sweep_strength = self.volume_whale.detect_liquidity_sweep_advanced(candles_5m)
+        
         # MTF trends
         trend_15m = self.mtf.get_trend_direction(candles_15m) if candles_15m else 'neutral'
         bias_1h = self.mtf.get_trend_direction(candles_1h) if candles_1h else 'neutral'
         
-        # STRICT MTF alignment
-        long_aligned, long_reason = self.mtf.check_mtf_alignment(
-            trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE
-        )
-        short_aligned, short_reason = self.mtf.check_mtf_alignment(
-            trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE
-        )
+        # MTF alignment
+        long_aligned, _ = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE)
+        short_aligned, _ = self.mtf.check_mtf_alignment(trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE)
         
         if self.config.REQUIRE_MTF_ALIGNMENT:
             if not long_aligned and not short_aligned:
-                print(f"SKIP: MTF (L:{long_reason}, S:{short_reason})")
+                print(f"SKIP: MTF (15m={trend_15m}, 1h={bias_1h})")
                 return None
         
-        # Calculate scores
+        # Calculate MTF scores
         long_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'LONG')
         short_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'SHORT')
         
-        long_score, long_reasons, long_regime = self.scorer.calculate_score(
-            analysis_5m, 'LONG', long_mtf_score
-        )
-        short_score, short_reasons, short_regime = self.scorer.calculate_score(
-            analysis_5m, 'SHORT', short_mtf_score
-        )
+        # BASE SCORING
+        long_base, long_reasons, long_regime = self.scorer.calculate_base_score(analysis_5m, 'LONG', long_mtf_score)
+        short_base, short_reasons, short_regime = self.scorer.calculate_base_score(analysis_5m, 'SHORT', short_mtf_score)
         
         # Pick direction
-        if long_score >= short_score and long_score >= self.config.MIN_SIGNAL_SCORE and long_aligned:
+        if long_base >= short_base and long_aligned:
             direction = 'LONG'
-            score = long_score
+            base_score = long_base
             reasons = long_reasons
             regime = long_regime
-        elif short_score >= self.config.MIN_SIGNAL_SCORE and short_aligned:
+        elif short_aligned:
             direction = 'SHORT'
-            score = short_score
+            base_score = short_base
             reasons = short_reasons
             regime = short_regime
         else:
-            max_score = max(long_score, short_score)
-            print(f"SKIP: Low score (L:{long_score}, S:{short_score}, need {self.config.MIN_SIGNAL_SCORE}+)")
+            print(f"SKIP: No aligned direction (L:{long_base}, S:{short_base})")
             return None
         
-        # STRICT filters
-        passed, block_reason = self.apply_hard_filters(
-            score, regime, analysis_5m['adx'], analysis_5m['atr']
+        # APPLY ADVANCED BONUSES
+        volume_data = {'is_surge': volume_surge, 'surge_ratio': surge_ratio, 'direction': vol_direction}
+        whale_data = {'is_whale': whale_detected, 'move_pct': whale_pct, 'direction': whale_direction}
+        liquidity_data = {'is_sweep': liq_sweep, 'type': sweep_type, 'strength': sweep_strength}
+        
+        final_score, final_reasons, bonus_applied = self.scorer.apply_advanced_bonuses(
+            base_score, reasons, analysis_5m, direction, volume_data, whale_data, liquidity_data
         )
+        
+        # REQUIRE at least volume OR whale confirmation
+        if self.config.REQUIRE_VOLUME_OR_WHALE:
+            if not bonus_applied and final_score < self.config.PERFECT_SETUP_THRESHOLD:
+                print(f"SKIP: No volume/whale confirmation (Score:{final_score})")
+                return None
+        
+        # Apply time multiplier
+        current_hour = datetime.utcnow().hour
+        final_score = self.scorer.apply_time_multiplier(final_score, current_hour)
+        
+        # Check minimum score
+        if final_score < self.config.BASE_MIN_SCORE:
+            print(f"SKIP: Low score ({final_score}, need {self.config.BASE_MIN_SCORE}+)")
+            return None
+        
+        # Hard filters
+        passed, block_reason = self.apply_hard_filters(final_score, regime, analysis_5m['adx'], analysis_5m['atr'])
         if not passed:
             print(f"SKIP: {block_reason}")
             return None
         
-        # CRITICAL: Get CORRECT futures price
+        # Get futures price
         spot_price = analysis_5m['price']
         entry_price = spot_price
         futures_market = None
         
-        # If using spot data for futures signal
         if market.startswith('B-') and market in self.config.SPOT_TO_FUTURES_MAP:
             futures_market = self.config.SPOT_TO_FUTURES_MAP[market]
-            
-            # Get live futures price
             futures_price, bid, ask = self.get_live_futures_price(futures_market)
             
             if not futures_price:
                 print(f"SKIP: No futures price for {futures_market}")
                 return None
             
-            # VALIDATE price sanity
             is_valid, reason = self.validate_price_sanity(spot_price, futures_price, futures_market)
             
             if not is_valid:
                 print(f"SKIP: {reason}")
                 return None
             
-            # Use validated futures price
             entry_price = futures_price
-            
-            # Show validation in console
-            print(f"OK: Spot={spot_price:.4f}, Futures={futures_price:.4f} |", end=' ')
+            print(f"OK: ₹{futures_price:.2f} |", end=' ')
         
-        # Use spot price's ATR for SL/TP calculation (same volatility)
+        # Calculate levels
         atr = analysis_5m['atr']
         
-        # Scale ATR proportionally if prices differ significantly
         if futures_market and abs(entry_price - spot_price) / spot_price > 0.05:
             atr_scale = entry_price / spot_price
             atr = atr * atr_scale
         
-        # Calculate levels based on CORRECT entry price
         if direction == 'LONG':
             sl = entry_price - (atr * self.config.ATR_SL_MULTIPLIER)
             tp1 = entry_price + (atr * self.config.ATR_TP1_MULTIPLIER)
@@ -401,12 +377,11 @@ class SignalGenerator:
         reward = abs(tp2 - entry_price)
         rr_ratio = reward / risk if risk > 0 else 0
         
-        # STRICTER R:R
         if rr_ratio < self.config.MIN_RR_RATIO:
-            print(f"SKIP: R:R too low ({rr_ratio:.2f}, need {self.config.MIN_RR_RATIO}+)")
+            print(f"SKIP: R:R {rr_ratio:.2f}")
             return None
         
-        quality_tier, emoji = self.scorer.get_quality_tier(score)
+        quality_tier, emoji = self.scorer.get_quality_tier(final_score)
         
         display_market = futures_market if futures_market else market
         
@@ -417,11 +392,11 @@ class SignalGenerator:
             'sl': sl,
             'tp1': tp1,
             'tp2': tp2,
-            'score': score,
+            'score': final_score,
             'quality_tier': quality_tier,
             'quality_emoji': emoji,
             'rr_ratio': rr_ratio,
-            'reasons': reasons,
+            'reasons': final_reasons,
             'mtf': {
                 'trend_15m': trend_15m,
                 'bias_1h': bias_1h
