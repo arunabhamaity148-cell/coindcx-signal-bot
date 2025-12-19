@@ -297,14 +297,16 @@ class SignalGenerator:
 
     def generate_signal(self, market, candles_5m, candles_15m, candles_1h):
         """
-        FIXED: Generate signal with CORRECT futures price
+        FIXED: Generate signal with CORRECT futures price + FULL LOGGING
         """
         
         if candles_5m and not self.check_same_candle(market, candles_5m[-1]['time']):
+            print(f"SKIP: Same candle")
             return None
         
         analysis_5m = self.analyze_market(candles_5m)
         if not analysis_5m:
+            print(f"SKIP: Analysis failed")
             return None
         
         # MTF trends
@@ -312,15 +314,16 @@ class SignalGenerator:
         bias_1h = self.mtf.get_trend_direction(candles_1h) if candles_1h else 'neutral'
         
         # STRICT MTF alignment
-        long_aligned, _ = self.mtf.check_mtf_alignment(
+        long_aligned, long_reason = self.mtf.check_mtf_alignment(
             trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE
         )
-        short_aligned, _ = self.mtf.check_mtf_alignment(
+        short_aligned, short_reason = self.mtf.check_mtf_alignment(
             trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE
         )
         
         if self.config.REQUIRE_MTF_ALIGNMENT:
             if not long_aligned and not short_aligned:
+                print(f"SKIP: MTF (L:{long_reason}, S:{short_reason})")
                 return None
         
         # Calculate scores
@@ -346,6 +349,8 @@ class SignalGenerator:
             reasons = short_reasons
             regime = short_regime
         else:
+            max_score = max(long_score, short_score)
+            print(f"SKIP: Low score (L:{long_score}, S:{short_score}, need {self.config.MIN_SIGNAL_SCORE}+)")
             return None
         
         # STRICT filters
@@ -353,6 +358,7 @@ class SignalGenerator:
             score, regime, analysis_5m['adx'], analysis_5m['atr']
         )
         if not passed:
+            print(f"SKIP: {block_reason}")
             return None
         
         # CRITICAL: Get CORRECT futures price
@@ -368,20 +374,21 @@ class SignalGenerator:
             futures_price, bid, ask = self.get_live_futures_price(futures_market)
             
             if not futures_price:
-                print(f"   ❌ No futures price for {futures_market}")
+                print(f"SKIP: No futures price for {futures_market}")
                 return None
             
             # VALIDATE price sanity
             is_valid, reason = self.validate_price_sanity(spot_price, futures_price, futures_market)
             
             if not is_valid:
-                print(f"   ❌ Price validation failed: {reason}")
+                print(f"SKIP: {reason}")
                 return None
             
             # Use validated futures price
             entry_price = futures_price
             
-            print(f"   ✓ Price validated: Spot={spot_price:.4f}, Futures={futures_price:.4f}")
+            # Show validation in console
+            print(f"OK: Spot={spot_price:.4f}, Futures={futures_price:.4f} |", end=' ')
         
         # Use spot price's ATR for SL/TP calculation (same volatility)
         atr = analysis_5m['atr']
@@ -407,6 +414,7 @@ class SignalGenerator:
         
         # STRICTER R:R
         if rr_ratio < self.config.MIN_RR_RATIO:
+            print(f"SKIP: R:R too low ({rr_ratio:.2f}, need {self.config.MIN_RR_RATIO}+)")
             return None
         
         quality_tier, emoji = self.scorer.get_quality_tier(score)
