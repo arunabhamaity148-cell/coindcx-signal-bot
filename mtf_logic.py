@@ -27,25 +27,26 @@ class MTFLogic:
     
     def check_mtf_alignment(self, trend_15m, bias_1h, signal_direction, strict_mode=False):
         """
-        RELAXED MTF alignment for INR futures
-        strict_mode=False allows more signals through
+        BALANCED MTF: Allow neutral states
         """
         if not strict_mode:
-            # RELAXED MODE: Allow if not opposing
+            # RELAXED: Both neutral = OK, opposing = block
             if signal_direction == 'LONG':
-                # Block only if 15m is clearly bearish
+                # Block only if 15m clearly bearish
                 if trend_15m == 'bearish':
-                    return False, f'15m bearish blocks LONG'
-                return True, 'MTF acceptable'
+                    return False, '15m bearish blocks LONG'
+                # Neutral is fine
+                return True, 'MTF OK'
             
             elif signal_direction == 'SHORT':
-                # Block only if 15m is clearly bullish
+                # Block only if 15m clearly bullish
                 if trend_15m == 'bullish':
-                    return False, f'15m bullish blocks SHORT'
-                return True, 'MTF acceptable'
+                    return False, '15m bullish blocks SHORT'
+                # Neutral is fine
+                return True, 'MTF OK'
         
         else:
-            # STRICT MODE: Require full alignment
+            # STRICT: Require alignment
             if signal_direction == 'LONG':
                 if trend_15m == 'bullish' and bias_1h in ['bullish', 'neutral']:
                     return True, 'MTF aligned'
