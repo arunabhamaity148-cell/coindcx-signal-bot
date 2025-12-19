@@ -4,20 +4,17 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-    # CoinDCX API Configuration
     COINDCX_BASE_URL = "https://public.coindcx.com"
     COINDCX_API_KEY = os.environ.get('COINDCX_API_KEY', '')
     COINDCX_API_SECRET = os.environ.get('COINDCX_API_SECRET', '')
     
-    # Trading Mode
     USE_AUTHENTICATED_API = os.environ.get('USE_AUTHENTICATED_API', 'true').lower() == 'true'
     
-    # FUTURES MARKETS - Only working pairs
+    # Working pairs only
     FUTURES_MARKETS = os.environ.get('FUTURES_MARKETS', 
         'F-BTC_INR,F-ETH_INR,F-SOL_INR,F-MATIC_INR,F-ADA_INR,F-DOGE_INR'
     ).split(',')
     
-    # SPOT to FUTURES mapping - Only working pairs
     SPOT_TO_FUTURES_MAP = {
         'B-BTC_USDT': 'F-BTC_INR',
         'B-ETH_USDT': 'F-ETH_INR',
@@ -39,7 +36,6 @@ class Config:
         else:
             return list(self.SPOT_TO_FUTURES_MAP.keys())
 
-    # Leverage
     LEVERAGE = int(os.environ.get('LEVERAGE', '12'))
     
     # Timeframes
@@ -47,27 +43,21 @@ class Config:
     TREND_TIMEFRAME = '15m'
     BIAS_TIMEFRAME = '1h'
     
-    # SMART SCANNING
-    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '10'))
-    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '30'))
-    MAX_SIGNALS_PER_DAY = int(os.environ.get('MAX_SIGNALS_PER_DAY', '12'))
-    MAX_SIGNALS_PER_4_HOURS = 3  # Quality control
+    # COINDCX OPTIMIZED - More signals, realistic thresholds
+    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '15'))
+    COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '45'))
+    MAX_SIGNALS_PER_DAY = 20
     
-    # DYNAMIC SCORING
-    BASE_MIN_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '55'))
-    HIGH_QUALITY_THRESHOLD = 75
-    PERFECT_SETUP_THRESHOLD = 80
+    # RELAXED SCORING - CoinDCX style
+    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '45'))
+    HIGH_QUALITY_THRESHOLD = 60
+    PERFECT_SETUP_THRESHOLD = 70
     
-    # ADVANCED FILTERS
-    VOLUME_SURGE_THRESHOLD = 3.0  # 3x average
-    WHALE_MOVE_THRESHOLD = 2.0  # 2% single candle
-    MIN_ORDER_FLOW_STRENGTH = 0.3  # Strong directional flow
-    
-    # Risk Management
-    ATR_SL_MULTIPLIER = 2.0
-    ATR_TP1_MULTIPLIER = 3.0
-    ATR_TP2_MULTIPLIER = 5.0
-    MIN_RR_RATIO = 1.5
+    # Risk Management - INR specific
+    ATR_SL_MULTIPLIER = 1.8
+    ATR_TP1_MULTIPLIER = 2.5
+    ATR_TP2_MULTIPLIER = 4.0
+    MIN_RR_RATIO = 1.3
     
     # Technical Indicators
     RSI_PERIOD = 14
@@ -76,34 +66,31 @@ class Config:
     ADX_PERIOD = 14
     ATR_PERIOD = 14
     
-    # SMART Filters
-    MIN_ADX_THRESHOLD = 12
-    MIN_ATR_THRESHOLD = 0.00001
-    BLOCK_RANGING_SCORE = 65
-    BLOCK_VOLATILE_SCORE = 70
+    # COINDCX FRIENDLY FILTERS - Much more relaxed
+    MIN_ADX_THRESHOLD = 8  # INR markets often range
+    MIN_ATR_THRESHOLD = 0.000001  # Very low for INR
+    BLOCK_RANGING_SCORE = 40  # Allow ranging trades
+    BLOCK_VOLATILE_SCORE = 50  # Allow volatile trades
     
-    # BTC Check
-    ENABLE_BTC_CHECK = os.environ.get('ENABLE_BTC_CHECK', 'true').lower() == 'true'
+    # BTC Check - Relaxed
+    ENABLE_BTC_CHECK = os.environ.get('ENABLE_BTC_CHECK', 'false').lower() == 'true'
     BTC_PAIR = 'B-BTC_USDT'
-    BTC_CHECK_INTERVAL_MINUTES = 10
-    BTC_VOLATILITY_THRESHOLD = 5.0
-    BTC_DUMP_THRESHOLD = 3.0
+    BTC_CHECK_INTERVAL_MINUTES = 15
+    BTC_VOLATILITY_THRESHOLD = 8.0  # Higher tolerance
+    BTC_DUMP_THRESHOLD = 5.0  # Only extreme dumps
     
-    # Data requirements
-    MIN_CANDLES_REQUIRED = 50
+    MIN_CANDLES_REQUIRED = 40  # Lower requirement
     
-    # MTF
+    # MTF - VERY RELAXED for CoinDCX
     MTF_STRICT_MODE = False
-    REQUIRE_MTF_ALIGNMENT = True
+    REQUIRE_MTF_ALIGNMENT = False  # DISABLED - price action priority
     
-    # BONUS SCORING
-    VOLUME_SURGE_BONUS = 15
-    WHALE_CANDLE_BONUS = 10
-    LIQUIDITY_SWEEP_BONUS = 12
-    TIME_OF_DAY_MULTIPLIER = True
+    # BONUSES - Optional, not required
+    VOLUME_SURGE_BONUS = 10
+    WHALE_CANDLE_BONUS = 8
+    LIQUIDITY_SWEEP_BONUS = 8
+    TIME_OF_DAY_MULTIPLIER = False  # DISABLED
     
-    # CONFIRMATIONS REQUIRED (multi-layer)
-    REQUIRE_VOLUME_OR_WHALE = True  # At least one
-    PERFECT_SETUP_INSTANT_SEND = True  # Score 80+ bypasses some checks
-    # Alias for backward compatibility
-    MIN_SIGNAL_SCORE = BASE_MIN_SCORE
+    # NO FORCED CONFIRMATIONS - Let price action speak
+    REQUIRE_VOLUME_OR_WHALE = False
+    PERFECT_SETUP_INSTANT_SEND = False
