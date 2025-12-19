@@ -19,7 +19,7 @@ class SignalGenerator:
         self.smart = SmartMoneyLogic()
         self.mtf = MTFLogic()
         self.scorer = ScoringEngine(self.config)
-        self.last_candle_time = {}
+        # REMOVED: last_candle_time tracking (causing permanent block)
         self.futures_prices = {}
         self.price_validation_tolerance = 0.30  # 30% tolerance
 
@@ -221,15 +221,7 @@ class SignalGenerator:
             return True, 'BTC stable', 'stable'
             
         except:
-            return True, 'BTC check error (neutral)', 'neutral'
-
-    def check_same_candle(self, market, candle_time):
-        """Prevent duplicate signals"""
-        if market in self.last_candle_time:
-            if self.last_candle_time[market] == candle_time:
-                return False
-        self.last_candle_time[market] = candle_time
-        return True
+            return None, None, None
 
     def analyze_market(self, candles_data):
         """Analyze market with indicators"""
@@ -297,12 +289,9 @@ class SignalGenerator:
 
     def generate_signal(self, market, candles_5m, candles_15m, candles_1h):
         """
-        FIXED: Generate signal with CORRECT futures price + FULL LOGGING
+        Generate signal with CORRECT futures price + FULL LOGGING
+        FIXED: Removed same candle check (was causing permanent block)
         """
-        
-        if candles_5m and not self.check_same_candle(market, candles_5m[-1]['time']):
-            print(f"SKIP: Same candle")
-            return None
         
         analysis_5m = self.analyze_market(candles_5m)
         if not analysis_5m:
