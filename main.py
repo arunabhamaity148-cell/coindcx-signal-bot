@@ -44,12 +44,14 @@ class ArunBot:
         if not TelegramNotifier.test_connection():
             print("⚠️ Telegram connection failed (continuing anyway)")
         
-        # Start WebSocket feed
-        print("\n🔌 Starting WebSocket price feed...")
-        ws_feed.start()
-        
-        if not ws_feed.wait_for_connection(timeout=10):
-            print("⚠️ WebSocket connection timeout (will retry)")
+        # Start WebSocket feed (optional - not critical)
+        print("\n🔌 Starting WebSocket price feed (optional)...")
+        try:
+            ws_feed.start()
+            if not ws_feed.wait_for_connection(timeout=5):
+                print("⚠️ WebSocket timeout (will use REST API instead)")
+        except Exception as e:
+            print(f"⚠️ WebSocket failed (using REST API): {e}")
         
         print("\n✅ Startup checks complete")
         print(f"📊 Mode: {config.MODE}")
@@ -92,7 +94,7 @@ class ArunBot:
                 candles = CoinDCXAPI.get_candles(pair, interval, limit=100)
                 
                 if candles.empty:
-                    print(f"⚠️ No data for {pair}")
+                    print(f"⚠️ Skipping {pair} (no data)")
                     continue
                 
                 # Analyze for signals
