@@ -19,14 +19,15 @@ class Config:
     MAX_SIGNALS_PER_DAY = 10
     MAX_LEVERAGE = 15
     
-    # Trading Pairs - CoinDCX Futures only
+    # Trading Pairs - CoinDCX format
+    # Use exact market names from CoinDCX
     PAIRS = [
-        'F-BTC_INR',
-        'F-ETH_INR',
-        'F-SOL_INR',
-        'F-MATIC_INR',
-        'F-ADA_INR',
-        'F-DOGE_INR'
+        'BTCUSDT',
+        'ETHUSDT',
+        'SOLUSDT',
+        'MATICUSDT',
+        'ADAUSDT',
+        'DOGEUSDT'
     ]
     
     # Mode Configurations
