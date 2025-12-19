@@ -111,19 +111,27 @@ class TradingBot:
         return status not in ['volatile', 'dump']
 
     def scan_market(self, market):
-        """Scan single market"""
+        """Scan single market with detailed logging"""
+        print(f"   📊 {market}...", end=' ')
+        
         if not self.check_cooldown(market):
+            mins_left = int((timedelta(minutes=self.config.COOLDOWN_MINUTES) - 
+                           (datetime.now() - self.last_signal_time[market])).total_seconds() / 60)
+            print(f"⏳ Cooldown ({mins_left}m left)")
             return None
 
         if not self.check_daily_limit():
+            print(f"🚫 Daily limit ({self.signals_sent_today}/{self.config.MAX_SIGNALS_PER_DAY})")
             return None
         
         if not self.check_scan_limit():
+            print(f"🚫 Scan limit ({self.signals_sent_this_scan}/{self.config.MAX_SIGNALS_PER_SCAN})")
             return None
 
         candles_5m = self.signal_generator.fetch_candles(market, self.config.SIGNAL_TIMEFRAME, 100)
         
         if not candles_5m:
+            print(f"❌ No 5m data")
             return None
         
         candles_15m = self.signal_generator.fetch_candles(market, self.config.TREND_TIMEFRAME, 100)
@@ -131,6 +139,11 @@ class TradingBot:
 
         signal = self.signal_generator.generate_signal(market, candles_5m, candles_15m, candles_1h)
 
+        if signal:
+            print(f"✅ {signal['direction']} {signal['score']} {signal['quality_emoji']}")
+        else:
+            print(f"—")
+        
         return signal
 
     def scan_all_markets(self):
