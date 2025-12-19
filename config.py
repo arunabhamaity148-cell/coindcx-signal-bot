@@ -68,10 +68,10 @@ class Config:
     MAX_SIGNALS_PER_DAY = int(os.environ.get('MAX_SIGNALS_PER_DAY', '15'))
     MAX_SIGNALS_PER_SCAN = int(os.environ.get('MAX_SIGNALS_PER_SCAN', '3'))
 
-    # STRICT SCORING - Quality over quantity
-    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '65'))
-    HIGH_QUALITY_THRESHOLD = 80
-    MEDIUM_QUALITY_THRESHOLD = 65
+    # BALANCED SCORING - Quality signals
+    MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '60'))
+    HIGH_QUALITY_THRESHOLD = 75
+    MEDIUM_QUALITY_THRESHOLD = 60
     
     # PRIORITY scoring - send best signals first
     PRIORITY_HIGH_SCORE = 80  # Instant send
@@ -108,6 +108,6 @@ class Config:
     # Data requirements
     MIN_CANDLES_REQUIRED = 50
     
-    # MTF - SEMI-STRICT
-    MTF_STRICT_MODE = True  # Enable strict MTF
+    # MTF - BALANCED (allow neutral)
+    MTF_STRICT_MODE = False  # Allow neutral MTF
     REQUIRE_MTF_ALIGNMENT = True  # Must have MTF alignment
