@@ -20,7 +20,7 @@ class SignalGenerator:
         self.mtf = MTFLogic()
         self.scorer = ScoringEngine(self.config)
         self.last_candle_time = {}
-        self.futures_prices = {}  # Cache for futures prices
+        self.futures_prices = {}
 
     def get_authenticated_headers(self, secret_key, api_key, payload):
         """Generate authenticated headers for CoinDCX API"""
@@ -38,21 +38,15 @@ class SignalGenerator:
                 'X-AUTH-SIGNATURE': signature
             }
         except Exception as e:
-            print(f"   ⚠️ Auth header error: {e}")
+            print(f"   ⚠️ Auth error: {e}")
             return None
 
     def fetch_candles_authenticated(self, market, interval='5m', limit=100):
-        """Fetch candles using authenticated API (for futures)"""
+        """Fetch candles using authenticated API"""
         try:
             url = f"{self.config.COINDCX_BASE_URL}/exchange/v1/candles"
             
-            # Convert interval format
-            interval_map = {
-                '5m': '5m',
-                '15m': '15m',
-                '1h': '1h',
-                '1d': '1d'
-            }
+            interval_map = {'5m': '5m', '15m': '15m', '1h': '1h', '1d': '1d'}
             
             payload = {
                 'pair': market,
@@ -89,12 +83,11 @@ class SignalGenerator:
             
             return candles
             
-        except Exception as e:
-            print(f"   ⚠️ Auth fetch error {market}: {str(e)}")
+        except:
             return None
 
     def fetch_candles_public(self, market, interval='5m', limit=100):
-        """Fetch candles using public API (for spot)"""
+        """Fetch candles using public API"""
         try:
             url = f"{self.config.COINDCX_BASE_URL}/market_data/candles"
             params = {'pair': market, 'interval': interval, 'limit': limit}
@@ -117,14 +110,12 @@ class SignalGenerator:
                 })
             
             return candles
-        except Exception as e:
-            print(f"   ⚠️ Public fetch error {market}: {str(e)}")
+        except:
             return None
 
     def get_futures_price(self, futures_market):
-        """Get current futures price (for signal reference)"""
+        """Get current futures price"""
         try:
-            # Cache for 30 seconds
             cache_key = futures_market
             if cache_key in self.futures_prices:
                 cached_time, cached_price = self.futures_prices[cache_key]
@@ -147,19 +138,12 @@ class SignalGenerator:
             return None
 
     def fetch_candles(self, market, interval='5m', limit=100):
-        """
-        Smart candle fetching:
-        1. If authenticated API + futures market → use authenticated
-        2. If spot market → use public API
-        3. Fallback: try public if authenticated fails
-        """
-        # Check if using authenticated API for futures
+        """Smart candle fetching with fallback"""
         if self.config.USE_AUTHENTICATED_API and self.config.COINDCX_API_KEY:
             if market.startswith('F-'):
                 candles = self.fetch_candles_authenticated(market, interval, limit)
                 if candles:
                     return candles
-                # Fallback to spot
                 spot_market = None
                 for spot, futures in self.config.SPOT_TO_FUTURES_MAP.items():
                     if futures == market:
@@ -168,11 +152,10 @@ class SignalGenerator:
                 if spot_market:
                     return self.fetch_candles_public(spot_market, interval, limit)
         
-        # Use public API for spot markets
         return self.fetch_candles_public(market, interval, limit)
 
     def check_btc_stability(self):
-        """OPTIONAL BTC check - only if enabled"""
+        """STRICT BTC check for quality control"""
         if not self.config.ENABLE_BTC_CHECK:
             return True, 'BTC check disabled', 'neutral'
         
@@ -186,28 +169,28 @@ class SignalGenerator:
             highs = [c['high'] for c in btc_5m]
             lows = [c['low'] for c in btc_5m]
             
-            # Only check for extreme dump (>5% red candle)
+            # STRICTER dump check (>3% red candle)
             for candle in btc_5m[-3:]:
                 body = candle['close'] - candle['open']
                 body_pct = abs(body) / candle['open'] * 100 if candle['open'] > 0 else 0
                 
-                if body < 0 and body_pct > 5.0:
-                    return False, f'BTC extreme dump (-{body_pct:.1f}%)', 'dump'
+                if body < 0 and body_pct > self.config.BTC_DUMP_THRESHOLD:
+                    return False, f'BTC dump (-{body_pct:.1f}%)', 'dump'
             
-            # Check volatility (only extreme)
+            # STRICTER volatility (>5%)
             atr = self.indicators.calculate_atr(highs, lows, closes, 14)
             volatility = self.indicators.calculate_volatility(closes, atr)
             
-            if volatility and volatility > 8.0:
-                return False, f'BTC extreme volatility ({volatility:.1f}%)', 'volatile'
+            if volatility and volatility > self.config.BTC_VOLATILITY_THRESHOLD:
+                return False, f'BTC volatile ({volatility:.1f}%)', 'volatile'
             
             return True, 'BTC stable', 'stable'
             
-        except Exception as e:
-            return True, f'BTC check error (neutral)', 'neutral'
+        except:
+            return True, 'BTC check error (neutral)', 'neutral'
 
     def check_same_candle(self, market, candle_time):
-        """Prevent duplicate signals on exact same candle"""
+        """Prevent duplicate signals"""
         if market in self.last_candle_time:
             if self.last_candle_time[market] == candle_time:
                 return False
@@ -215,11 +198,8 @@ class SignalGenerator:
         return True
 
     def analyze_market(self, candles_data):
-        """Analyze with RELAXED data requirements"""
-        if not candles_data:
-            return None
-        
-        if len(candles_data) < self.config.MIN_CANDLES_REQUIRED:
+        """Analyze market with indicators"""
+        if not candles_data or len(candles_data) < self.config.MIN_CANDLES_REQUIRED:
             return None
 
         candles = candles_data[-100:] if len(candles_data) >= 100 else candles_data
@@ -266,16 +246,17 @@ class SignalGenerator:
         }
 
     def apply_hard_filters(self, score, regime, adx, atr):
-        """RELAXED hard filters"""
+        """STRICTER filters"""
+        # ADX check - stricter
         if adx and adx < self.config.MIN_ADX_THRESHOLD:
-            if score < 50:
-                return False, f'Weak ADX ({adx:.1f}) + Low score'
+            return False, f'Weak ADX ({adx:.1f})'
         
+        # Regime checks - stricter
         if regime == 'ranging' and score < self.config.BLOCK_RANGING_SCORE:
-            return False, f'Ranging (score {score})'
+            return False, f'Ranging (need {self.config.BLOCK_RANGING_SCORE}+)'
         
         if regime == 'volatile' and score < self.config.BLOCK_VOLATILE_SCORE:
-            return False, f'Volatile (score {score})'
+            return False, f'Volatile (need {self.config.BLOCK_VOLATILE_SCORE}+)'
         
         if atr and atr < self.config.MIN_ATR_THRESHOLD:
             return False, 'ATR too low'
@@ -283,28 +264,31 @@ class SignalGenerator:
         return True, None
 
     def generate_signal(self, market, candles_5m, candles_15m, candles_1h):
-        """Generate signal with futures price adjustment if using spot data"""
+        """Generate HIGH QUALITY signal only"""
         
-        # Same candle check
         if candles_5m and not self.check_same_candle(market, candles_5m[-1]['time']):
             return None
         
-        # Analyze 5m timeframe
         analysis_5m = self.analyze_market(candles_5m)
         if not analysis_5m:
             return None
         
-        # Get MTF trends
+        # MTF trends
         trend_15m = self.mtf.get_trend_direction(candles_15m) if candles_15m else 'neutral'
         bias_1h = self.mtf.get_trend_direction(candles_1h) if candles_1h else 'neutral'
         
-        # Check alignment
+        # STRICT MTF alignment check
         long_aligned, _ = self.mtf.check_mtf_alignment(
             trend_15m, bias_1h, 'LONG', self.config.MTF_STRICT_MODE
         )
         short_aligned, _ = self.mtf.check_mtf_alignment(
             trend_15m, bias_1h, 'SHORT', self.config.MTF_STRICT_MODE
         )
+        
+        # If REQUIRE_MTF_ALIGNMENT, both directions need check
+        if self.config.REQUIRE_MTF_ALIGNMENT:
+            if not long_aligned and not short_aligned:
+                return None
         
         # Calculate scores
         long_mtf_score = self.mtf.get_mtf_score(trend_15m, bias_1h, 'LONG')
@@ -317,7 +301,7 @@ class SignalGenerator:
             analysis_5m, 'SHORT', short_mtf_score
         )
         
-        # Pick best direction
+        # Pick BEST direction
         if long_score >= short_score and long_score >= self.config.MIN_SIGNAL_SCORE and long_aligned:
             direction = 'LONG'
             score = long_score
@@ -331,18 +315,17 @@ class SignalGenerator:
         else:
             return None
         
-        # Apply filters
+        # STRICT filters
         passed, block_reason = self.apply_hard_filters(
             score, regime, analysis_5m['adx'], analysis_5m['atr']
         )
         if not passed:
             return None
         
-        # Get futures price if using spot data
+        # Get price
         entry = analysis_5m['price']
         futures_market = None
         
-        # Check if this is spot data for futures signal
         if market.startswith('B-') and market in self.config.SPOT_TO_FUTURES_MAP:
             futures_market = self.config.SPOT_TO_FUTURES_MAP[market]
             futures_price = self.get_futures_price(futures_market)
@@ -364,12 +347,12 @@ class SignalGenerator:
         reward = abs(tp2 - entry)
         rr_ratio = reward / risk if risk > 0 else 0
         
+        # STRICTER R:R
         if rr_ratio < self.config.MIN_RR_RATIO:
             return None
         
         quality_tier, emoji = self.scorer.get_quality_tier(score)
         
-        # Use futures market name if available
         display_market = futures_market if futures_market else market
         
         return {
