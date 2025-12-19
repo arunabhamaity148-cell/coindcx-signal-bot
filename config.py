@@ -48,17 +48,17 @@ class Config:
     BIAS_TIMEFRAME   = '1h'
 
     # ---------- Scanning ----------
-    CHECK_INTERVAL_MINUTES   = int(os.environ.get('CHECK_INTERVAL_MINUTES', '15'))
-    COOLDOWN_MINUTES         = int(os.environ.get('COOLDOWN_MINUTES', '45'))
-    MAX_SIGNALS_PER_DAY      = 20
+    CHECK_INTERVAL_MINUTES = int(os.environ.get('CHECK_INTERVAL_MINUTES', '15'))
+    COOLDOWN_MINUTES       = int(os.environ.get('COOLDOWN_MINUTES', '45'))
+    MAX_SIGNALS_PER_DAY    = 20
 
     # ---------- Scoring ----------
     MIN_SIGNAL_SCORE = int(os.environ.get('MIN_SIGNAL_SCORE', '45'))
-    HIGH_QUALITY_THRESHOLD   = 60
-    PERFECT_SETUP_THRESHOLD  = 70
-
-    # Alias for backward compatibility (used inside bot.py / telegram_utils.py)
-    BASE_MIN_SCORE = MIN_SIGNAL_SCORE
+    HIGH_QUALITY_THRESHOLD  = 60
+    PERFECT_SETUP_THRESHOLD = 70
+    BASE_MIN_SCORE          = MIN_SIGNAL_SCORE          # alias
+    MAX_SIGNALS_PER_4_HOURS = 3
+    MAX_SIGNALS_PER_SCAN    = 2
 
     # ---------- Risk ----------
     ATR_SL_MULTIPLIER  = 1.8
@@ -74,10 +74,10 @@ class Config:
     ATR_PERIOD = 14
 
     # ---------- Filters ----------
-    MIN_ADX_THRESHOLD      = 8
-    MIN_ATR_THRESHOLD      = 0.000001
-    BLOCK_RANGING_SCORE    = 40
-    BLOCK_VOLATILE_SCORE   = 50
+    MIN_ADX_THRESHOLD    = 8
+    MIN_ATR_THRESHOLD    = 0.000001
+    BLOCK_RANGING_SCORE  = 40
+    BLOCK_VOLATILE_SCORE = 50
 
     # ---------- BTC Check ----------
     ENABLE_BTC_CHECK = os.environ.get('ENABLE_BTC_CHECK', 'false').lower() == 'true'
@@ -92,10 +92,10 @@ class Config:
     REQUIRE_MTF_ALIGNMENT = False
 
     # ---------- Bonuses ----------
-    VOLUME_SURGE_BONUS      = 10
-    WHALE_CANDLE_BONUS      = 8
-    LIQUIDITY_SWEEP_BONUS   = 8
-    TIME_OF_DAY_MULTIPLIER  = False
+    VOLUME_SURGE_BONUS     = 10
+    WHALE_CANDLE_BONUS     = 8
+    LIQUIDITY_SWEEP_BONUS  = 8
+    TIME_OF_DAY_MULTIPLIER = False
 
     # ---------- Confirmations ----------
     REQUIRE_VOLUME_OR_WHALE    = False
