@@ -224,7 +224,7 @@ class SignalGenerator:
                 candles, bid, ask, current_rsi, current_adx, current_macd_hist
             )
             
-            # NEW: Don't auto-block! Let ChatGPT decide!
+            # Count traps
             trapped_count = sum(traps.values())
             trap_reasons = TrapDetector.get_trap_reasons(traps)
             
@@ -233,8 +233,20 @@ class SignalGenerator:
                 print(f"⚠️ {pair} - Too many traps ({trapped_count}): {', '.join(trap_reasons)}")
                 return None
             
+            # Determine trend direction BEFORE ChatGPT check
+            trend = None
+            if (ema_fast.iloc[-1] > ema_slow.iloc[-1] and 
+                macd_line.iloc[-1] > signal_line.iloc[-1] and
+                plus_di.iloc[-1] > minus_di.iloc[-1]):
+                trend = "LONG"
+            elif (ema_fast.iloc[-1] < ema_slow.iloc[-1] and 
+                  macd_line.iloc[-1] < signal_line.iloc[-1] and
+                  minus_di.iloc[-1] > plus_di.iloc[-1]):
+                trend = "SHORT"
+            else:
+                return None  # No clear trend
+            
             # If 1-2 traps, ask ChatGPT
-            chatgpt_approved = True
             if trapped_count > 0:
                 print(f"⚠️ {pair} - {trapped_count} trap(s) detected: {', '.join(trap_reasons)}")
                 print(f"🤖 Asking ChatGPT for final decision...")
@@ -243,12 +255,18 @@ class SignalGenerator:
                 from chatgpt_advisor import ChatGPTAdvisor
                 advisor = ChatGPTAdvisor()
                 
+                # Calculate SL for preview
+                if trend == "LONG":
+                    preview_sl = current_price - (current_atr * self.mode_config['atr_sl_multiplier'])
+                else:
+                    preview_sl = current_price + (current_atr * self.mode_config['atr_sl_multiplier'])
+                
                 # Build signal preview for ChatGPT
                 signal_preview = {
                     'pair': pair,
                     'direction': trend,
                     'entry': current_price,
-                    'sl': current_price - (current_atr * self.mode_config['atr_sl_multiplier']) if trend == "LONG" else current_price + (current_atr * self.mode_config['atr_sl_multiplier']),
+                    'sl': preview_sl,
                     'rsi': current_rsi,
                     'adx': current_adx,
                     'trapped_count': trapped_count,
@@ -263,20 +281,6 @@ class SignalGenerator:
                     return None
                 else:
                     print(f"✅ ChatGPT approved: {decision.get('reason', 'Acceptable risk')}")
-                    chatgpt_approved = True
-            
-            # Determine trend direction
-            trend = None
-            if (ema_fast.iloc[-1] > ema_slow.iloc[-1] and 
-                macd_line.iloc[-1] > signal_line.iloc[-1] and
-                plus_di.iloc[-1] > minus_di.iloc[-1]):
-                trend = "LONG"
-            elif (ema_fast.iloc[-1] < ema_slow.iloc[-1] and 
-                  macd_line.iloc[-1] < signal_line.iloc[-1] and
-                  minus_di.iloc[-1] > plus_di.iloc[-1]):
-                trend = "SHORT"
-            else:
-                return None  # No clear trend
             
             # RSI filter
             if trend == "LONG" and current_rsi > 70:
