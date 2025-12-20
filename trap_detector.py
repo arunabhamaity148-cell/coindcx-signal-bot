@@ -27,6 +27,7 @@ class TrapDetector:
         """
         Trap #2: Liquidity grab filter
         Long wicks that grab stop losses
+        FULL PROTECTION - NO COMPROMISE!
         """
         if len(candles) < 1:
             return False
@@ -34,16 +35,16 @@ class TrapDetector:
         last_candle = candles.iloc[-1]
         body = abs(last_candle['close'] - last_candle['open'])
         
-        if body == 0 or body < 0.001:  # Very small body or zero
-            return False  # Skip trap check for ticker-based data
+        if body == 0 or body < 0.0001:
+            body = 0.0001  # Prevent division by zero
         
         upper_wick = last_candle['high'] - max(last_candle['open'], last_candle['close'])
         lower_wick = min(last_candle['open'], last_candle['close']) - last_candle['low']
         
-        # More lenient for simulated candles
-        if upper_wick > body * 5:  # Changed from 2 to 5
+        # STRICT: Wick > 2x body = liquidity grab trap
+        if upper_wick > body * 2.0:
             return True
-        if lower_wick > body * 5:  # Changed from 2 to 5
+        if lower_wick > body * 2.0:
             return True
         
         return False
@@ -52,7 +53,8 @@ class TrapDetector:
     def check_wick_manipulation(candles: pd.DataFrame) -> bool:
         """
         Trap #3: Wick manipulation filter
-        Multiple consecutive wicks in same direction
+        Multiple consecutive wicks = manipulation
+        FULL PROTECTION!
         """
         if len(candles) < 3:
             return False
@@ -63,17 +65,18 @@ class TrapDetector:
         for _, candle in last_3.iterrows():
             body = abs(candle['close'] - candle['open'])
             
-            if body < 0.001:  # Skip for tiny/zero bodies (ticker data)
-                continue
+            if body < 0.0001:
+                body = 0.0001
                 
             upper_wick = candle['high'] - max(candle['open'], candle['close'])
             lower_wick = min(candle['open'], candle['close']) - candle['low']
             
-            # More lenient threshold
-            if body > 0 and (upper_wick > body * 3 or lower_wick > body * 3):  # Changed from 1.5 to 3
+            # STRICT: Wick > 1.5x body = suspicious
+            if upper_wick > body * 1.5 or lower_wick > body * 1.5:
                 wick_traps += 1
         
-        return wick_traps >= 3  # All 3 must be traps (was 2+)
+        # 2+ wicks out of 3 = manipulation
+        return wick_traps >= 2
     
     @staticmethod
     def check_news_spike(candles: pd.DataFrame) -> bool:
@@ -187,19 +190,26 @@ class TrapDetector:
         """
         Trap #10: Indicator over-optimization trap
         Too perfect readings = likely false signal
+        FULL PROTECTION!
         """
-        # For simulated data, only check extreme perfection
         
-        # Perfect RSI (exactly 50, 30, 70) - wider tolerance
-        if abs(rsi - 50) < 0.5 or abs(rsi - 30) < 0.5 or abs(rsi - 70) < 0.5:
+        # Check for suspiciously perfect values
+        # RSI exactly at key levels (30, 50, 70)
+        if abs(rsi - 50) < 1.0:
+            return True
+        if abs(rsi - 30) < 1.0:
+            return True
+        if abs(rsi - 70) < 1.0:
             return True
         
-        # Perfect ADX (exactly 25, 50, 75) - wider tolerance  
-        if abs(adx - 25) < 0.5 or abs(adx - 50) < 0.5:
+        # ADX exactly at thresholds (25, 50)
+        if abs(adx - 25) < 1.0:
+            return True
+        if abs(adx - 50) < 1.0:
             return True
         
-        # MACD histogram exactly zero - wider tolerance
-        if abs(macd_hist) < 0.00001:  # Changed from 0.0001
+        # MACD histogram suspiciously close to zero
+        if abs(macd_hist) < 0.001:
             return True
         
         return False
