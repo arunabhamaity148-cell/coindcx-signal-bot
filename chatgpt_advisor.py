@@ -38,7 +38,8 @@ class ChatGPTAdvisor:
     
     def validate_signal_with_traps(self, signal: Dict) -> Dict:
         """
-        Smart trap validation - Don't auto-block, analyze context!
+        INTELLIGENT trap validation - Context matters!
+        Even 1-2 traps can be acceptable if setup is strong
         
         Args:
             signal: Signal dict with trap info
@@ -51,38 +52,60 @@ class ChatGPTAdvisor:
         trap_reasons = signal.get('trap_reasons', [])
         
         prompt = f"""
-Analyze this crypto futures trade signal with trap warnings:
+You are an EXPERIENCED crypto futures trader with 10+ years experience.
 
-**Signal:**
+**TRADE SETUP:**
 Pair: {signal['pair']}
 Direction: {signal['direction']}
 Entry: ₹{signal['entry']:,.2f}
 Stop Loss: ₹{signal['sl']:,.2f}
 
-**Indicators:**
-RSI: {signal['rsi']}
-ADX: {signal['adx']}
+**TECHNICAL INDICATORS:**
+RSI: {signal['rsi']} (30-70 = good, outside = extreme)
+ADX: {signal['adx']} (25+ = trending, 40+ = strong trend)
 
 **⚠️ TRAP WARNINGS ({trapped_count}):**
 {', '.join(trap_reasons)}
 
-**Question:**
-Should we TAKE or SKIP this trade?
+**YOUR TASK:**
+Decide: TAKE or SKIP this trade
 
-Consider:
-- 1-2 traps can be acceptable if indicators are strong
-- Wick manipulation in low liquidity is common (not always bad)
-- Liquidity grab can be false alarm in volatile markets
-- Strong RSI + ADX can override minor traps
+**IMPORTANT CONTEXT:**
+1. **Wick Manipulation**: Very common in low liquidity markets (CoinDCX). If other indicators are strong, wick traps can be ignored.
 
-Reply in this format:
+2. **Liquidity Grab**: Often happens before strong moves. If ADX > 30 and RSI is neutral, liquidity grab is actually a GOOD sign.
+
+3. **1-2 traps are NORMAL** in real trading. Perfect setups are rare. Strong trends can override minor traps.
+
+4. **What matters most:**
+   - ADX > 30 = Real trend (most important!)
+   - RSI 40-60 = Neutral zone (best entries)
+   - Direction clear = High confidence
+
+5. **When to SKIP:**
+   - RSI extreme (>75 or <25)
+   - ADX < 25 (weak/no trend)
+   - Multiple traps + weak indicators
+
+**EXAMPLES OF GOOD TRADES WITH TRAPS:**
+- Wick manipulation + ADX 35 + RSI 52 = TAKE (strong trend overrides wick)
+- Liquidity grab + ADX 40 + Neutral RSI = TAKE (liquidity grab before breakout)
+- Both traps + ADX 45 + RSI 50 = TAKE (very strong trend, traps are noise)
+
+**BE PRACTICAL, NOT OVERLY CAUTIOUS!**
+Real profitable traders take calculated risks.
+
+Reply in this EXACT format:
 DECISION: TAKE or SKIP
-CONFIDENCE: 0-100%
-REASON: One line explanation
+CONFIDENCE: [number]%
+REASON: [one sentence explaining why]
 """
         
         messages = [
-            {"role": "system", "content": "You are an expert crypto trader. Be practical, not overly cautious. 1-2 traps don't always mean bad trades."},
+            {
+                "role": "system", 
+                "content": "You are a profitable crypto trader. You understand that 1-2 traps with strong indicators are often GOOD trades. You are practical and experienced, not overly cautious. You know low liquidity markets have false trap signals."
+            },
             {"role": "user", "content": prompt}
         ]
         
@@ -90,7 +113,7 @@ REASON: One line explanation
             response = self._call_chatgpt(messages)
             
             # Parse response
-            approved = 'TAKE' in response.upper()
+            approved = 'TAKE' in response.upper() and 'SKIP' not in response.upper().split('DECISION:')[1].split('\n')[0]
             
             # Extract confidence
             confidence = 50
@@ -102,15 +125,22 @@ REASON: One line explanation
                     confidence = 50
             
             # Extract reason
-            reason = "ChatGPT analysis"
+            reason = "Trade analysis complete"
             if 'REASON:' in response:
                 try:
                     reason = response.split('REASON:')[1].strip().split('\n')[0]
                 except:
                     pass
             
+            # Log full ChatGPT response
+            print(f"🤖 ChatGPT Full Response:")
+            print(f"   {response.replace(chr(10), chr(10) + '   ')}")
+            
+            # Decision: Approve if confidence >= 55% (lenient)
+            final_approved = approved and confidence >= 55
+            
             return {
-                'approved': approved and confidence >= 60,
+                'approved': final_approved,
                 'reason': reason,
                 'confidence': confidence,
                 'full_response': response
@@ -118,11 +148,20 @@ REASON: One line explanation
             
         except Exception as e:
             print(f"⚠️ ChatGPT validation error: {e}")
-            # On error, be conservative but not blocking
+            # On error, be LENIENT (not blocking)
+            # If only 1 trap, approve by default
             if trapped_count <= 1:
-                return {'approved': True, 'reason': 'Minor trap, acceptable', 'confidence': 60}
+                return {
+                    'approved': True, 
+                    'reason': 'Single trap acceptable (ChatGPT unavailable)', 
+                    'confidence': 60
+                }
             else:
-                return {'approved': False, 'reason': 'Multiple traps', 'confidence': 30}
+                return {
+                    'approved': False, 
+                    'reason': 'Multiple traps, ChatGPT unavailable', 
+                    'confidence': 30
+                }
 
         """
         Ask ChatGPT to validate a trading signal
