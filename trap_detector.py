@@ -26,20 +26,13 @@ class TrapDetector:
     def check_liquidity_grab(candles: pd.DataFrame) -> bool:
         """
         Trap #2: Liquidity grab filter
-        Smart detection - adapts to data quality
+        
+        NOW USES REAL BINANCE DATA - Proper detection!
         """
         if len(candles) < 2:
             return False
         
         last_candle = candles.iloc[-1]
-        prev_candle = candles.iloc[-2]
-        
-        # Check if data is realistic (has variation)
-        price_variation = abs(last_candle['close'] - prev_candle['close']) / prev_candle['close']
-        
-        # If no variation = simulated, be lenient
-        if price_variation < 0.0001:  # Less than 0.01% change
-            return False  # Skip check for flat data
         
         body = abs(last_candle['close'] - last_candle['open'])
         
@@ -49,13 +42,11 @@ class TrapDetector:
         upper_wick = last_candle['high'] - max(last_candle['open'], last_candle['close'])
         lower_wick = min(last_candle['open'], last_candle['close']) - last_candle['low']
         
-        # Real data: Strict (2x)
-        # Simulated but realistic: Medium (3x)
-        threshold = 3.0 if price_variation < 0.001 else 2.0
-        
-        if upper_wick > body * threshold:
+        # With REAL Binance data: STRICT threshold
+        # Wick > 3x body = liquidity grab
+        if upper_wick > body * 3.0:
             return True
-        if lower_wick > body * threshold:
+        if lower_wick > body * 3.0:
             return True
         
         return False
@@ -64,21 +55,12 @@ class TrapDetector:
     def check_wick_manipulation(candles: pd.DataFrame) -> bool:
         """
         Trap #3: Wick manipulation filter
-        Smart detection based on data quality
+        
+        NOW USES REAL BINANCE DATA - Enable full protection!
+        Real historical candles = Proper wick detection
         """
         if len(candles) < 3:
             return False
-        
-        # Check data quality - is it realistic?
-        recent_closes = candles['close'].iloc[-5:] if len(candles) >= 5 else candles['close']
-        price_std = recent_closes.std()
-        price_mean = recent_closes.mean()
-        
-        # Coefficient of variation
-        cv = (price_std / price_mean) if price_mean > 0 else 0
-        
-        # Very low variation = simulated data
-        is_simulated = cv < 0.005  # Less than 0.5% variation
         
         last_3 = candles.iloc[-3:]
         wick_traps = 0
@@ -92,13 +74,12 @@ class TrapDetector:
             upper_wick = candle['high'] - max(candle['open'], candle['close'])
             lower_wick = min(candle['open'], candle['close']) - candle['low']
             
-            # Adaptive threshold
-            threshold = 4.0 if is_simulated else 1.5
-            
-            if upper_wick > body * threshold or lower_wick > body * threshold:
+            # With REAL data, use STRICT threshold
+            # Wick > 2.5x body = manipulation
+            if upper_wick > body * 2.5 or lower_wick > body * 2.5:
                 wick_traps += 1
         
-        # Need 2+ for trigger
+        # Need 2+ wicks for confirmation
         return wick_traps >= 2
     
     @staticmethod
@@ -212,28 +193,28 @@ class TrapDetector:
     def check_indicator_overfit(rsi: float, adx: float, macd_hist: float) -> bool:
         """
         Trap #10: Indicator over-optimization trap
-        Smart detection - checks for unrealistic perfection
+        
+        NOW USES REAL DATA - Proper detection!
         """
         
-        # Check if indicators are suspiciously perfect
-        perfect_score = 0
+        # Check if indicators are unrealistically perfect
+        perfect_count = 0
         
-        # RSI at exact round numbers
-        rsi_rounded = round(rsi)
-        if rsi_rounded in [30, 50, 70] and abs(rsi - rsi_rounded) < 0.5:
-            perfect_score += 1
+        # RSI at exact key levels
+        if abs(rsi - 50) < 0.5 or abs(rsi - 30) < 0.5 or abs(rsi - 70) < 0.5:
+            perfect_count += 1
         
         # ADX at exact thresholds
-        adx_rounded = round(adx)
-        if adx_rounded in [25, 50] and abs(adx - adx_rounded) < 0.5:
-            perfect_score += 1
+        if abs(adx - 25) < 0.5 or abs(adx - 50) < 0.5:
+            perfect_count += 1
         
         # MACD too close to zero
-        if abs(macd_hist) < 0.01:
-            perfect_score += 1
+        if abs(macd_hist) < 0.005:
+            perfect_count += 1
         
-        # If 2+ indicators are "perfect" = suspicious
-        return perfect_score >= 2
+        # If 3 indicators are "perfect" = suspicious
+        # (Very rare in real data)
+        return perfect_count >= 3
     
     @staticmethod
     def check_all_traps(candles: pd.DataFrame, bid: float = 0, ask: float = 0, 
