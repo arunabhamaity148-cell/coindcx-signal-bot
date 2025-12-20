@@ -36,7 +36,94 @@ class ChatGPTAdvisor:
             print(f"❌ ChatGPT API error: {e}")
             return "Error: Unable to get AI advice"
     
-    def validate_signal(self, signal: Dict) -> Dict:
+    def validate_signal_with_traps(self, signal: Dict) -> Dict:
+        """
+        Smart trap validation - Don't auto-block, analyze context!
+        
+        Args:
+            signal: Signal dict with trap info
+        
+        Returns:
+            {'approved': bool, 'reason': str, 'confidence': int}
+        """
+        
+        trapped_count = signal.get('trapped_count', 0)
+        trap_reasons = signal.get('trap_reasons', [])
+        
+        prompt = f"""
+Analyze this crypto futures trade signal with trap warnings:
+
+**Signal:**
+Pair: {signal['pair']}
+Direction: {signal['direction']}
+Entry: ₹{signal['entry']:,.2f}
+Stop Loss: ₹{signal['sl']:,.2f}
+
+**Indicators:**
+RSI: {signal['rsi']}
+ADX: {signal['adx']}
+
+**⚠️ TRAP WARNINGS ({trapped_count}):**
+{', '.join(trap_reasons)}
+
+**Question:**
+Should we TAKE or SKIP this trade?
+
+Consider:
+- 1-2 traps can be acceptable if indicators are strong
+- Wick manipulation in low liquidity is common (not always bad)
+- Liquidity grab can be false alarm in volatile markets
+- Strong RSI + ADX can override minor traps
+
+Reply in this format:
+DECISION: TAKE or SKIP
+CONFIDENCE: 0-100%
+REASON: One line explanation
+"""
+        
+        messages = [
+            {"role": "system", "content": "You are an expert crypto trader. Be practical, not overly cautious. 1-2 traps don't always mean bad trades."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        try:
+            response = self._call_chatgpt(messages)
+            
+            # Parse response
+            approved = 'TAKE' in response.upper()
+            
+            # Extract confidence
+            confidence = 50
+            if 'CONFIDENCE:' in response:
+                try:
+                    conf_part = response.split('CONFIDENCE:')[1].split('%')[0].strip()
+                    confidence = int(''.join(filter(str.isdigit, conf_part)))
+                except:
+                    confidence = 50
+            
+            # Extract reason
+            reason = "ChatGPT analysis"
+            if 'REASON:' in response:
+                try:
+                    reason = response.split('REASON:')[1].strip().split('\n')[0]
+                except:
+                    pass
+            
+            return {
+                'approved': approved and confidence >= 60,
+                'reason': reason,
+                'confidence': confidence,
+                'full_response': response
+            }
+            
+        except Exception as e:
+            print(f"⚠️ ChatGPT validation error: {e}")
+            # On error, be conservative but not blocking
+            if trapped_count <= 1:
+                return {'approved': True, 'reason': 'Minor trap, acceptable', 'confidence': 60}
+            else:
+                return {'approved': False, 'reason': 'Multiple traps', 'confidence': 30}
+
         """
         Ask ChatGPT to validate a trading signal
         USE SPARINGLY - only for final decision
