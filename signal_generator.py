@@ -131,7 +131,7 @@ class SignalGenerator:
     
     def analyze(self, pair: str, candles: pd.DataFrame) -> Optional[Dict]:
         """
-        Main analysis function
+        Main analysis function with NaN protection
         
         Args:
             pair: Trading pair
@@ -160,6 +160,168 @@ class SignalGenerator:
         
         # Check if enough data
         if len(candles) < 50:
+            return None
+        
+        try:
+            # Clean data - remove NaN
+            candles = candles.dropna()
+            
+            if len(candles) < 50:
+                print(f"⚠️ Not enough clean data for {pair}")
+                return None
+            
+            # Calculate all indicators
+            close = candles['close']
+            high = candles['high']
+            low = candles['low']
+            volume = candles['volume']
+            
+            ema_fast = Indicators.ema(close, self.mode_config['ema_fast'])
+            ema_slow = Indicators.ema(close, self.mode_config['ema_slow'])
+            macd_line, signal_line, histogram = Indicators.macd(close)
+            rsi = Indicators.rsi(close)
+            adx, plus_di, minus_di = Indicators.adx(high, low, close)
+            atr = Indicators.atr(high, low, close)
+            volume_surge = Indicators.volume_surge(volume)
+            
+            # Drop NaN from indicators
+            ema_fast = ema_fast.dropna()
+            ema_slow = ema_slow.dropna()
+            macd_line = macd_line.dropna()
+            signal_line = signal_line.dropna()
+            histogram = histogram.dropna()
+            rsi = rsi.dropna()
+            adx = adx.dropna()
+            atr = atr.dropna()
+            volume_surge = volume_surge.dropna()
+            
+            # Check if we have enough data after cleaning
+            if len(rsi) < 2 or len(adx) < 2 or len(atr) < 2:
+                print(f"⚠️ Insufficient indicator data for {pair}")
+                return None
+            
+            # Current values with NaN check
+            current_price = float(close.iloc[-1])
+            current_rsi = float(rsi.iloc[-1])
+            current_adx = float(adx.iloc[-1])
+            current_atr = float(atr.iloc[-1])
+            current_macd_hist = float(histogram.iloc[-1])
+            prev_macd_hist = float(histogram.iloc[-2]) if len(histogram) > 1 else 0.0
+            current_volume_surge = float(volume_surge.iloc[-1]) if len(volume_surge) > 0 else 1.0
+            
+            # Validate values
+            if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
+                print(f"⚠️ NaN values in indicators for {pair}")
+                return None
+            
+            # Get ticker for spread check
+            ticker = CoinDCXAPI.get_ticker(pair)
+            bid = ticker['bid'] if ticker else current_price
+            ask = ticker['ask'] if ticker else current_price
+            
+            # Trap detection
+            traps = TrapDetector.check_all_traps(
+                candles, bid, ask, current_rsi, current_adx, current_macd_hist
+            )
+            
+            if TrapDetector.is_trapped(traps):
+                trap_reasons = TrapDetector.get_trap_reasons(traps)
+                print(f"⚠️ {pair} - Traps detected: {', '.join(trap_reasons)}")
+                return None
+            
+            # Determine trend direction
+            trend = None
+            if (ema_fast.iloc[-1] > ema_slow.iloc[-1] and 
+                macd_line.iloc[-1] > signal_line.iloc[-1] and
+                plus_di.iloc[-1] > minus_di.iloc[-1]):
+                trend = "LONG"
+            elif (ema_fast.iloc[-1] < ema_slow.iloc[-1] and 
+                  macd_line.iloc[-1] < signal_line.iloc[-1] and
+                  minus_di.iloc[-1] > plus_di.iloc[-1]):
+                trend = "SHORT"
+            else:
+                return None  # No clear trend
+            
+            # RSI filter
+            if trend == "LONG" and current_rsi > 70:
+                return None  # Overbought
+            if trend == "SHORT" and current_rsi < 30:
+                return None  # Oversold
+            
+            # ADX filter (minimum trend strength)
+            if current_adx < config.MIN_ADX_STRENGTH:
+                return None
+            
+            # Calculate entry/SL/TP
+            levels = self._calculate_entry_sl_tp(trend, current_price, current_atr)
+            
+            # Liquidation safety check
+            if not self._check_liquidation_safety(levels['entry'], levels['sl']):
+                print(f"⚠️ {pair} - Liquidation risk too high")
+                return None
+            
+            # Get multi-timeframe trend (if possible)
+            try:
+                candles_5m = CoinDCXAPI.get_candles(pair, '5m', 50)
+                candles_15m = CoinDCXAPI.get_candles(pair, '15m', 50)
+                candles_1h = CoinDCXAPI.get_candles(pair, '1h', 50)
+                
+                if not candles_5m.empty and not candles_15m.empty and not candles_1h.empty:
+                    mtf_trend = Indicators.mtf_trend(
+                        candles_5m['close'],
+                        candles_15m['close'],
+                        candles_1h['close']
+                    )
+                else:
+                    mtf_trend = "UNKNOWN"
+            except:
+                mtf_trend = "UNKNOWN"
+            
+            # Calculate signal score
+            indicators_data = {
+                'rsi': current_rsi,
+                'adx': current_adx,
+                'macd_histogram': current_macd_hist,
+                'prev_macd_histogram': prev_macd_hist,
+                'volume_surge': current_volume_surge
+            }
+            
+            score = self._calculate_signal_score(indicators_data, mtf_trend)
+            
+            # Minimum score filter
+            min_score = 60 if config.MODE == 'TREND' else 50
+            if score < min_score:
+                return None
+            
+            # Build signal
+            signal = {
+                'pair': pair,
+                'direction': trend,
+                'entry': levels['entry'],
+                'sl': levels['sl'],
+                'tp1': levels['tp1'],
+                'tp2': levels['tp2'],
+                'leverage': self.mode_config['leverage'],
+                'score': score,
+                'rsi': round(current_rsi, 1),
+                'adx': round(current_adx, 1),
+                'mtf_trend': mtf_trend,
+                'mode': config.MODE,
+                'volume_surge': round(current_volume_surge, 2),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            # Update counters
+            self.signal_count += 1
+            self.signals_today.append(signal)
+            self.last_signal_time[pair] = datetime.now()
+            
+            return signal
+            
+        except Exception as e:
+            print(f"❌ Error in analysis for {pair}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
         
         # Calculate all indicators
