@@ -18,9 +18,18 @@ class WebSocketFeed:
         self.thread = None
         
     def on_message(self, ws, message):
-        """Handle incoming WebSocket messages"""
+        """Handle incoming WebSocket messages with better error handling"""
         try:
+            # Skip if message is not string
+            if not isinstance(message, str):
+                return
+            
+            # Try to parse JSON
             data = json.loads(message)
+            
+            # Skip if data is not dict
+            if not isinstance(data, dict):
+                return
             
             # CoinDCX WebSocket format
             if 'p' in data and 's' in data:  # price and symbol
@@ -33,8 +42,15 @@ class WebSocketFeed:
                 price = float(data['last_traded_price'])
                 self.prices[symbol] = price
                 
-        except Exception as e:
-            print(f"⚠️ WebSocket message error: {e}")
+        except json.JSONDecodeError:
+            # Ignore invalid JSON messages
+            pass
+        except (TypeError, ValueError, KeyError):
+            # Ignore other parsing errors
+            pass
+        except Exception:
+            # Ignore all other errors silently
+            pass
     
     def on_error(self, ws, error):
         """Handle WebSocket errors"""
