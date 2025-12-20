@@ -284,12 +284,15 @@ class SignalGenerator:
             
             # RSI filter
             if trend == "LONG" and current_rsi > 70:
-                return None  # Overbought
+                print(f"❌ {pair} BLOCKED: RSI too high ({current_rsi}) - Overbought")
+                return None
             if trend == "SHORT" and current_rsi < 30:
-                return None  # Oversold
+                print(f"❌ {pair} BLOCKED: RSI too low ({current_rsi}) - Oversold")
+                return None
             
             # ADX filter (minimum trend strength)
             if current_adx < config.MIN_ADX_STRENGTH:
+                print(f"❌ {pair} BLOCKED: ADX too weak ({current_adx:.1f}) - Need {config.MIN_ADX_STRENGTH}+")
                 return None
             
             # Calculate entry/SL/TP
@@ -297,7 +300,8 @@ class SignalGenerator:
             
             # Liquidation safety check
             if not self._check_liquidation_safety(levels['entry'], levels['sl']):
-                print(f"⚠️ {pair} - Liquidation risk too high")
+                distance = abs(levels['entry'] - levels['sl']) / levels['entry'] * 100
+                print(f"❌ {pair} BLOCKED: Liquidation risk too high (SL only {distance:.1f}% away, need 10%+)")
                 return None
             
             # Get multi-timeframe trend (if possible)
@@ -331,7 +335,18 @@ class SignalGenerator:
             # Minimum score filter
             min_score = 60 if config.MODE == 'TREND' else 50
             if score < min_score:
+                print(f"❌ {pair} BLOCKED: Score too low ({score}) - Need {min_score}+")
+                print(f"   RSI: {current_rsi:.1f}, ADX: {current_adx:.1f}, MTF: {mtf_trend}")
                 return None
+            
+            # SUCCESS! Generate signal
+            print(f"✅ {pair} SIGNAL APPROVED!")
+            print(f"   Direction: {trend}")
+            print(f"   Score: {score}/100")
+            print(f"   Entry: ₹{levels['entry']:,.2f}")
+            print(f"   RSI: {current_rsi:.1f}, ADX: {current_adx:.1f}")
+            if trapped_count > 0:
+                print(f"   ⚠️ Had {trapped_count} trap(s) but ChatGPT approved!")
             
             # Build signal
             signal = {
