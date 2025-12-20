@@ -27,7 +27,7 @@ class TrapDetector:
         """
         Trap #2: Liquidity grab filter
         
-        NOW USES REAL BINANCE DATA - Proper detection!
+        LENIENT for real trading - Only catch EXTREME cases
         """
         if len(candles) < 2:
             return False
@@ -42,11 +42,11 @@ class TrapDetector:
         upper_wick = last_candle['high'] - max(last_candle['open'], last_candle['close'])
         lower_wick = min(last_candle['open'], last_candle['close']) - last_candle['low']
         
-        # With REAL Binance data: STRICT threshold
-        # Wick > 3x body = liquidity grab
-        if upper_wick > body * 3.0:
+        # LENIENT: Only flag if wick is 5x body (very extreme!)
+        # Normal 2-3x wicks are common in volatile markets
+        if upper_wick > body * 5.0:
             return True
-        if lower_wick > body * 3.0:
+        if lower_wick > body * 5.0:
             return True
         
         return False
@@ -56,14 +56,14 @@ class TrapDetector:
         """
         Trap #3: Wick manipulation filter
         
-        NOW USES REAL BINANCE DATA - Enable full protection!
-        Real historical candles = Proper wick detection
+        LENIENT - Wicks are NORMAL in crypto!
+        Only flag extreme manipulation
         """
         if len(candles) < 3:
             return False
         
         last_3 = candles.iloc[-3:]
-        wick_traps = 0
+        extreme_wicks = 0
         
         for _, candle in last_3.iterrows():
             body = abs(candle['close'] - candle['open'])
@@ -74,13 +74,13 @@ class TrapDetector:
             upper_wick = candle['high'] - max(candle['open'], candle['close'])
             lower_wick = min(candle['open'], candle['close']) - candle['low']
             
-            # With REAL data, use STRICT threshold
-            # Wick > 2.5x body = manipulation
-            if upper_wick > body * 2.5 or lower_wick > body * 2.5:
-                wick_traps += 1
+            # LENIENT: Only flag if wick > 4x body (extreme!)
+            # 2-3x wicks are normal, don't flag them
+            if upper_wick > body * 4.0 or lower_wick > body * 4.0:
+                extreme_wicks += 1
         
-        # Need 2+ wicks for confirmation
-        return wick_traps >= 2
+        # Need ALL 3 candles with extreme wicks (very rare)
+        return extreme_wicks >= 3
     
     @staticmethod
     def check_news_spike(candles: pd.DataFrame) -> bool:
