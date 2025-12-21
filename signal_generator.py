@@ -93,7 +93,8 @@ class SignalGenerator:
             score += 15
         else:
             score += 10
-# ADX score (max 25 points)
+        
+        # ADX score (max 25 points)
         adx = indicators['adx']
         if adx > 40:
             score += 25
@@ -117,8 +118,7 @@ class SignalGenerator:
             score += 10
         else:
             score += 5
-        
-        # Multi-timeframe alignment (max 20 points)
+ # Multi-timeframe alignment (max 20 points)
         if trend_strength in ['STRONG_UP', 'STRONG_DOWN']:
             score += 20
         elif trend_strength in ['MODERATE_UP', 'MODERATE_DOWN']:
@@ -251,9 +251,12 @@ class SignalGenerator:
             # If 1-2 traps, ask ChatGPT
             if trapped_count > 0:
                 print(f"⚠️ {pair} - {trapped_count} trap(s) detected: {', '.join(trap_reasons)}")
-                print(f"🤖 Asking ChatGPT for final decision...")
+                
+                chatgpt_approved = False
                 
                 try:
+                    print(f"🤖 Asking ChatGPT for final decision...")
+                    
                     # ChatGPT validation
                     from chatgpt_advisor import ChatGPTAdvisor
                     advisor = ChatGPTAdvisor()
@@ -284,15 +287,22 @@ class SignalGenerator:
                         return None
                     else:
                         print(f"✅ ChatGPT approved: {decision.get('reason', 'Acceptable risk')}")
+                        chatgpt_approved = True
                         
                 except Exception as e:
-                    print(f"⚠️ ChatGPT error: {e}")
+                    print(f"⚠️ ChatGPT error: {str(e)[:100]}")
                     # Fallback: Auto-approve 1-2 traps if ChatGPT fails
                     if trapped_count <= 2:
-                        print(f"✅ Fallback: Auto-approved {trapped_count} trap(s) (ChatGPT unavailable)")
+                        print(f"✅ Fallback activated: Auto-approved {trapped_count} trap(s)")
+                        print(f"   Reason: ChatGPT unavailable but indicators strong")
+                        chatgpt_approved = True
                     else:
-                        print(f"❌ Too many traps ({trapped_count}), blocking")
+                        print(f"❌ Too many traps ({trapped_count}) + ChatGPT unavailable = BLOCK")
                         return None
+                
+                # If not approved by either ChatGPT or fallback, block
+                if not chatgpt_approved:
+                    return None
             
             # RSI filter
             if trend == "LONG" and current_rsi > 70:
