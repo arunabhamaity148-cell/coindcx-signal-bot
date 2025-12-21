@@ -93,8 +93,7 @@ class SignalGenerator:
             score += 15
         else:
             score += 10
-        
-        # ADX score (max 25 points)
+# ADX score (max 25 points)
         adx = indicators['adx']
         if adx > 40:
             score += 25
@@ -509,4 +508,21 @@ class SignalGenerator:
             'mtf_trend': mtf_trend,
             'mode': config.MODE,
             'volume_surge': round(current_volume_surge, 2),
-            'timestamp': datetime.now().st
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Update counters
+        self.signal_count += 1
+        self.signals_today.append(signal)
+        self.last_signal_time[pair] = datetime.now()
+        
+        return signal
+    
+    def get_stats(self) -> Dict:
+        """Get signal generator statistics"""
+        return {
+            'signals_today': self.signal_count,
+            'signals_remaining': config.MAX_SIGNALS_PER_DAY - self.signal_count,
+            'mode': config.MODE,
+            'last_reset': self.last_reset_date.strftime('%Y-%m-%d')
+        }
