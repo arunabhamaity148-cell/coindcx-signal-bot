@@ -1,20 +1,19 @@
-import openai
+from openai import OpenAI
 from typing import Dict, List
 from config import config
 
 class ChatGPTAdvisor:
     """
-    ChatGPT integration for decision-making assistance
-    Uses MINIMAL API calls to save costs
+    ChatGPT integration for decision-making (OpenAI 1.0+ compatible)
     """
     
     def __init__(self):
-        openai.api_key = config.CHATGPT_API_KEY
+        self.client = OpenAI(api_key=config.CHATGPT_API_KEY)
         self.model = config.CHATGPT_MODEL
     
     def _call_chatgpt(self, messages: List[Dict]) -> str:
         """
-        Internal method to call ChatGPT API
+        Internal method to call ChatGPT API (OpenAI 1.0+ format)
         
         Args:
             messages: List of message dicts with role and content
@@ -23,10 +22,10 @@ class ChatGPTAdvisor:
             ChatGPT response text
         """
         try:
-            response = openai.ChatCompletion.create(
+            response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                max_tokens=300,  # Keep it short
+                max_tokens=300,
                 temperature=0.7
             )
             
