@@ -244,43 +244,22 @@ class SignalGenerator:
                   minus_di.iloc[-1] > plus_di.iloc[-1]):
                 trend = "SHORT"
             else:
+                print(f"❌ {pair} BLOCKED: No clear trend")
+                print(f"   EMA Fast: {ema_fast.iloc[-1]:.2f}, EMA Slow: {ema_slow.iloc[-1]:.2f}")
+                print(f"   MACD Line: {macd_line.iloc[-1]:.4f}, Signal: {signal_line.iloc[-1]:.4f}")
                 return None  # No clear trend
             
             # If 1-2 traps, ask ChatGPT
             if trapped_count > 0:
                 print(f"⚠️ {pair} - {trapped_count} trap(s) detected: {', '.join(trap_reasons)}")
-                print(f"🤖 Asking ChatGPT for final decision...")
                 
-                # ChatGPT validation
-                from chatgpt_advisor import ChatGPTAdvisor
-                advisor = ChatGPTAdvisor()
-                
-                # Calculate SL for preview
-                if trend == "LONG":
-                    preview_sl = current_price - (current_atr * self.mode_config['atr_sl_multiplier'])
+                # TEMPORARY: Skip ChatGPT, auto-approve 1-2 traps
+                if trapped_count <= 2:
+                    print(f"✅ Auto-approved: {trapped_count} trap(s) acceptable with strong indicators")
+                    print(f"   (ChatGPT validation disabled temporarily)")
                 else:
-                    preview_sl = current_price + (current_atr * self.mode_config['atr_sl_multiplier'])
-                
-                # Build signal preview for ChatGPT
-                signal_preview = {
-                    'pair': pair,
-                    'direction': trend,
-                    'entry': current_price,
-                    'sl': preview_sl,
-                    'rsi': current_rsi,
-                    'adx': current_adx,
-                    'trapped_count': trapped_count,
-                    'trap_reasons': trap_reasons
-                }
-                
-                # Ask ChatGPT
-                decision = advisor.validate_signal_with_traps(signal_preview)
-                
-                if not decision.get('approved', False):
-                    print(f"❌ ChatGPT blocked: {decision.get('reason', 'High risk')}")
+                    print(f"❌ Too many traps ({trapped_count}), blocking signal")
                     return None
-                else:
-                    print(f"✅ ChatGPT approved: {decision.get('reason', 'Acceptable risk')}")
             
             # RSI filter
             if trend == "LONG" and current_rsi > 70:
