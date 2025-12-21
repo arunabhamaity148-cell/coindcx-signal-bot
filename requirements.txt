@@ -19,3 +19,5 @@ pytz==2023.3
 
 # Optional: Better logging
 python-dotenv==1.0.0
+openai>=1.12.0
+httpx>=0.25.0,<1.0.0
