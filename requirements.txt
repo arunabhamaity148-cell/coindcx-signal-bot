@@ -8,9 +8,6 @@ numpy==1.26.2
 requests==2.31.0
 websocket-client==1.7.0
 
-# AI Integration
-openai==1.6.1
-
 # Async
 asyncio==3.4.3
 
