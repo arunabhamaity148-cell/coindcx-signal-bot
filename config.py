@@ -66,7 +66,7 @@ class Config:
     }
     
     # Risk Management
-    LIQUIDATION_BUFFER = 0.10  # 10% minimum distance from liquidation
+    LIQUIDATION_BUFFER = 0.005   # 0.5% minimum distance from liquidation
     MIN_ADX_STRENGTH = 25
     COOLDOWN_MINUTES = 30  # Minimum time between signals for same pair
     
