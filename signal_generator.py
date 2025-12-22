@@ -536,30 +536,3 @@ class SignalGenerator:
             'mode': config.MODE,
             'last_reset': self.last_reset_date.strftime('%Y-%m-%d')
         }
-# At the end of analyze() function, before return signal:
-
-if config.TRACK_PERFORMANCE and signal:
-    # Log signal to CSV for analysis
-    import csv
-    from datetime import datetime
-    
-    log_data = {
-        'timestamp': datetime.now().isoformat(),
-        'pair': signal['pair'],
-        'direction': signal['direction'],
-        'entry': signal['entry'],
-        'sl': signal['sl'],
-        'tp1': signal['tp1'],
-        'score': signal['score'],
-        'rsi': signal['rsi'],
-        'adx': signal['adx']
-    }
-    
-    try:
-        with open(config.PERFORMANCE_LOG_FILE, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=log_data.keys())
-            if f.tell() == 0:  # File is empty, write header
-                writer.writeheader()
-            writer.writerow(log_data)
-    except Exception as e:
-        print(f"⚠️ Performance logging failed: {e}")
