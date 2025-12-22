@@ -1,6 +1,5 @@
 import os
 from dataclasses import dataclass
-
 @dataclass
 class Config:
     """Bot Configuration - All settings from Railway environment"""
