@@ -1,4 +1,4 @@
-from openai import OpenAI
+from opena import OpenAI
 from typing import Dict, List, Optional, Tuple
 from config import config
 import time
