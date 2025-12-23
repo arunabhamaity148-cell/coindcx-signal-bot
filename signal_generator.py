@@ -12,6 +12,12 @@ class SignalGenerator:
     """
     Multi-Mode Signal Generator
     Analyzes markets in QUICK (5m), MID (15m), and TREND (1h) timeframes
+    
+    ✅ FIXED BUGS:
+    1. TP sanity validation for low-price coins
+    2. Invalid TP guard (TP = ENTRY blocked)
+    3. QUICK mode stricter ADX (25 instead of 20)
+    4. Minimum TP distance protection (% based)
     """
 
     def __init__(self):
@@ -53,29 +59,84 @@ class SignalGenerator:
 
         return False
 
-    def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Dict:
-        """Calculate entry, stop loss, and take profit levels using mode-specific multipliers"""
-
+    def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Optional[Dict]:
+        """
+        Calculate entry, stop loss, and take profit levels
+        
+        ✅ FIX #1: Dynamic rounding for low-price coins
+        ✅ FIX #4: Minimum TP distance protection
+        
+        Returns None if TP validation fails
+        """
+        
         sl_multiplier = mode_config['atr_sl_multiplier']
         tp1_multiplier = mode_config['atr_tp1_multiplier']
         tp2_multiplier = mode_config['atr_tp2_multiplier']
-
+        
+        # ✅ FIX #1: Get appropriate decimal places based on price
+        decimal_places = config.get_decimal_places(current_price)
+        
+        # Calculate raw values
         if direction == "LONG":
             entry = current_price
-            sl = entry - (atr * sl_multiplier)
-            tp1 = entry + (atr * tp1_multiplier)
-            tp2 = entry + (atr * tp2_multiplier)
+            sl_raw = entry - (atr * sl_multiplier)
+            tp1_raw = entry + (atr * tp1_multiplier)
+            tp2_raw = entry + (atr * tp2_multiplier)
         else:  # SHORT
             entry = current_price
-            sl = entry + (atr * sl_multiplier)
-            tp1 = entry - (atr * tp1_multiplier)
-            tp2 = entry - (atr * tp2_multiplier)
-
+            sl_raw = entry + (atr * sl_multiplier)
+            tp1_raw = entry - (atr * tp1_multiplier)
+            tp2_raw = entry - (atr * tp2_multiplier)
+        
+        # ✅ FIX #1: Round with appropriate precision
+        entry = round(entry, decimal_places)
+        sl = round(sl_raw, decimal_places)
+        tp1 = round(tp1_raw, decimal_places)
+        tp2 = round(tp2_raw, decimal_places)
+        
+        # ✅ FIX #4: Apply minimum TP distance (% based)
+        min_tp_distance = entry * (config.MIN_TP_DISTANCE_PERCENT / 100)
+        
+        if direction == "LONG":
+            # Ensure TP1 is at least MIN_TP_DISTANCE_PERCENT above entry
+            if tp1 - entry < min_tp_distance:
+                tp1 = round(entry + min_tp_distance, decimal_places)
+            if tp2 - entry < min_tp_distance * 1.5:  # TP2 should be even further
+                tp2 = round(entry + min_tp_distance * 1.5, decimal_places)
+        else:  # SHORT
+            # Ensure TP1 is at least MIN_TP_DISTANCE_PERCENT below entry
+            if entry - tp1 < min_tp_distance:
+                tp1 = round(entry - min_tp_distance, decimal_places)
+            if entry - tp2 < min_tp_distance * 1.5:
+                tp2 = round(entry - min_tp_distance * 1.5, decimal_places)
+        
+        # ✅ FIX #2: Validate TP levels are valid
+        if direction == "LONG":
+            if tp1 <= entry:
+                print(f"⚠️ Invalid TP: LONG TP1 ({tp1}) <= Entry ({entry})")
+                return None
+            if tp2 <= entry:
+                print(f"⚠️ Invalid TP: LONG TP2 ({tp2}) <= Entry ({entry})")
+                return None
+            if tp1 >= tp2:
+                print(f"⚠️ Invalid TP: TP1 ({tp1}) >= TP2 ({tp2})")
+                return None
+        else:  # SHORT
+            if tp1 >= entry:
+                print(f"⚠️ Invalid TP: SHORT TP1 ({tp1}) >= Entry ({entry})")
+                return None
+            if tp2 >= entry:
+                print(f"⚠️ Invalid TP: SHORT TP2 ({tp2}) >= Entry ({entry})")
+                return None
+            if tp1 <= tp2:
+                print(f"⚠️ Invalid TP: TP1 ({tp1}) <= TP2 ({tp2})")
+                return None
+        
         return {
-            'entry': round(entry, 2),
-            'sl': round(sl, 2),
-            'tp1': round(tp1, 2),
-            'tp2': round(tp2, 2)
+            'entry': entry,
+            'sl': sl,
+            'tp1': tp1,
+            'tp2': tp2
         }
 
     def _check_liquidation_safety(self, entry: float, sl: float) -> tuple[bool, float]:
@@ -314,12 +375,17 @@ class SignalGenerator:
             if trend == "SHORT" and current_rsi < config.RSI_OVERSOLD:
                 return None
 
-            # ✅ ADX filter (use mode-specific threshold)
+            # ✅ ADX filter (use mode-specific threshold - FIX #3 applied via config)
             if current_adx < min_adx:
                 return None
 
-            # ✅ Calculate levels with mode-specific config
+            # ✅ Calculate levels with FIXES #1, #2, #4
             levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
+            
+            # ✅ FIX #2: Block signal if TP validation failed
+            if levels is None:
+                print(f"❌ {pair} BLOCKED: Invalid TP levels")
+                return None
 
             # ✅ Liquidation check
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
@@ -399,8 +465,10 @@ class SignalGenerator:
             print(f"✅ {mode} MODE: {pair} SIGNAL APPROVED!")
             print(f"   Direction: {trend}")
             print(f"   Score: {score}/100")
-            print(f"   Entry: ₹{levels['entry']:,.2f}")
-            print(f"   SL: ₹{levels['sl']:,.2f} ({sl_distance_pct:.1f}% away)")
+            print(f"   Entry: ₹{levels['entry']:,.6f}")
+            print(f"   SL: ₹{levels['sl']:,.6f} ({sl_distance_pct:.1f}% away)")
+            print(f"   TP1: ₹{levels['tp1']:,.6f}")
+            print(f"   TP2: ₹{levels['tp2']:,.6f}")
             print(f"   RSI: {current_rsi:.1f}, ADX: {current_adx:.1f}")
 
             # Build signal
@@ -416,8 +484,8 @@ class SignalGenerator:
                 'rsi': round(current_rsi, 1),
                 'adx': round(current_adx, 1),
                 'mtf_trend': mtf_trend,
-                'mode': mode,  # ✅ Added
-                'timeframe': mode_config['timeframe'],  # ✅ Added
+                'mode': mode,
+                'timeframe': mode_config['timeframe'],
                 'volume_surge': round(current_volume_surge, 2),
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
