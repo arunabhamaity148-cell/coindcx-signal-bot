@@ -10,16 +10,18 @@ from news_guard import news_guard
 
 class SignalGenerator:
     """
-    Core signal generation engine
-    Analyzes market data and generates high-quality trading signals
+    Multi-Mode Signal Generator
+    Analyzes markets in QUICK (5m), MID (15m), and TREND (1h) timeframes
     """
 
     def __init__(self):
         self.signal_count = 0
         self.signals_today = []
         self.last_signal_time: Dict[str, datetime] = {}
-        self.mode_config = config.MODE_CONFIG[config.MODE]
         self.last_reset_date = datetime.now().date()
+        
+        # ✅ Track signals per mode
+        self.mode_signal_count = {mode: 0 for mode in config.ACTIVE_MODES}
 
     def _reset_daily_counters(self):
         """Reset signal counters at midnight"""
@@ -27,13 +29,15 @@ class SignalGenerator:
         if today != self.last_reset_date:
             self.signal_count = 0
             self.signals_today = []
+            self.mode_signal_count = {mode: 0 for mode in config.ACTIVE_MODES}
             self.last_reset_date = today
             print(f"🔄 Daily counters reset for {today}")
 
-    def _check_cooldown(self, pair: str) -> bool:
-        """Check if pair is in cooldown period"""
-        if pair in self.last_signal_time:
-            time_since_last = datetime.now() - self.last_signal_time[pair]
+    def _check_cooldown(self, pair: str, mode: str) -> bool:
+        """Check if pair is in cooldown period (per mode)"""
+        key = f"{pair}_{mode}"
+        if key in self.last_signal_time:
+            time_since_last = datetime.now() - self.last_signal_time[key]
             if time_since_last < timedelta(minutes=config.COOLDOWN_MINUTES):
                 return False  # Still in cooldown
         return True
@@ -49,12 +53,12 @@ class SignalGenerator:
 
         return False
 
-    def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float) -> Dict:
-        """Calculate entry, stop loss, and take profit levels"""
+    def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Dict:
+        """Calculate entry, stop loss, and take profit levels using mode-specific multipliers"""
 
-        sl_multiplier = self.mode_config['atr_sl_multiplier']
-        tp1_multiplier = self.mode_config['atr_tp1_multiplier']
-        tp2_multiplier = self.mode_config['atr_tp2_multiplier']
+        sl_multiplier = mode_config['atr_sl_multiplier']
+        tp1_multiplier = mode_config['atr_tp1_multiplier']
+        tp2_multiplier = mode_config['atr_tp2_multiplier']
 
         if direction == "LONG":
             entry = current_price
@@ -80,10 +84,7 @@ class SignalGenerator:
         Returns: (is_safe, distance_percentage)
         """
         distance_pct = abs(entry - sl) / entry * 100
-        
-        # Use 1.5% minimum instead of config value (which was 0.5%)
-        MIN_DISTANCE = 1.5  # 1.5% minimum for crypto volatility
-        
+        MIN_DISTANCE = config.LIQUIDATION_BUFFER * 100
         is_safe = distance_pct >= MIN_DISTANCE
         return is_safe, distance_pct
 
@@ -91,13 +92,15 @@ class SignalGenerator:
         """Log signal to CSV for performance tracking"""
         if not hasattr(config, 'TRACK_PERFORMANCE') or not config.TRACK_PERFORMANCE:
             return
-        
+
         log_file = getattr(config, 'PERFORMANCE_LOG_FILE', 'signal_performance.csv')
-        
+
         log_data = {
             'timestamp': signal.get('timestamp', datetime.now().isoformat()),
             'pair': signal['pair'],
             'direction': signal['direction'],
+            'mode': signal.get('mode', 'UNKNOWN'),
+            'timeframe': signal.get('timeframe', 'UNKNOWN'),
             'entry': signal['entry'],
             'sl': signal['sl'],
             'tp1': signal['tp1'],
@@ -105,10 +108,9 @@ class SignalGenerator:
             'score': signal['score'],
             'rsi': signal['rsi'],
             'adx': signal['adx'],
-            'leverage': signal['leverage'],
-            'mode': signal['mode']
+            'leverage': signal['leverage']
         }
-        
+
         try:
             # Check if file exists
             try:
@@ -116,14 +118,14 @@ class SignalGenerator:
                     file_exists = True
             except FileNotFoundError:
                 file_exists = False
-            
+
             # Write to CSV
             with open(log_file, 'a', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=log_data.keys())
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(log_data)
-                
+
             print(f"📝 Signal logged to {log_file}")
         except Exception as e:
             print(f"⚠️ Performance logging failed: {e}")
@@ -179,32 +181,47 @@ class SignalGenerator:
 
         return min(score, 100)
 
-    def analyze(self, pair: str, candles: pd.DataFrame) -> Optional[Dict]:
+    def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
         """
-        Main analysis function with NaN protection
+        Main analysis function - now supports specific mode
         
         Args:
             pair: Trading pair
             candles: Historical OHLCV data
+            mode: Analysis mode (QUICK/MID/TREND) - if None, uses config.MODE
         
         Returns:
             Signal dict or None
         """
-# Reset daily counters if needed
+        
+        # ✅ Use provided mode or default
+        if mode is None:
+            mode = config.MODE
+        
+        # ✅ Get mode-specific configuration
+        mode_config = config.MODE_CONFIG[mode]
+        min_score = mode_config.get('min_score', config.MIN_SIGNAL_SCORE)
+        min_adx = mode_config.get('min_adx', config.MIN_ADX_STRENGTH)
+
+        # Reset daily counters if needed
         self._reset_daily_counters()
 
         # ⚠️ NEWS GUARD CHECK - PRIORITY #1
         is_blocked, reason = news_guard.is_blocked()
         if is_blocked:
-            print(f"🚫 NEWS GUARD ACTIVE: {reason}")
             return None
 
-        # Check daily limit
+        # Check daily limit (global)
         if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             return None
+        
+        # ✅ Check per-mode limit
+        max_per_mode = config.MAX_SIGNALS_PER_DAY // len(config.ACTIVE_MODES)
+        if self.mode_signal_count[mode] >= max_per_mode:
+            return None
 
-        # Check cooldown
-        if not self._check_cooldown(pair):
+        # ✅ Check cooldown (per pair per mode)
+        if not self._check_cooldown(pair, mode):
             return None
 
         # Check if enough data
@@ -216,7 +233,6 @@ class SignalGenerator:
             candles = candles.dropna()
 
             if len(candles) < 50:
-                print(f"⚠️ Not enough clean data for {pair}")
                 return None
 
             # Calculate all indicators
@@ -225,8 +241,8 @@ class SignalGenerator:
             low = candles['low']
             volume = candles['volume']
 
-            ema_fast = Indicators.ema(close, self.mode_config['ema_fast'])
-            ema_slow = Indicators.ema(close, self.mode_config['ema_slow'])
+            ema_fast = Indicators.ema(close, mode_config['ema_fast'])
+            ema_slow = Indicators.ema(close, mode_config['ema_slow'])
             macd_line, signal_line, histogram = Indicators.macd(close)
             rsi = Indicators.rsi(close)
             adx, plus_di, minus_di = Indicators.adx(high, low, close)
@@ -246,7 +262,6 @@ class SignalGenerator:
 
             # Check if we have enough data after cleaning
             if len(rsi) < 2 or len(adx) < 2 or len(atr) < 2:
-                print(f"⚠️ Insufficient indicator data for {pair}")
                 return None
 
             # Current values with NaN check
@@ -260,7 +275,6 @@ class SignalGenerator:
 
             # Validate values
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
-                print(f"⚠️ NaN values in indicators for {pair}")
                 return None
 
             # Get ticker for spread check
@@ -279,7 +293,6 @@ class SignalGenerator:
 
             # If 3+ traps triggered, skip (too risky)
             if trapped_count >= 3:
-                print(f"⚠️ {pair} - Too many traps ({trapped_count}): {', '.join(trap_reasons)}")
                 return None
 
             # Determine trend direction
@@ -293,43 +306,32 @@ class SignalGenerator:
                   minus_di.iloc[-1] > plus_di.iloc[-1]):
                 trend = "SHORT"
             else:
-                print(f"❌ {pair} BLOCKED: No clear trend")
-                print(f"   EMA Fast: {ema_fast.iloc[-1]:.2f}, EMA Slow: {ema_slow.iloc[-1]:.2f}")
-                print(f"   MACD Line: {macd_line.iloc[-1]:.4f}, Signal: {signal_line.iloc[-1]:.4f}")
                 return None
 
-            # RSI filter
-            if trend == "LONG" and current_rsi > 70:
-                print(f"❌ {pair} BLOCKED: RSI too high ({current_rsi}) - Overbought")
+            # ✅ RSI filter with relaxed thresholds
+            if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
                 return None
-            if trend == "SHORT" and current_rsi < 30:
-                print(f"❌ {pair} BLOCKED: RSI too low ({current_rsi}) - Oversold")
+            if trend == "SHORT" and current_rsi < config.RSI_OVERSOLD:
                 return None
 
-            # ADX filter (minimum trend strength)
-            if current_adx < config.MIN_ADX_STRENGTH:
-                print(f"❌ {pair} BLOCKED: ADX too weak ({current_adx:.1f}) - Need {config.MIN_ADX_STRENGTH}+")
+            # ✅ ADX filter (use mode-specific threshold)
+            if current_adx < min_adx:
                 return None
 
-            # ✅ CALCULATE LEVELS EARLY
-            levels = self._calculate_entry_sl_tp(trend, current_price, current_atr)
+            # ✅ Calculate levels with mode-specific config
+            levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
 
-            # ✅ IMPROVED LIQUIDATION CHECK (1.5% minimum)
+            # ✅ Liquidation check
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
-            
+
             if not is_safe:
-                print(f"❌ {pair} BLOCKED: SL too tight ({sl_distance_pct:.1f}% away, need 1.5%+)")
                 return None
 
             # If 1-2 traps, ask ChatGPT
             if trapped_count > 0:
-                print(f"⚠️ {pair} - {trapped_count} trap(s) detected: {', '.join(trap_reasons)}")
-
                 chatgpt_approved = False
 
                 try:
-                    print(f"🤖 Asking ChatGPT for final decision...")
-
                     from chatgpt_advisor import ChatGPTAdvisor
                     advisor = ChatGPTAdvisor()
 
@@ -347,20 +349,15 @@ class SignalGenerator:
                     decision = advisor.validate_signal_with_traps(signal_preview)
 
                     if not decision.get('approved', False):
-                        print(f"❌ ChatGPT BLOCKED: {decision.get('reason', 'High risk')}")
                         return None
                     else:
-                        print(f"✅ ChatGPT APPROVED: {decision.get('reason', 'Acceptable risk')}")
                         chatgpt_approved = True
 
                 except Exception as e:
-                    print(f"⚠️ ChatGPT error: {str(e)[:100]}")
                     # Fallback: Auto-approve 1-2 traps if ChatGPT fails
                     if trapped_count <= 2:
-                        print(f"✅ Fallback activated: Auto-approved {trapped_count} trap(s)")
                         chatgpt_approved = True
                     else:
-                        print(f"❌ Too many traps ({trapped_count}) + ChatGPT unavailable = BLOCK")
                         return None
 
                 if not chatgpt_approved:
@@ -394,22 +391,17 @@ class SignalGenerator:
 
             score = self._calculate_signal_score(indicators_data, mtf_trend)
 
-            # Use dynamic minimum score based on mode
-            min_score = config.get_min_score() if hasattr(config, 'get_min_score') else 50
+            # ✅ Use mode-specific minimum score
             if score < min_score:
-                print(f"❌ {pair} BLOCKED: Score too low ({score}) - Need {min_score}+")
-                print(f"   RSI: {current_rsi:.1f}, ADX: {current_adx:.1f}, MTF: {mtf_trend}")
                 return None
 
             # ✅ SUCCESS! Generate signal
-            print(f"✅ {pair} SIGNAL APPROVED!")
+            print(f"✅ {mode} MODE: {pair} SIGNAL APPROVED!")
             print(f"   Direction: {trend}")
             print(f"   Score: {score}/100")
             print(f"   Entry: ₹{levels['entry']:,.2f}")
             print(f"   SL: ₹{levels['sl']:,.2f} ({sl_distance_pct:.1f}% away)")
             print(f"   RSI: {current_rsi:.1f}, ADX: {current_adx:.1f}")
-            if trapped_count > 0:
-                print(f"   ⚠️ Had {trapped_count} trap(s) but ChatGPT approved!")
 
             # Build signal
             signal = {
@@ -419,28 +411,30 @@ class SignalGenerator:
                 'sl': levels['sl'],
                 'tp1': levels['tp1'],
                 'tp2': levels['tp2'],
-                'leverage': self.mode_config['leverage'],
+                'leverage': mode_config['leverage'],
                 'score': score,
                 'rsi': round(current_rsi, 1),
                 'adx': round(current_adx, 1),
                 'mtf_trend': mtf_trend,
-                'mode': config.MODE,
+                'mode': mode,  # ✅ Added
+                'timeframe': mode_config['timeframe'],  # ✅ Added
                 'volume_surge': round(current_volume_surge, 2),
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
 
-            # ✅ LOG PERFORMANCE (before updating counters)
+            # ✅ LOG PERFORMANCE
             self._log_signal_performance(signal)
 
-            # Update counters
+            # ✅ Update counters (global + per-mode)
             self.signal_count += 1
+            self.mode_signal_count[mode] += 1
             self.signals_today.append(signal)
-            self.last_signal_time[pair] = datetime.now()
+            self.last_signal_time[f"{pair}_{mode}"] = datetime.now()
 
             return signal
 
         except Exception as e:
-            print(f"❌ Error in analysis for {pair}: {e}")
+            print(f"❌ Error in {mode} analysis for {pair}: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -450,6 +444,7 @@ class SignalGenerator:
         return {
             'signals_today': self.signal_count,
             'signals_remaining': config.MAX_SIGNALS_PER_DAY - self.signal_count,
-            'mode': config.MODE,
+            'mode_breakdown': self.mode_signal_count,
+            'mode': 'MULTI' if config.MULTI_MODE_ENABLED else config.MODE,
             'last_reset': self.last_reset_date.strftime('%Y-%m-%d')
         }
