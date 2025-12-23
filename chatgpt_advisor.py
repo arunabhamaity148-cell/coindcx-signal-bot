@@ -20,6 +20,8 @@ class ChatGPTAdvisor:
     
     OUTPUT: Strict JSON only
     {"approved": true/false}
+    
+    ✅ NEW: Rejection reason logging (inferred from signal data)
     """
 
     def __init__(self):
@@ -88,6 +90,121 @@ class ChatGPTAdvisor:
         except Exception as e:
             print(f"⚠️ ChatGPT response validation error: {e}")
             return False
+
+
+    def _infer_rejection_reasons(self, signal: Dict) -> List[str]:
+        """
+        Infer likely rejection reasons based on signal data.
+        This is LOCAL analysis for logging only.
+        Does NOT affect ChatGPT decision.
+        
+        Returns:
+            List of rejection reason strings
+        """
+        reasons = []
+        
+        # Extract signal data
+        direction = signal.get("direction", "UNKNOWN")
+        rsi = float(signal.get("rsi", 50))
+        adx = float(signal.get("adx", 20))
+        volume_surge = float(signal.get("volume_surge", 1.0))
+        entry = float(signal.get("entry", 0))
+        sl = float(signal.get("sl", 0))
+        tp1 = float(signal.get("tp1", 0))
+        
+        # Calculate metrics
+        sl_distance = abs(entry - sl) / entry * 100 if entry > 0 else 0
+        tp1_distance = abs(tp1 - entry) / entry * 100 if entry > 0 else 0
+        rr_ratio = tp1_distance / sl_distance if sl_distance > 0 else 0
+        
+        # ================================
+        # REJECTION REASON INFERENCE
+        # ================================
+        
+        # 1. LOW VOLUME
+        if volume_surge < 1.2:
+            reasons.append("LOW_VOLUME")
+        
+        # 2. LATE ENTRY (exhausted momentum)
+        if direction == "LONG" and rsi > 65 and adx > 40:
+            reasons.append("LATE_ENTRY")
+        elif direction == "SHORT" and rsi < 35 and adx > 40:
+            reasons.append("LATE_ENTRY")
+        
+        # 3. EXHAUSTED RSI
+        if rsi > 70 or rsi < 30:
+            reasons.append("EXHAUSTED_RSI")
+        
+        # 4. POOR RISK/REWARD
+        if rr_ratio < 1.5:
+            reasons.append("POOR_RR")
+        
+        # 5. ADX TOO HIGH WITH EXTREME RSI (overbought/oversold in strong trend)
+        if adx > 45 and (rsi > 70 or rsi < 30):
+            reasons.append("ADX_TOO_HIGH_WITH_EXTREME_RSI")
+        
+        # 6. SL TOO CLOSE
+        if sl_distance < 1.0:
+            reasons.append("SL_TOO_CLOSE")
+        
+        # 7. CHASING PRICE (high RSI with low volume)
+        if direction == "LONG" and rsi > 60 and volume_surge < 1.3:
+            reasons.append("CHASING_PRICE")
+        elif direction == "SHORT" and rsi < 40 and volume_surge < 1.3:
+            reasons.append("CHASING_PRICE")
+        
+        # 8. WEAK TREND (low ADX with extreme RSI)
+        if adx < 25 and (rsi > 65 or rsi < 35):
+            reasons.append("WEAK_TREND")
+        
+        # 9. NO PULLBACK CONFIRMATION (momentum continuation without rest)
+        if direction == "LONG" and rsi > 62 and adx > 35:
+            reasons.append("NO_PULLBACK")
+        elif direction == "SHORT" and rsi < 38 and adx > 35:
+            reasons.append("NO_PULLBACK")
+        
+        return reasons
+
+
+    def _log_rejection(self, signal: Dict, reasons: List[str]):
+        """
+        Print detailed rejection log.
+        This is for debugging/analysis only.
+        """
+        pair = signal.get("pair", "UNKNOWN")
+        direction = signal.get("direction", "UNKNOWN")
+        rsi = signal.get("rsi", 0)
+        adx = signal.get("adx", 0)
+        volume_surge = signal.get("volume_surge", 0)
+        entry = signal.get("entry", 0)
+        sl = signal.get("sl", 0)
+        tp1 = signal.get("tp1", 0)
+        
+        sl_distance = abs(entry - sl) / entry * 100 if entry > 0 else 0
+        tp1_distance = abs(tp1 - entry) / entry * 100 if entry > 0 else 0
+        rr_ratio = tp1_distance / sl_distance if sl_distance > 0 else 0
+        
+        print(f"\n{'='*70}")
+        print(f"🚫 SIGNAL REJECTED BY CHATGPT")
+        print(f"{'='*70}")
+        print(f"Pair: {pair}")
+        print(f"Direction: {direction}")
+        print(f"Entry: {entry}")
+        print(f"SL: {sl} (Distance: {sl_distance:.2f}%)")
+        print(f"TP1: {tp1} (R/R: {rr_ratio:.2f})")
+        print(f"\nIndicators:")
+        print(f"  RSI: {rsi}")
+        print(f"  ADX: {adx}")
+        print(f"  Volume Surge: {volume_surge}x")
+        print(f"\n🔍 Inferred Rejection Reasons:")
+        
+        if reasons:
+            for reason in reasons:
+                print(f"  ❌ {reason}")
+        else:
+            print(f"  ⚠️  No specific reasons detected (general quality issue)")
+        
+        print(f"{'='*70}\n")
 
 
     def final_trade_decision(self, signal: Dict, candles_data: Dict = None) -> bool:
@@ -174,6 +291,9 @@ RESPOND WITH STRICT JSON ONLY (no explanation):
         # If ChatGPT failed/timeout → REJECT (safety first)
         if response is None:
             print(f"❌ {pair} REJECTED: ChatGPT timeout/error (safety protocol)")
+            # Infer and log reasons even for timeout
+            reasons = ["CHATGPT_TIMEOUT_ERROR"]
+            self._log_rejection(signal, reasons)
             return False
         
         # Parse decision
@@ -183,6 +303,12 @@ RESPOND WITH STRICT JSON ONLY (no explanation):
             print(f"✅ {pair} APPROVED by ChatGPT - Signal will be sent")
         else:
             print(f"❌ {pair} REJECTED by ChatGPT - Signal silently dropped")
+            
+            # ================================
+            # 🔍 INFER AND LOG REJECTION REASONS
+            # ================================
+            reasons = self._infer_rejection_reasons(signal)
+            self._log_rejection(signal, reasons)
         
         return approved
 
