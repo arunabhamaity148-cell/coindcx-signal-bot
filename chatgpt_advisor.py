@@ -6,15 +6,31 @@ import time
 
 class ChatGPTAdvisor:
     """
-    CHATGPT AS FINAL TRADE JUDGE
-    -----------------------------
-    Every signal MUST pass ChatGPT validation before sending.
-    ChatGPT acts as an experienced discretionary trader.
+    CHATGPT AS QUALITY ADVISOR (NOT FINAL JUDGE)
+    ---------------------------------------------
+    ChatGPT provides quality assessment, but uses intelligent filtering:
+    
+    APPROVAL RULES:
+    1. Score >= 75: Auto-approve (unless HARD reject)
+    2. Score >= 65 + <= 2 soft reasons: Approve
+    3. HARD rejection reasons always block
+    
+    HARD REJECTION REASONS (Non-negotiable):
+    - RR < 1.5
+    - SL < 0.8%
+    - Extreme RSI (>75 or <25) + High ADX (>45)
+    - ChatGPT timeout/error
+    
+    SOFT REJECTION REASONS (Advisory only):
+    - Moderate RSI levels
+    - Low volume
+    - Late entry warnings
+    - Weak trend structure
+    
+    GOAL: 8-12 quality signals/day (profitable, not perfect)
     
     OUTPUT: Strict JSON only
     {"approved": true/false}
-    
-    ✅ EXACT REJECTION REASON LOGGING (Deterministic)
     """
 
     def __init__(self):
@@ -83,14 +99,15 @@ class ChatGPTAdvisor:
             return False
 
 
-    def _infer_exact_rejection_reasons(self, signal: Dict) -> List[Tuple[str, str]]:
+    def _classify_rejection_reasons(self, signal: Dict) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
         """
-        Infer EXACT rejection reasons with deterministic rules.
+        Classify rejection reasons into HARD and SOFT.
         
         Returns:
-            List of (reason_code, detail_message) tuples
+            (hard_reasons, soft_reasons)
         """
-        reasons = []
+        hard_reasons = []
+        soft_reasons = []
         
         # Extract signal data
         direction = signal.get("direction", "UNKNOWN")
@@ -107,154 +124,166 @@ class ChatGPTAdvisor:
         rr_ratio = tp1_distance / sl_distance if sl_distance > 0 else 0
         
         # ================================
-        # DETERMINISTIC REJECTION RULES
+        # HARD REJECTION REASONS (Non-negotiable)
         # ================================
         
-        # RULE 1: RSI EXTREME ZONES
-        if rsi >= 75:
-            reasons.append((
-                "RSI_OVERBOUGHT",
-                f"RSI={rsi:.1f} >= 75 (extreme overbought)"
-            ))
-        elif rsi <= 25:
-            reasons.append((
-                "RSI_OVERSOLD",
-                f"RSI={rsi:.1f} <= 25 (extreme oversold)"
+        # HARD 1: Poor Risk/Reward
+        if rr_ratio < 1.5:
+            hard_reasons.append((
+                "HARD_POOR_RR",
+                f"Risk/Reward={rr_ratio:.2f} < 1.5 (unacceptable risk profile)"
             ))
         
-        # RULE 2: RSI OVERBOUGHT/OVERSOLD (moderate)
-        elif rsi >= 70:
-            reasons.append((
-                "RSI_OVERBOUGHT",
-                f"RSI={rsi:.1f} >= 70 (overbought zone)"
-            ))
-        elif rsi <= 30:
-            reasons.append((
-                "RSI_OVERSOLD",
-                f"RSI={rsi:.1f} <= 30 (oversold zone)"
+        # HARD 2: SL Too Tight
+        if sl_distance < 0.8:
+            hard_reasons.append((
+                "HARD_SL_TOO_TIGHT",
+                f"SL distance={sl_distance:.2f}% < 0.8% (extreme whipsaw risk)"
             ))
         
-        # RULE 3: EXHAUSTED TREND (high ADX + extreme RSI)
+        # HARD 3: Extreme RSI + High ADX (true exhaustion)
         if adx >= 45:
-            if direction == "LONG" and rsi >= 65:
-                reasons.append((
-                    "EXHAUSTED_TREND",
-                    f"LONG with ADX={adx:.1f} + RSI={rsi:.1f} (uptrend exhaustion)"
+            if rsi >= 75:
+                hard_reasons.append((
+                    "HARD_EXHAUSTED_TREND",
+                    f"RSI={rsi:.1f} >= 75 with ADX={adx:.1f} (severe overbought exhaustion)"
                 ))
-            elif direction == "SHORT" and rsi <= 35:
-                reasons.append((
-                    "EXHAUSTED_TREND",
-                    f"SHORT with ADX={adx:.1f} + RSI={rsi:.1f} (downtrend exhaustion)"
-                ))
-        
-        # RULE 4: LATE ENTRY (moderate ADX + unfavorable RSI)
-        if adx >= 40:
-            if direction == "LONG" and rsi >= 68:
-                reasons.append((
-                    "LATE_ENTRY",
-                    f"LONG entry at RSI={rsi:.1f} with ADX={adx:.1f} (momentum exhausted)"
-                ))
-            elif direction == "SHORT" and rsi <= 32:
-                reasons.append((
-                    "LATE_ENTRY",
-                    f"SHORT entry at RSI={rsi:.1f} with ADX={adx:.1f} (momentum exhausted)"
+            elif rsi <= 25:
+                hard_reasons.append((
+                    "HARD_EXHAUSTED_TREND",
+                    f"RSI={rsi:.1f} <= 25 with ADX={adx:.1f} (severe oversold exhaustion)"
                 ))
         
-        # RULE 5: LOW VOLUME
+        # ================================
+        # SOFT REJECTION REASONS (Advisory)
+        # ================================
+        
+        # SOFT 1: Moderate RSI Extremes
+        if 70 <= rsi < 75:
+            soft_reasons.append((
+                "SOFT_RSI_OVERBOUGHT",
+                f"RSI={rsi:.1f} in 70-75 range (moderate overbought)"
+            ))
+        elif 25 < rsi <= 30:
+            soft_reasons.append((
+                "SOFT_RSI_OVERSOLD",
+                f"RSI={rsi:.1f} in 25-30 range (moderate oversold)"
+            ))
+        
+        # SOFT 2: Low Volume
         if volume_surge < 1.2:
-            reasons.append((
-                "LOW_VOLUME",
+            soft_reasons.append((
+                "SOFT_LOW_VOLUME",
                 f"Volume surge={volume_surge:.2f}x < 1.2x (weak confirmation)"
             ))
-        elif volume_surge < 1.5:
-            # Moderate volume with unfavorable conditions
-            if (direction == "LONG" and rsi >= 62) or (direction == "SHORT" and rsi <= 38):
-                reasons.append((
-                    "LOW_VOLUME",
-                    f"Volume surge={volume_surge:.2f}x < 1.5x with RSI={rsi:.1f} (insufficient momentum)"
+        elif volume_surge < 1.5 and ((direction == "LONG" and rsi >= 60) or (direction == "SHORT" and rsi <= 40)):
+            soft_reasons.append((
+                "SOFT_LOW_VOLUME",
+                f"Volume surge={volume_surge:.2f}x < 1.5x with unfavorable RSI={rsi:.1f}"
+            ))
+        
+        # SOFT 3: Late Entry (moderate ADX)
+        if 40 <= adx < 45:
+            if direction == "LONG" and rsi >= 65:
+                soft_reasons.append((
+                    "SOFT_LATE_ENTRY",
+                    f"LONG at RSI={rsi:.1f} with ADX={adx:.1f} (late in uptrend)"
+                ))
+            elif direction == "SHORT" and rsi <= 35:
+                soft_reasons.append((
+                    "SOFT_LATE_ENTRY",
+                    f"SHORT at RSI={rsi:.1f} with ADX={adx:.1f} (late in downtrend)"
                 ))
         
-        # RULE 6: POOR RISK/REWARD
-        if rr_ratio < 1.5:
-            reasons.append((
-                "POOR_RR",
-                f"Risk/Reward={rr_ratio:.2f} < 1.5 (unfavorable risk profile)"
-            ))
-        elif rr_ratio < 2.0:
-            # Marginal R/R with weak setup
-            if adx < 30 or volume_surge < 1.3:
-                reasons.append((
-                    "POOR_RR",
-                    f"Risk/Reward={rr_ratio:.2f} < 2.0 with weak setup (ADX={adx:.1f}, Volume={volume_surge:.2f}x)"
-                ))
-        
-        # RULE 7: SL TOO TIGHT
-        if sl_distance < 0.8:
-            reasons.append((
-                "SL_TOO_TIGHT",
-                f"SL distance={sl_distance:.2f}% < 0.8% (high whipsaw risk)"
-            ))
-        elif sl_distance < 1.0:
-            reasons.append((
-                "SL_TOO_TIGHT",
-                f"SL distance={sl_distance:.2f}% < 1.0% (tight stop)"
-            ))
-        
-        # RULE 8: CHASING PRICE (no pullback)
-        if direction == "LONG" and rsi >= 62 and adx >= 35 and volume_surge < 1.5:
-            reasons.append((
-                "CHASING_PRICE",
-                f"LONG at RSI={rsi:.1f} without pullback (ADX={adx:.1f}, Volume={volume_surge:.2f}x)"
-            ))
-        elif direction == "SHORT" and rsi <= 38 and adx >= 35 and volume_surge < 1.5:
-            reasons.append((
-                "CHASING_PRICE",
-                f"SHORT at RSI={rsi:.1f} without pullback (ADX={adx:.1f}, Volume={volume_surge:.2f}x)"
-            ))
-        
-        # RULE 9: WEAK TREND STRUCTURE (low ADX + unfavorable RSI)
+        # SOFT 4: Weak Trend Structure
         if adx < 25:
             if rsi >= 65 or rsi <= 35:
-                reasons.append((
-                    "WEAK_TREND",
-                    f"ADX={adx:.1f} < 25 with RSI={rsi:.1f} (no clear trend)"
+                soft_reasons.append((
+                    "SOFT_WEAK_TREND",
+                    f"ADX={adx:.1f} < 25 with RSI={rsi:.1f} (weak trend structure)"
                 ))
         
-        # RULE 10: OVEREXTENDED MOMENTUM (ADX very high)
-        if adx >= 55:
-            reasons.append((
-                "OVEREXTENDED_MOMENTUM",
-                f"ADX={adx:.1f} >= 55 (trend likely near exhaustion)"
+        # SOFT 5: Marginal RR with weak setup
+        if 1.5 <= rr_ratio < 2.0:
+            if adx < 28 or volume_surge < 1.3:
+                soft_reasons.append((
+                    "SOFT_MARGINAL_RR",
+                    f"R/R={rr_ratio:.2f} marginal with weak setup (ADX={adx:.1f}, Vol={volume_surge:.2f}x)"
+                ))
+        
+        # SOFT 6: SL Tight (but acceptable)
+        if 0.8 <= sl_distance < 1.0:
+            soft_reasons.append((
+                "SOFT_SL_TIGHT",
+                f"SL distance={sl_distance:.2f}% tight but acceptable"
             ))
         
-        # RULE 11: RSI DIVERGENCE FROM TREND
-        if direction == "LONG" and rsi < 45 and adx >= 30:
-            reasons.append((
-                "RSI_DIVERGENCE",
-                f"LONG signal but RSI={rsi:.1f} < 45 (bearish divergence risk)"
+        # SOFT 7: Chasing Price
+        if direction == "LONG" and rsi >= 62 and adx >= 32 and volume_surge < 1.5:
+            soft_reasons.append((
+                "SOFT_CHASING_PRICE",
+                f"LONG at RSI={rsi:.1f} without strong pullback confirmation"
             ))
-        elif direction == "SHORT" and rsi > 55 and adx >= 30:
-            reasons.append((
-                "RSI_DIVERGENCE",
-                f"SHORT signal but RSI={rsi:.1f} > 55 (bullish divergence risk)"
-            ))
-        
-        # If no specific reasons found, it's a discretionary rejection
-        if not reasons:
-            reasons.append((
-                "DISCRETIONARY_REJECT",
-                f"No specific technical violation (ChatGPT quality filter)"
+        elif direction == "SHORT" and rsi <= 38 and adx >= 32 and volume_surge < 1.5:
+            soft_reasons.append((
+                "SOFT_CHASING_PRICE",
+                f"SHORT at RSI={rsi:.1f} without strong pullback confirmation"
             ))
         
-        return reasons
+        # SOFT 8: Overextended Momentum
+        if adx >= 52:
+            soft_reasons.append((
+                "SOFT_OVEREXTENDED",
+                f"ADX={adx:.1f} >= 52 (trend may be near exhaustion)"
+            ))
+        
+        return hard_reasons, soft_reasons
 
 
-    def _log_rejection(self, signal: Dict, reasons: List[Tuple[str, str]]):
+    def _apply_intelligent_filtering(self, signal: Dict, hard_reasons: List, soft_reasons: List, chatgpt_approved: bool) -> Tuple[bool, str]:
         """
-        Print exact rejection log with deterministic reasons.
+        Apply intelligent filtering rules.
+        
+        Returns:
+            (final_approved, approval_reason)
+        """
+        score = int(signal.get("score", 0))
+        
+        # RULE 1: HARD rejections always block
+        if hard_reasons:
+            return False, f"HARD_REJECT ({len(hard_reasons)} critical issues)"
+        
+        # RULE 2: Score >= 75 - Auto-approve (high quality)
+        if score >= 75:
+            return True, f"AUTO_APPROVED (Score={score} >= 75, high quality)"
+        
+        # RULE 3: Score >= 65 with <= 2 soft reasons - Approve
+        if score >= 65 and len(soft_reasons) <= 2:
+            return True, f"APPROVED (Score={score} >= 65, {len(soft_reasons)} minor issues acceptable)"
+        
+        # RULE 4: ChatGPT approved + Score >= 60 + <= 3 soft reasons
+        if chatgpt_approved and score >= 60 and len(soft_reasons) <= 3:
+            return True, f"CHATGPT_APPROVED (Score={score}, {len(soft_reasons)} minor issues)"
+        
+        # RULE 5: Excellent fundamentals (low soft reasons) despite lower score
+        if score >= 55 and len(soft_reasons) <= 1:
+            return True, f"APPROVED (Score={score}, minimal issues: {len(soft_reasons)})"
+        
+        # Otherwise, reject
+        rejection_summary = f"Score={score}, {len(soft_reasons)} soft issues"
+        if not chatgpt_approved:
+            rejection_summary += ", ChatGPT rejected"
+        
+        return False, f"SOFT_REJECT ({rejection_summary})"
+
+
+    def _log_decision(self, signal: Dict, approved: bool, reason: str, hard_reasons: List, soft_reasons: List):
+        """
+        Print decision log with all reasons.
         """
         pair = signal.get("pair", "UNKNOWN")
         direction = signal.get("direction", "UNKNOWN")
+        score = signal.get("score", 0)
         rsi = signal.get("rsi", 0)
         adx = signal.get("adx", 0)
         volume_surge = signal.get("volume_surge", 0)
@@ -267,12 +296,14 @@ class ChatGPTAdvisor:
         tp1_distance = abs(tp1 - entry) / entry * 100 if entry > 0 else 0
         rr_ratio = tp1_distance / sl_distance if sl_distance > 0 else 0
         
+        status_symbol = "✅" if approved else "🚫"
+        status_text = "APPROVED" if approved else "REJECTED"
+        
         print(f"\n{'='*75}")
-        print(f"🚫 SIGNAL REJECTED BY CHATGPT")
+        print(f"{status_symbol} SIGNAL {status_text}: {pair} {direction}")
         print(f"{'='*75}")
-        print(f"Pair:      {pair}")
-        print(f"Direction: {direction}")
         print(f"Mode:      {mode}")
+        print(f"Score:     {score}/100")
         print(f"Entry:     {entry:,.6f}")
         print(f"SL:        {sl:,.6f} ({sl_distance:.2f}% distance)")
         print(f"TP1:       {tp1:,.6f} (R/R: {rr_ratio:.2f})")
@@ -280,18 +311,34 @@ class ChatGPTAdvisor:
         print(f"   RSI:          {rsi:.1f}")
         print(f"   ADX:          {adx:.1f}")
         print(f"   Volume Surge: {volume_surge:.2f}x")
-        print(f"\n🔍 EXACT REJECTION REASONS:")
+        print(f"\n🎯 DECISION: {reason}")
         
-        for i, (reason_code, detail_message) in enumerate(reasons, 1):
-            print(f"   {i}. [{reason_code}]")
-            print(f"      {detail_message}")
+        if hard_reasons:
+            print(f"\n🔴 HARD REJECTION REASONS ({len(hard_reasons)}):")
+            for i, (reason_code, detail_message) in enumerate(hard_reasons, 1):
+                print(f"   {i}. [{reason_code}]")
+                print(f"      {detail_message}")
+        
+        if soft_reasons:
+            print(f"\n🟡 SOFT ADVISORY NOTES ({len(soft_reasons)}):")
+            for i, (reason_code, detail_message) in enumerate(soft_reasons, 1):
+                print(f"   {i}. [{reason_code}]")
+                print(f"      {detail_message}")
+        
+        if not hard_reasons and not soft_reasons and approved:
+            print(f"\n✨ Clean signal - no quality concerns")
         
         print(f"{'='*75}\n")
 
 
     def final_trade_decision(self, signal: Dict, candles_data: Dict = None) -> bool:
         """
-        🎯 FINAL TRADE DECISION - ChatGPT as Experienced Trader
+        🎯 QUALITY ADVISOR DECISION (Not Final Judge)
+        
+        Uses intelligent filtering:
+        - Score >= 75: Auto-approve
+        - Score >= 65 + <= 2 soft reasons: Approve
+        - HARD reasons always block
         
         Args:
             signal: Signal dictionary from rule-based system
@@ -320,7 +367,21 @@ class ChatGPTAdvisor:
         tp1_distance = abs(tp1 - entry) / entry * 100
         rr_ratio = tp1_distance / sl_distance if sl_distance > 0 else 0
         
-        # Build professional trader prompt
+        # ================================
+        # STEP 1: Classify rejection reasons
+        # ================================
+        hard_reasons, soft_reasons = self._classify_rejection_reasons(signal)
+        
+        # ================================
+        # STEP 2: Check HARD rejections first
+        # ================================
+        if hard_reasons:
+            self._log_decision(signal, False, f"HARD_REJECT ({len(hard_reasons)} critical issues)", hard_reasons, soft_reasons)
+            return False
+        
+        # ================================
+        # STEP 3: Get ChatGPT opinion
+        # ================================
         prompt = f"""You are an experienced cryptocurrency futures trader with 10+ years of experience.
 
 SIGNAL TO EVALUATE:
@@ -354,7 +415,6 @@ PREFER:
 RESPOND WITH STRICT JSON ONLY (no explanation):
 {{"approved": true}}  OR  {{"approved": false}}"""
 
-        # Build messages
         messages = [
             {
                 "role": "system",
@@ -366,32 +426,33 @@ RESPOND WITH STRICT JSON ONLY (no explanation):
             }
         ]
         
-        # Call ChatGPT with timeout protection
-        print(f"🤖 Consulting ChatGPT for {pair} {direction}...")
+        print(f"🤖 Consulting ChatGPT for {pair} {direction} (Score: {score})...")
         response = self._call_chatgpt_with_timeout(messages)
         
-        # If ChatGPT failed/timeout → REJECT (safety first)
+        # If ChatGPT failed/timeout → Continue with local decision
         if response is None:
-            print(f"❌ {pair} REJECTED: ChatGPT timeout/error (safety protocol)")
-            reasons = [("CHATGPT_TIMEOUT", "API call failed or timed out")]
-            self._log_rejection(signal, reasons)
-            return False
-        
-        # Parse decision
-        approved = self._parse_decision(response)
-        
-        if approved:
-            print(f"✅ {pair} APPROVED by ChatGPT - Signal will be sent")
+            print(f"⚠️ ChatGPT timeout - using local quality filters")
+            chatgpt_approved = False
         else:
-            print(f"❌ {pair} REJECTED by ChatGPT - Signal silently dropped")
-            
-            # ================================
-            # 🔍 INFER EXACT REJECTION REASONS
-            # ================================
-            reasons = self._infer_exact_rejection_reasons(signal)
-            self._log_rejection(signal, reasons)
+            chatgpt_approved = self._parse_decision(response)
+            if chatgpt_approved:
+                print(f"✅ ChatGPT: APPROVED")
+            else:
+                print(f"⚠️ ChatGPT: REJECTED (advisory)")
         
-        return approved
+        # ================================
+        # STEP 4: Apply intelligent filtering
+        # ================================
+        final_approved, approval_reason = self._apply_intelligent_filtering(
+            signal, hard_reasons, soft_reasons, chatgpt_approved
+        )
+        
+        # ================================
+        # STEP 5: Log decision
+        # ================================
+        self._log_decision(signal, final_approved, approval_reason, hard_reasons, soft_reasons)
+        
+        return final_approved
 
 
     def validate_signal_with_traps(self, signal: Dict) -> Dict:
@@ -403,6 +464,6 @@ RESPOND WITH STRICT JSON ONLY (no explanation):
         
         return {
             "approved": approved,
-            "reason": "ChatGPT final decision",
+            "reason": "Quality advisor decision",
             "confidence": 100 if approved else 0
         }
