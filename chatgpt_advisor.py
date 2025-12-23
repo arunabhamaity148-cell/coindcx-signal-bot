@@ -1,203 +1,201 @@
 from openai import OpenAI
-from typing import Dict, List
+from typing import Dict, List, Optional
 from config import config
+import time
 
 
 class ChatGPTAdvisor:
     """
-    ADVANCED CHATGPT VALIDATOR (FULL VERSION)
-    -----------------------------------------
-    - SL distance awareness
-    - Trap severity scoring
-    - Indicator strength scoring
-    - Strict decision parsing
-    - Multi-layer security checks
-    - No aggressive prompts
-    - No risky overrides
+    CHATGPT AS FINAL TRADE JUDGE
+    -----------------------------
+    Every signal MUST pass ChatGPT validation before sending.
+    ChatGPT acts as an experienced discretionary trader.
+    
+    REJECTION CRITERIA:
+    - Late entries (momentum exhausted)
+    - Low volume trend continuation
+    - Exhausted RSI + high ADX
+    - Poor risk/reward setup
+    - Prefer pullback/clean breakdown confirmation
+    
+    OUTPUT: Strict JSON only
+    {"approved": true/false}
     """
 
     def __init__(self):
         self.client = OpenAI(api_key=config.CHATGPT_API_KEY)
         self.model = config.CHATGPT_MODEL
+        self.timeout = 8  # 8 second timeout
+        self.max_retries = 2
 
 
-    # -----------------------------------
-    # BASIC CHATGPT CALL HANDLER
-    # -----------------------------------
-    def _call_chatgpt(self, messages: List[Dict]) -> str:
+    def _call_chatgpt_with_timeout(self, messages: List[Dict]) -> Optional[str]:
+        """
+        Call ChatGPT with timeout protection.
+        Returns None on failure (timeout/error).
+        """
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=100,  # Minimal - only need JSON
+                    temperature=0.2,  # Low temp for consistency
+                    timeout=self.timeout
+                )
+                return response.choices[0].message.content.strip()
+            
+            except Exception as e:
+                print(f"⚠️ ChatGPT attempt {attempt + 1}/{self.max_retries} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(1)  # Brief pause before retry
+                continue
+        
+        return None  # All attempts failed
+
+
+    def _parse_decision(self, response: str) -> bool:
+        """
+        Parse ChatGPT response - STRICT JSON only.
+        Returns False on any parsing error (safety first).
+        """
+        if not response:
+            return False
+        
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=350,
-                temperature=0.3
-            )
-            return response.choices[0].message.content.strip()
+            # Try to extract JSON
+            import json
+            
+            # Remove markdown code blocks if present
+            response = response.replace("```json", "").replace("```", "").strip()
+            
+            # Parse JSON
+            data = json.loads(response)
+            
+            # Validate structure
+            if "approved" not in data:
+                print("⚠️ ChatGPT response missing 'approved' field")
+                return False
+            
+            # Return boolean value
+            return bool(data["approved"])
+        
+        except json.JSONDecodeError as e:
+            print(f"⚠️ ChatGPT JSON parse error: {e}")
+            print(f"   Response: {response[:200]}")
+            return False
+        
         except Exception as e:
-            print(f"❌ ChatGPT API error: {e}")
-            return "ERROR"
+            print(f"⚠️ ChatGPT response validation error: {e}")
+            return False
 
 
-    # -----------------------------------
-    # INTERNAL SCORING SYSTEM
-    # -----------------------------------
-    def _trap_severity_score(self, traps: List[str]) -> int:
-        score = 0
-        for t in traps:
-            if "liquidity" in t:
-                score += 3
-            elif "market_maker" in t:
-                score += 4
-            elif "reversal" in t:
-                score += 5
-            else:
-                score += 2
-        return score
+    def final_trade_decision(self, signal: Dict, candles_data: Dict = None) -> bool:
+        """
+        🎯 FINAL TRADE DECISION - ChatGPT as Experienced Trader
+        
+        Args:
+            signal: Signal dictionary from rule-based system
+            candles_data: Optional recent price action data
+        
+        Returns:
+            True = APPROVED (send signal)
+            False = REJECTED (silently drop, no Telegram message)
+        """
+        
+        # Extract signal data
+        pair = signal.get("pair", "UNKNOWN")
+        direction = signal.get("direction", "UNKNOWN")
+        entry = float(signal.get("entry", 0))
+        sl = float(signal.get("sl", 0))
+        tp1 = float(signal.get("tp1", 0))
+        tp2 = float(signal.get("tp2", 0))
+        rsi = float(signal.get("rsi", 50))
+        adx = float(signal.get("adx", 20))
+        volume_surge = float(signal.get("volume_surge", 1.0))
+        score = int(signal.get("score", 0))
+        mode = signal.get("mode", "UNKNOWN")
+        
+        # Calculate metrics
+        sl_distance = abs(entry - sl) / entry * 100
+        tp1_distance = abs(tp1 - entry) / entry * 100
+        rr_ratio = tp1_distance / sl_distance if sl_distance > 0 else 0
+        
+        # Build professional trader prompt
+        prompt = f"""You are an experienced cryptocurrency futures trader with 10+ years of experience.
 
-
-    def _indicator_strength(self, rsi, adx, sl_pct):
-        score = 0
-
-        # RSI
-        if 45 <= rsi <= 55:
-            score += 20
-        elif 40 <= rsi <= 60:
-            score += 10
-        else:
-            score += 0
-
-        # ADX
-        if adx >= 35:
-            score += 20
-        elif adx >= 25:
-            score += 10
-
-        # SL distance
-        if sl_pct >= 1.5:
-            score += 20
-        elif sl_pct >= 1.0:
-            score += 10
-
-        return score
-
-
-    # -----------------------------------
-    # MAIN FUNCTION: ChatGPT Validation
-    # -----------------------------------
-    def validate_signal_with_traps(self, signal: Dict) -> Dict:
-
-        entry = float(signal["entry"])
-        sl = float(signal["sl"])
-        rsi = float(signal["rsi"])
-        adx = float(signal["adx"])
-        traps = signal["trap_reasons"]
-        trap_count = signal["trapped_count"]
-
-        sl_pct = abs(entry - sl) / entry * 100
-
-        # ---------------------------
-        # HARD RULES (Unbreakable)
-        # ---------------------------
-        if sl_pct < 1.0:
-            return {"approved": False, "reason": f"SL too close ({sl_pct:.2f}%)"}
-
-        if rsi > 75 or rsi < 25:
-            return {"approved": False, "reason": "RSI extreme zone"}
-
-        if adx < 25:
-            return {"approved": False, "reason": "ADX weak"}
-
-        # ---------------------------
-        # INTERNAL AUTO SCORING (Local check before AI)
-        # ---------------------------
-        trap_severity = self._trap_severity_score(traps)
-        indicator_score = self._indicator_strength(rsi, adx, sl_pct)
-
-        # If traps heavy + indicators weak → auto skip
-        if trap_severity >= 8 and indicator_score < 25:
-            return {"approved": False, "reason": "Trap severity high"}
-
-        # ---------------------------
-        # BUILD CHATGPT PROMPT (Safe)
-        # ---------------------------
-        prompt = f"""
-You are a **risk-first cryptocurrency futures validator**.
-
-### TRADE DETAILS
-Direction: {signal['direction']}
+SIGNAL TO EVALUATE:
+Pair: {pair}
+Direction: {direction}
 Entry: {entry}
-Stop Loss: {sl}
-SL Distance: {sl_pct:.2f}%
+Stop Loss: {sl} ({sl_distance:.2f}% away)
+Take Profit 1: {tp1} (R/R: {rr_ratio:.2f})
+Mode: {mode}
+
+INDICATORS:
 RSI: {rsi}
 ADX: {adx}
+Volume Surge: {volume_surge}x
+Rule-based Score: {score}/100
 
-### TRAPS
-Count: {trap_count}
-List: {", ".join(traps)}
+YOUR EXPERTISE - REJECT IF:
+1. Late entry (RSI > 65 for LONG, RSI < 35 for SHORT + ADX > 40)
+2. Exhausted momentum (RSI > 70 or < 30 with ADX > 45)
+3. Low volume trend continuation (volume_surge < 1.2 + RSI > 60)
+4. Poor risk/reward (R/R < 1.5 or SL distance < 1%)
+5. Chasing price (no pullback confirmation)
 
-### INTERNAL PRE-SCORES
-Trap Severity Score: {trap_severity}/15
-Indicator Strength Score: {indicator_score}/60
+PREFER:
+- Fresh breakouts with volume confirmation
+- Pullback entries in strong trends
+- Clean support/resistance breaks
+- RSI 40-60 range with rising ADX
+- Volume surge > 1.5x on entry
 
-### RULES (Important)
-1. If SL distance < 1% → ALWAYS SKIP.
-2. If RSI > 70 or < 30 → SKIP.
-3. If ADX < 25 → SKIP.
-4. 2 traps allowed ONLY IF:
-       - RSI 45–55
-       - ADX > 35
-       - SL distance > 1.2%
-5. NEVER approve a trade that increases liquidation risk.
-6. Trend confirmation > trap override.
+RESPOND WITH STRICT JSON ONLY (no explanation):
+{{"approved": true}}  OR  {{"approved": false}}"""
 
-### REQUIRED OUTPUT (Exact format)
-DECISION: TAKE or SKIP
-CONFIDENCE: (0–100)%
-REASON: One short sentence
-"""
-
+        # Build messages
         messages = [
-            {"role": "system", 
-             "content": "You ALWAYS prioritize risk. You NEVER approve unsafe trades."},
-            {"role": "user", "content": prompt}
+            {
+                "role": "system",
+                "content": "You are a strict, experienced trader. You ONLY respond with JSON format: {\"approved\": true/false}. No explanations. Reject late entries, exhausted momentum, and low-quality setups."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
         ]
+        
+        # Call ChatGPT with timeout protection
+        print(f"🤖 Consulting ChatGPT for {pair} {direction}...")
+        response = self._call_chatgpt_with_timeout(messages)
+        
+        # If ChatGPT failed/timeout → REJECT (safety first)
+        if response is None:
+            print(f"❌ {pair} REJECTED: ChatGPT timeout/error (safety protocol)")
+            return False
+        
+        # Parse decision
+        approved = self._parse_decision(response)
+        
+        if approved:
+            print(f"✅ {pair} APPROVED by ChatGPT - Signal will be sent")
+        else:
+            print(f"❌ {pair} REJECTED by ChatGPT - Signal silently dropped")
+        
+        return approved
 
-        # ---------------------------
-        # CALL CHATGPT
-        # ---------------------------
-        response = self._call_chatgpt(messages)
-        print("🤖 ChatGPT Full Response:\n", response)
 
-        if response == "ERROR":
-            return {"approved": False, "reason": "ChatGPT unavailable"}
-
-
-        # ---------------------------
-        # STRICT PARSING
-        # ---------------------------
-        try:
-            decision = response.split("DECISION:")[1].split("\n")[0].strip().upper()
-            conf_raw = response.split("CONFIDENCE:")[1].split("%")[0].strip()
-            confidence = int(''.join(filter(str.isdigit, conf_raw)))
-        except:
-            return {"approved": False, "reason": "Parsing error"}
-
-        # ---------------------------
-        # FINAL DECISION RULES
-        # ---------------------------
-        if decision != "TAKE":
-            return {"approved": False, "reason": "AI decided SKIP", "confidence": confidence}
-
-        if confidence < 70:
-            return {"approved": False, "reason": f"Low confidence ({confidence}%)"}
-
-        # Extra protection for 2 traps
-        if trap_count == 2:
-            if not (45 <= rsi <= 55 and adx > 35 and sl_pct > 1.2):
-                return {"approved": False, "reason": "2 traps but weak indicators"}
-
+    def validate_signal_with_traps(self, signal: Dict) -> Dict:
+        """
+        LEGACY FUNCTION - Now redirects to final_trade_decision()
+        Kept for backward compatibility with existing trap detection flow.
+        """
+        approved = self.final_trade_decision(signal)
+        
         return {
-            "approved": True,
-            "reason": "AI approved safely",
-            "confidence": confidence
+            "approved": approved,
+            "reason": "ChatGPT final decision",
+            "confidence": 100 if approved else 0
         }
