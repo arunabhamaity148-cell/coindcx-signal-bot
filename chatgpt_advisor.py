@@ -1,5 +1,5 @@
 from openai import OpenAI
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from config import config
 import time
 
@@ -11,23 +11,16 @@ class ChatGPTAdvisor:
     Every signal MUST pass ChatGPT validation before sending.
     ChatGPT acts as an experienced discretionary trader.
     
-    REJECTION CRITERIA:
-    - Late entries (momentum exhausted)
-    - Low volume trend continuation
-    - Exhausted RSI + high ADX
-    - Poor risk/reward setup
-    - Prefer pullback/clean breakdown confirmation
-    
     OUTPUT: Strict JSON only
     {"approved": true/false}
     
-    ✅ NEW: Rejection reason logging (inferred from signal data)
+    ✅ EXACT REJECTION REASON LOGGING (Deterministic)
     """
 
     def __init__(self):
         self.client = OpenAI(api_key=config.CHATGPT_API_KEY)
         self.model = config.CHATGPT_MODEL
-        self.timeout = 8  # 8 second timeout
+        self.timeout = 8
         self.max_retries = 2
 
 
@@ -41,8 +34,8 @@ class ChatGPTAdvisor:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    max_tokens=100,  # Minimal - only need JSON
-                    temperature=0.2,  # Low temp for consistency
+                    max_tokens=100,
+                    temperature=0.2,
                     timeout=self.timeout
                 )
                 return response.choices[0].message.content.strip()
@@ -50,10 +43,10 @@ class ChatGPTAdvisor:
             except Exception as e:
                 print(f"⚠️ ChatGPT attempt {attempt + 1}/{self.max_retries} failed: {e}")
                 if attempt < self.max_retries - 1:
-                    time.sleep(1)  # Brief pause before retry
+                    time.sleep(1)
                 continue
         
-        return None  # All attempts failed
+        return None
 
 
     def _parse_decision(self, response: str) -> bool:
@@ -65,7 +58,6 @@ class ChatGPTAdvisor:
             return False
         
         try:
-            # Try to extract JSON
             import json
             
             # Remove markdown code blocks if present
@@ -79,7 +71,6 @@ class ChatGPTAdvisor:
                 print("⚠️ ChatGPT response missing 'approved' field")
                 return False
             
-            # Return boolean value
             return bool(data["approved"])
         
         except json.JSONDecodeError as e:
@@ -92,14 +83,12 @@ class ChatGPTAdvisor:
             return False
 
 
-    def _infer_rejection_reasons(self, signal: Dict) -> List[str]:
+    def _infer_exact_rejection_reasons(self, signal: Dict) -> List[Tuple[str, str]]:
         """
-        Infer likely rejection reasons based on signal data.
-        This is LOCAL analysis for logging only.
-        Does NOT affect ChatGPT decision.
+        Infer EXACT rejection reasons with deterministic rules.
         
         Returns:
-            List of rejection reason strings
+            List of (reason_code, detail_message) tuples
         """
         reasons = []
         
@@ -118,58 +107,151 @@ class ChatGPTAdvisor:
         rr_ratio = tp1_distance / sl_distance if sl_distance > 0 else 0
         
         # ================================
-        # REJECTION REASON INFERENCE
+        # DETERMINISTIC REJECTION RULES
         # ================================
         
-        # 1. LOW VOLUME
+        # RULE 1: RSI EXTREME ZONES
+        if rsi >= 75:
+            reasons.append((
+                "RSI_OVERBOUGHT",
+                f"RSI={rsi:.1f} >= 75 (extreme overbought)"
+            ))
+        elif rsi <= 25:
+            reasons.append((
+                "RSI_OVERSOLD",
+                f"RSI={rsi:.1f} <= 25 (extreme oversold)"
+            ))
+        
+        # RULE 2: RSI OVERBOUGHT/OVERSOLD (moderate)
+        elif rsi >= 70:
+            reasons.append((
+                "RSI_OVERBOUGHT",
+                f"RSI={rsi:.1f} >= 70 (overbought zone)"
+            ))
+        elif rsi <= 30:
+            reasons.append((
+                "RSI_OVERSOLD",
+                f"RSI={rsi:.1f} <= 30 (oversold zone)"
+            ))
+        
+        # RULE 3: EXHAUSTED TREND (high ADX + extreme RSI)
+        if adx >= 45:
+            if direction == "LONG" and rsi >= 65:
+                reasons.append((
+                    "EXHAUSTED_TREND",
+                    f"LONG with ADX={adx:.1f} + RSI={rsi:.1f} (uptrend exhaustion)"
+                ))
+            elif direction == "SHORT" and rsi <= 35:
+                reasons.append((
+                    "EXHAUSTED_TREND",
+                    f"SHORT with ADX={adx:.1f} + RSI={rsi:.1f} (downtrend exhaustion)"
+                ))
+        
+        # RULE 4: LATE ENTRY (moderate ADX + unfavorable RSI)
+        if adx >= 40:
+            if direction == "LONG" and rsi >= 68:
+                reasons.append((
+                    "LATE_ENTRY",
+                    f"LONG entry at RSI={rsi:.1f} with ADX={adx:.1f} (momentum exhausted)"
+                ))
+            elif direction == "SHORT" and rsi <= 32:
+                reasons.append((
+                    "LATE_ENTRY",
+                    f"SHORT entry at RSI={rsi:.1f} with ADX={adx:.1f} (momentum exhausted)"
+                ))
+        
+        # RULE 5: LOW VOLUME
         if volume_surge < 1.2:
-            reasons.append("LOW_VOLUME")
+            reasons.append((
+                "LOW_VOLUME",
+                f"Volume surge={volume_surge:.2f}x < 1.2x (weak confirmation)"
+            ))
+        elif volume_surge < 1.5:
+            # Moderate volume with unfavorable conditions
+            if (direction == "LONG" and rsi >= 62) or (direction == "SHORT" and rsi <= 38):
+                reasons.append((
+                    "LOW_VOLUME",
+                    f"Volume surge={volume_surge:.2f}x < 1.5x with RSI={rsi:.1f} (insufficient momentum)"
+                ))
         
-        # 2. LATE ENTRY (exhausted momentum)
-        if direction == "LONG" and rsi > 65 and adx > 40:
-            reasons.append("LATE_ENTRY")
-        elif direction == "SHORT" and rsi < 35 and adx > 40:
-            reasons.append("LATE_ENTRY")
-        
-        # 3. EXHAUSTED RSI
-        if rsi > 70 or rsi < 30:
-            reasons.append("EXHAUSTED_RSI")
-        
-        # 4. POOR RISK/REWARD
+        # RULE 6: POOR RISK/REWARD
         if rr_ratio < 1.5:
-            reasons.append("POOR_RR")
+            reasons.append((
+                "POOR_RR",
+                f"Risk/Reward={rr_ratio:.2f} < 1.5 (unfavorable risk profile)"
+            ))
+        elif rr_ratio < 2.0:
+            # Marginal R/R with weak setup
+            if adx < 30 or volume_surge < 1.3:
+                reasons.append((
+                    "POOR_RR",
+                    f"Risk/Reward={rr_ratio:.2f} < 2.0 with weak setup (ADX={adx:.1f}, Volume={volume_surge:.2f}x)"
+                ))
         
-        # 5. ADX TOO HIGH WITH EXTREME RSI (overbought/oversold in strong trend)
-        if adx > 45 and (rsi > 70 or rsi < 30):
-            reasons.append("ADX_TOO_HIGH_WITH_EXTREME_RSI")
+        # RULE 7: SL TOO TIGHT
+        if sl_distance < 0.8:
+            reasons.append((
+                "SL_TOO_TIGHT",
+                f"SL distance={sl_distance:.2f}% < 0.8% (high whipsaw risk)"
+            ))
+        elif sl_distance < 1.0:
+            reasons.append((
+                "SL_TOO_TIGHT",
+                f"SL distance={sl_distance:.2f}% < 1.0% (tight stop)"
+            ))
         
-        # 6. SL TOO CLOSE
-        if sl_distance < 1.0:
-            reasons.append("SL_TOO_CLOSE")
+        # RULE 8: CHASING PRICE (no pullback)
+        if direction == "LONG" and rsi >= 62 and adx >= 35 and volume_surge < 1.5:
+            reasons.append((
+                "CHASING_PRICE",
+                f"LONG at RSI={rsi:.1f} without pullback (ADX={adx:.1f}, Volume={volume_surge:.2f}x)"
+            ))
+        elif direction == "SHORT" and rsi <= 38 and adx >= 35 and volume_surge < 1.5:
+            reasons.append((
+                "CHASING_PRICE",
+                f"SHORT at RSI={rsi:.1f} without pullback (ADX={adx:.1f}, Volume={volume_surge:.2f}x)"
+            ))
         
-        # 7. CHASING PRICE (high RSI with low volume)
-        if direction == "LONG" and rsi > 60 and volume_surge < 1.3:
-            reasons.append("CHASING_PRICE")
-        elif direction == "SHORT" and rsi < 40 and volume_surge < 1.3:
-            reasons.append("CHASING_PRICE")
+        # RULE 9: WEAK TREND STRUCTURE (low ADX + unfavorable RSI)
+        if adx < 25:
+            if rsi >= 65 or rsi <= 35:
+                reasons.append((
+                    "WEAK_TREND",
+                    f"ADX={adx:.1f} < 25 with RSI={rsi:.1f} (no clear trend)"
+                ))
         
-        # 8. WEAK TREND (low ADX with extreme RSI)
-        if adx < 25 and (rsi > 65 or rsi < 35):
-            reasons.append("WEAK_TREND")
+        # RULE 10: OVEREXTENDED MOMENTUM (ADX very high)
+        if adx >= 55:
+            reasons.append((
+                "OVEREXTENDED_MOMENTUM",
+                f"ADX={adx:.1f} >= 55 (trend likely near exhaustion)"
+            ))
         
-        # 9. NO PULLBACK CONFIRMATION (momentum continuation without rest)
-        if direction == "LONG" and rsi > 62 and adx > 35:
-            reasons.append("NO_PULLBACK")
-        elif direction == "SHORT" and rsi < 38 and adx > 35:
-            reasons.append("NO_PULLBACK")
+        # RULE 11: RSI DIVERGENCE FROM TREND
+        if direction == "LONG" and rsi < 45 and adx >= 30:
+            reasons.append((
+                "RSI_DIVERGENCE",
+                f"LONG signal but RSI={rsi:.1f} < 45 (bearish divergence risk)"
+            ))
+        elif direction == "SHORT" and rsi > 55 and adx >= 30:
+            reasons.append((
+                "RSI_DIVERGENCE",
+                f"SHORT signal but RSI={rsi:.1f} > 55 (bullish divergence risk)"
+            ))
+        
+        # If no specific reasons found, it's a discretionary rejection
+        if not reasons:
+            reasons.append((
+                "DISCRETIONARY_REJECT",
+                f"No specific technical violation (ChatGPT quality filter)"
+            ))
         
         return reasons
 
 
-    def _log_rejection(self, signal: Dict, reasons: List[str]):
+    def _log_rejection(self, signal: Dict, reasons: List[Tuple[str, str]]):
         """
-        Print detailed rejection log.
-        This is for debugging/analysis only.
+        Print exact rejection log with deterministic reasons.
         """
         pair = signal.get("pair", "UNKNOWN")
         direction = signal.get("direction", "UNKNOWN")
@@ -179,32 +261,32 @@ class ChatGPTAdvisor:
         entry = signal.get("entry", 0)
         sl = signal.get("sl", 0)
         tp1 = signal.get("tp1", 0)
+        mode = signal.get("mode", "UNKNOWN")
         
         sl_distance = abs(entry - sl) / entry * 100 if entry > 0 else 0
         tp1_distance = abs(tp1 - entry) / entry * 100 if entry > 0 else 0
         rr_ratio = tp1_distance / sl_distance if sl_distance > 0 else 0
         
-        print(f"\n{'='*70}")
+        print(f"\n{'='*75}")
         print(f"🚫 SIGNAL REJECTED BY CHATGPT")
-        print(f"{'='*70}")
-        print(f"Pair: {pair}")
+        print(f"{'='*75}")
+        print(f"Pair:      {pair}")
         print(f"Direction: {direction}")
-        print(f"Entry: {entry}")
-        print(f"SL: {sl} (Distance: {sl_distance:.2f}%)")
-        print(f"TP1: {tp1} (R/R: {rr_ratio:.2f})")
-        print(f"\nIndicators:")
-        print(f"  RSI: {rsi}")
-        print(f"  ADX: {adx}")
-        print(f"  Volume Surge: {volume_surge}x")
-        print(f"\n🔍 Inferred Rejection Reasons:")
+        print(f"Mode:      {mode}")
+        print(f"Entry:     {entry:,.6f}")
+        print(f"SL:        {sl:,.6f} ({sl_distance:.2f}% distance)")
+        print(f"TP1:       {tp1:,.6f} (R/R: {rr_ratio:.2f})")
+        print(f"\n📊 Indicators:")
+        print(f"   RSI:          {rsi:.1f}")
+        print(f"   ADX:          {adx:.1f}")
+        print(f"   Volume Surge: {volume_surge:.2f}x")
+        print(f"\n🔍 EXACT REJECTION REASONS:")
         
-        if reasons:
-            for reason in reasons:
-                print(f"  ❌ {reason}")
-        else:
-            print(f"  ⚠️  No specific reasons detected (general quality issue)")
+        for i, (reason_code, detail_message) in enumerate(reasons, 1):
+            print(f"   {i}. [{reason_code}]")
+            print(f"      {detail_message}")
         
-        print(f"{'='*70}\n")
+        print(f"{'='*75}\n")
 
 
     def final_trade_decision(self, signal: Dict, candles_data: Dict = None) -> bool:
@@ -291,8 +373,7 @@ RESPOND WITH STRICT JSON ONLY (no explanation):
         # If ChatGPT failed/timeout → REJECT (safety first)
         if response is None:
             print(f"❌ {pair} REJECTED: ChatGPT timeout/error (safety protocol)")
-            # Infer and log reasons even for timeout
-            reasons = ["CHATGPT_TIMEOUT_ERROR"]
+            reasons = [("CHATGPT_TIMEOUT", "API call failed or timed out")]
             self._log_rejection(signal, reasons)
             return False
         
@@ -305,9 +386,9 @@ RESPOND WITH STRICT JSON ONLY (no explanation):
             print(f"❌ {pair} REJECTED by ChatGPT - Signal silently dropped")
             
             # ================================
-            # 🔍 INFER AND LOG REJECTION REASONS
+            # 🔍 INFER EXACT REJECTION REASONS
             # ================================
-            reasons = self._infer_rejection_reasons(signal)
+            reasons = self._infer_exact_rejection_reasons(signal)
             self._log_rejection(signal, reasons)
         
         return approved
