@@ -478,5 +478,6 @@ class ChatGPTAdvisor:
             quality_analysis = self.calculate_advanced_quality_score(signal, candles)
             
             # Safe fallback if analysis fails
-            if not quality_analysis or 'total_score' not in quality_analysis:
-                print("⚠ ChatGPT error")
+if not quality_analysis or 'total_score' not in quality_analysis:
+    print("⚠ ChatGPT error - auto approving")
+    return True
