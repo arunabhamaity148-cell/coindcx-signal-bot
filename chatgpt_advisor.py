@@ -479,4 +479,4 @@ class ChatGPTAdvisor:
             
             # Safe fallback if analysis fails
             if not quality_analysis or 'total_score' not in quality_analysis:
-                print("⚠
+                print("⚠ ChatGPT error")
