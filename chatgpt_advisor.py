@@ -166,8 +166,7 @@ class ChatGPTAdvisor:
             from datetime import datetime
             now = datetime.now()
             hour = now.hour
-
-            if 18 <= hour < 22:
+if 18 <= hour < 22:
                 return {"score": 100, "status": "NY_SESSION", "liquidity": "VERY_HIGH"}
             elif 13 <= hour < 18:
                 return {"score": 90, "status": "LONDON_SESSION", "liquidity": "HIGH"}
@@ -477,8 +476,28 @@ class ChatGPTAdvisor:
             # Run advanced quality analysis
             quality_analysis = self.calculate_advanced_quality_score(signal, candles)
             
-            if not quality_analysis:
-                print("⚠️ Quality analysis failed - auto-approving")
+            # Safe fallback if analysis fails
+            if not quality_analysis or 'total_score' not in quality_analysis:
+                print("⚠️ Quality analysis incomplete - auto-approving")
                 return True
             
- 
+            total_score = quality_analysis.get('total_score', 70)
+            
+            # Lenient threshold for discretionary trading
+            MIN_QUALITY_SCORE = 60
+            
+            if total_score >= MIN_QUALITY_SCORE:
+                print(f"✅ APPROVED - Quality score: {total_score}/100 (threshold: {MIN_QUALITY_SCORE})")
+                print(f"{'='*70}\n")
+                return True
+            else:
+                print(f"❌ REJECTED - Quality score: {total_score}/100 (threshold: {MIN_QUALITY_SCORE})")
+                print(f"{'='*70}\n")
+                return False
+                
+        except Exception as e:
+            # CRITICAL: Never block trades on error
+            print(f"⚠️ ChatGPT decision error: {e} - auto-approving for safety")
+            import traceback
+            traceback.print_exc()
+            return True
