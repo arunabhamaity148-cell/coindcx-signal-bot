@@ -56,11 +56,19 @@ class SignalGenerator:
 
 
     def _check_cooldown(self, pair: str, mode: str) -> bool:
-        """Check if pair is in cooldown period (per mode)"""
+        """
+        Check if pair is in cooldown period (per mode).
+        Cooldown = 30 minutes per (PAIR + MODE).
+        Prevents same-pair signal spam.
+        """
         key = f"{pair}_{mode}"
         if key in self.last_signal_time:
             time_since_last = datetime.now() - self.last_signal_time[key]
-            if time_since_last < timedelta(minutes=config.COOLDOWN_MINUTES):
+            cooldown_duration = timedelta(minutes=config.SAME_PAIR_COOLDOWN_MINUTES)
+            if time_since_last < cooldown_duration:
+                remaining = cooldown_duration - time_since_last
+                remaining_mins = int(remaining.total_seconds() / 60)
+                print(f"⏸️  {pair} ({mode}) in cooldown - {remaining_mins}m remaining")
                 return False
         return True
 
@@ -288,6 +296,7 @@ class SignalGenerator:
         if self.mode_signal_count[mode] >= max_per_mode:
             return None
 
+        # ⏸️ SAME-PAIR COOLDOWN CHECK (before any processing)
         if not self._check_cooldown(pair, mode):
             return None
 
@@ -476,7 +485,11 @@ class SignalGenerator:
             self.signal_count += 1
             self.mode_signal_count[mode] += 1
             self.signals_today.append(signal)
-            self.last_signal_time[f"{pair}_{mode}"] = datetime.now()
+            
+            # ⏸️ UPDATE COOLDOWN TIMESTAMP (only when signal is actually sent)
+            cooldown_key = f"{pair}_{mode}"
+            self.last_signal_time[cooldown_key] = datetime.now()
+            print(f"⏱️  Cooldown started: {pair} ({mode}) - next signal after 30 minutes")
 
             return signal
 
