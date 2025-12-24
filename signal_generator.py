@@ -12,19 +12,19 @@ from chatgpt_advisor import ChatGPTAdvisor
 
 class SignalGenerator:
     """
-    Multi-Mode Signal Generator with ChatGPT Final Judge
+    Multi-Mode Signal Generator with ChatGPT Final Judge + Advanced Filters
     
     ARCHITECTURE:
     1. Rule-based system filters market (QUICK/MID/TREND modes)
-    2. ChatGPT acts as FINAL JUDGE for every signal
-    3. Only ChatGPT-approved signals reach Telegram
-    4. Rejected signals are silently dropped (no output)
+    2. Advanced quality scoring (10 new modules)
+    3. ChatGPT acts as FINAL JUDGE for every signal
+    4. Only ChatGPT-approved signals reach Telegram
+    5. Rejected signals are silently dropped (no output)
     
-    ✅ FIXED BUGS:
-    1. TP sanity validation for low-price coins
-    2. Invalid TP guard (TP = ENTRY blocked)
-    3. QUICK mode stricter ADX (25 instead of 20)
-    4. Minimum TP distance protection (% based)
+    ✅ ENHANCEMENTS:
+    - 10 Advanced Filter Modules integrated
+    - Quality score threshold (60+)
+    - Better false signal filtering
     """
 
     def __init__(self):
@@ -33,14 +33,9 @@ class SignalGenerator:
         self.last_signal_time: Dict[str, datetime] = {}
         self.last_reset_date = datetime.now().date()
         self.mode_signal_count = {mode: 0 for mode in config.ACTIVE_MODES}
-        
-        # Initialize ChatGPT advisor
         self.chatgpt_advisor = ChatGPTAdvisor()
-        
-        # Track ChatGPT stats
         self.chatgpt_approved = 0
         self.chatgpt_rejected = 0
-
 
     def _reset_daily_counters(self):
         """Reset signal counters at midnight"""
@@ -54,13 +49,8 @@ class SignalGenerator:
             self.last_reset_date = today
             print(f"🔄 Daily counters reset for {today}")
 
-
     def _check_cooldown(self, pair: str, mode: str) -> bool:
-        """
-        Check if pair is in cooldown period (per mode).
-        Cooldown = 30 minutes per (PAIR + MODE).
-        Prevents same-pair signal spam.
-        """
+        """Check if pair is in cooldown period (per mode)"""
         key = f"{pair}_{mode}"
         if key in self.last_signal_time:
             time_since_last = datetime.now() - self.last_signal_time[key]
@@ -72,54 +62,38 @@ class SignalGenerator:
                 return False
         return True
 
-
     def _check_power_hours(self) -> bool:
-        """Check if current time is in power hours (best trading times)"""
+        """Check if current time is in power hours"""
         now = datetime.now()
         current_hour = now.hour
-
         for start_hour, end_hour in config.POWER_HOURS:
             if start_hour <= current_hour < end_hour:
                 return True
-
         return False
 
-
     def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Optional[Dict]:
-        """
-        Calculate entry, stop loss, and take profit levels
-        
-        ✅ FIX #1: Dynamic rounding for low-price coins
-        ✅ FIX #4: Minimum TP distance protection
-        
-        Returns None if TP validation fails
-        """
-
+        """Calculate entry, stop loss, and take profit levels"""
         sl_multiplier = mode_config['atr_sl_multiplier']
         tp1_multiplier = mode_config['atr_tp1_multiplier']
         tp2_multiplier = mode_config['atr_tp2_multiplier']
-
         decimal_places = config.get_decimal_places(current_price)
 
-        # Calculate raw values
         if direction == "LONG":
             entry = current_price
             sl_raw = entry - (atr * sl_multiplier)
             tp1_raw = entry + (atr * tp1_multiplier)
             tp2_raw = entry + (atr * tp2_multiplier)
-        else:  # SHORT
+        else:
             entry = current_price
             sl_raw = entry + (atr * sl_multiplier)
             tp1_raw = entry - (atr * tp1_multiplier)
             tp2_raw = entry - (atr * tp2_multiplier)
 
-        # Round with appropriate precision
         entry = round(entry, decimal_places)
         sl = round(sl_raw, decimal_places)
         tp1 = round(tp1_raw, decimal_places)
         tp2 = round(tp2_raw, decimal_places)
 
-        # Apply minimum TP distance (% based)
         min_tp_distance = entry * (config.MIN_TP_DISTANCE_PERCENT / 100)
 
         if direction == "LONG":
@@ -127,38 +101,27 @@ class SignalGenerator:
                 tp1 = round(entry + min_tp_distance, decimal_places)
             if tp2 - entry < min_tp_distance * 1.5:
                 tp2 = round(entry + min_tp_distance * 1.5, decimal_places)
-        else:  # SHORT
+        else:
             if entry - tp1 < min_tp_distance:
                 tp1 = round(entry - min_tp_distance, decimal_places)
             if entry - tp2 < min_tp_distance * 1.5:
                 tp2 = round(entry - min_tp_distance * 1.5, decimal_places)
 
-        # Validate TP levels
         if direction == "LONG":
             if tp1 <= entry or tp2 <= entry or tp1 >= tp2:
                 return None
-        else:  # SHORT
+        else:
             if tp1 >= entry or tp2 >= entry or tp1 <= tp2:
                 return None
 
-        return {
-            'entry': entry,
-            'sl': sl,
-            'tp1': tp1,
-            'tp2': tp2
-        }
-
+        return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
 
     def _check_liquidation_safety(self, entry: float, sl: float) -> tuple[bool, float]:
-        """
-        Ensure SL is far enough from liquidation price
-        Returns: (is_safe, distance_percentage)
-        """
+        """Ensure SL is far enough from liquidation price"""
         distance_pct = abs(entry - sl) / entry * 100
         MIN_DISTANCE = config.LIQUIDATION_BUFFER * 100
         is_safe = distance_pct >= MIN_DISTANCE
         return is_safe, distance_pct
-
 
     def _log_signal_performance(self, signal: Dict):
         """Log signal to CSV for performance tracking"""
@@ -166,7 +129,6 @@ class SignalGenerator:
             return
 
         log_file = getattr(config, 'PERFORMANCE_LOG_FILE', 'signal_performance.csv')
-
         log_data = {
             'timestamp': signal.get('timestamp', datetime.now().isoformat()),
             'pair': signal['pair'],
@@ -196,20 +158,14 @@ class SignalGenerator:
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(log_data)
-
             print(f"📝 Signal logged to {log_file}")
         except Exception as e:
             print(f"⚠️ Performance logging failed: {e}")
 
-
     def _calculate_signal_score(self, indicators: Dict, trend_strength: str) -> int:
-        """
-        Calculate signal quality score (0-100)
-        Higher score = better signal
-        """
+        """Calculate signal quality score (0-100)"""
         score = 0
 
-        # RSI score (max 20 points)
         rsi = indicators['rsi']
         if 35 < rsi < 65:
             score += 20
@@ -218,7 +174,6 @@ class SignalGenerator:
         else:
             score += 10
 
-        # ADX score (max 25 points)
         adx = indicators['adx']
         if adx > 40:
             score += 25
@@ -229,13 +184,11 @@ class SignalGenerator:
         else:
             score += 10
 
-        # MACD momentum (max 20 points)
         if abs(indicators['macd_histogram']) > abs(indicators['prev_macd_histogram']):
             score += 20
         else:
             score += 10
 
-        # Volume surge (max 15 points)
         if indicators['volume_surge'] > 1.5:
             score += 15
         elif indicators['volume_surge'] > 1.2:
@@ -243,7 +196,6 @@ class SignalGenerator:
         else:
             score += 5
 
-        # Multi-timeframe alignment (max 20 points)
         if trend_strength in ['STRONG_UP', 'STRONG_DOWN']:
             score += 20
         elif trend_strength in ['MODERATE_UP', 'MODERATE_DOWN']:
@@ -253,25 +205,17 @@ class SignalGenerator:
 
         return min(score, 100)
 
-
     def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
         """
-        Main analysis function with ChatGPT Final Judge
+        Main analysis function with ChatGPT Final Judge + Advanced Filters
         
         FLOW:
         1. Rule-based filtering (RSI, ADX, traps, etc.)
         2. Signal construction
-        3. 🤖 ChatGPT FINAL DECISION (MANDATORY)
-        4. If approved → return signal
-        5. If rejected → return None (silent drop)
-        
-        Args:
-            pair: Trading pair
-            candles: Historical OHLCV data
-            mode: Analysis mode (QUICK/MID/TREND)
-        
-        Returns:
-            Signal dict if ChatGPT approves, None otherwise
+        3. 🔬 Advanced Quality Scoring (10 modules)
+        4. 🤖 ChatGPT FINAL DECISION (MANDATORY)
+        5. If approved → return signal
+        6. If rejected → return None (silent drop)
         """
 
         if mode is None:
@@ -283,12 +227,10 @@ class SignalGenerator:
 
         self._reset_daily_counters()
 
-        # NEWS GUARD CHECK
         is_blocked, reason = news_guard.is_blocked()
         if is_blocked:
             return None
 
-        # Check daily limits
         if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             return None
 
@@ -296,21 +238,17 @@ class SignalGenerator:
         if self.mode_signal_count[mode] >= max_per_mode:
             return None
 
-        # ⏸️ SAME-PAIR COOLDOWN CHECK (before any processing)
         if not self._check_cooldown(pair, mode):
             return None
 
-        # Check data sufficiency
         if len(candles) < 50:
             return None
 
         try:
-            # Clean data
             candles = candles.dropna()
             if len(candles) < 50:
                 return None
 
-            # Calculate indicators
             close = candles['close']
             high = candles['high']
             low = candles['low']
@@ -324,7 +262,6 @@ class SignalGenerator:
             atr = Indicators.atr(high, low, close)
             volume_surge = Indicators.volume_surge(volume)
 
-            # Drop NaN
             ema_fast = ema_fast.dropna()
             ema_slow = ema_slow.dropna()
             macd_line = macd_line.dropna()
@@ -338,7 +275,6 @@ class SignalGenerator:
             if len(rsi) < 2 or len(adx) < 2 or len(atr) < 2:
                 return None
 
-            # Extract current values
             current_price = float(close.iloc[-1])
             current_rsi = float(rsi.iloc[-1])
             current_adx = float(adx.iloc[-1])
@@ -347,11 +283,9 @@ class SignalGenerator:
             prev_macd_hist = float(histogram.iloc[-2]) if len(histogram) > 1 else 0.0
             current_volume_surge = float(volume_surge.iloc[-1]) if len(volume_surge) > 0 else 1.0
 
-            # Validate values
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
                 return None
 
-            # Trap detection
             ticker = CoinDCXAPI.get_ticker(pair)
             bid = ticker['bid'] if ticker else current_price
             ask = ticker['ask'] if ticker else current_price
@@ -363,11 +297,9 @@ class SignalGenerator:
             trapped_count = sum(traps.values())
             trap_reasons = TrapDetector.get_trap_reasons(traps)
 
-            # Block if 3+ traps (too risky)
             if trapped_count >= 3:
                 return None
 
-            # Determine trend
             trend = None
             if (ema_fast.iloc[-1] > ema_slow.iloc[-1] and 
                 macd_line.iloc[-1] > signal_line.iloc[-1] and
@@ -380,27 +312,22 @@ class SignalGenerator:
             else:
                 return None
 
-            # RSI filter
             if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
                 return None
             if trend == "SHORT" and current_rsi < config.RSI_OVERSOLD:
                 return None
 
-            # ADX filter
             if current_adx < min_adx:
                 return None
 
-            # Calculate levels
             levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
             if levels is None:
                 return None
 
-            # Liquidation check
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
             if not is_safe:
                 return None
 
-            # Multi-timeframe trend
             try:
                 candles_5m = CoinDCXAPI.get_candles(pair, '5m', 50)
                 candles_15m = CoinDCXAPI.get_candles(pair, '15m', 50)
@@ -417,7 +344,6 @@ class SignalGenerator:
             except:
                 mtf_trend = "UNKNOWN"
 
-            # Calculate score
             indicators_data = {
                 'rsi': current_rsi,
                 'adx': current_adx,
@@ -431,7 +357,6 @@ class SignalGenerator:
             if score < min_score:
                 return None
 
-            # Build preliminary signal
             signal = {
                 'pair': pair,
                 'direction': trend,
@@ -450,23 +375,18 @@ class SignalGenerator:
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
 
-            # ================================
-            # 🤖 CHATGPT FINAL DECISION
-            # ================================
             print(f"\n{'='*60}")
             print(f"📊 Rule-based system PASSED: {pair} {trend}")
             print(f"{'='*60}")
-            
-            chatgpt_approved = self.chatgpt_advisor.final_trade_decision(signal)
-            
+
+            chatgpt_approved = self.chatgpt_advisor.final_trade_decision(signal, candles)
+
             if not chatgpt_approved:
-                # ❌ SILENTLY REJECTED - No Telegram message
                 self.chatgpt_rejected += 1
                 print(f"🚫 Signal silently dropped (no Telegram output)")
                 print(f"{'='*60}\n")
                 return None
-            
-            # ✅ APPROVED - Signal will be sent
+
             self.chatgpt_approved += 1
             print(f"✅ {mode} MODE: {pair} FINAL APPROVAL!")
             print(f"   Direction: {trend}")
@@ -478,15 +398,12 @@ class SignalGenerator:
             print(f"   RSI: {current_rsi:.1f}, ADX: {current_adx:.1f}")
             print(f"{'='*60}\n")
 
-            # Log performance
             self._log_signal_performance(signal)
 
-            # Update counters
             self.signal_count += 1
             self.mode_signal_count[mode] += 1
             self.signals_today.append(signal)
-            
-            # ⏸️ UPDATE COOLDOWN TIMESTAMP (only when signal is actually sent)
+
             cooldown_key = f"{pair}_{mode}"
             self.last_signal_time[cooldown_key] = datetime.now()
             print(f"⏱️  Cooldown started: {pair} ({mode}) - next signal after 30 minutes")
@@ -499,12 +416,11 @@ class SignalGenerator:
             traceback.print_exc()
             return None
 
-
     def get_stats(self) -> Dict:
         """Get signal generator statistics including ChatGPT performance"""
         total_evaluated = self.chatgpt_approved + self.chatgpt_rejected
         approval_rate = (self.chatgpt_approved / total_evaluated * 100) if total_evaluated > 0 else 0
-        
+
         return {
             'signals_today': self.signal_count,
             'signals_remaining': config.MAX_SIGNALS_PER_DAY - self.signal_count,
