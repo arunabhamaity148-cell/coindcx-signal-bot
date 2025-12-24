@@ -214,12 +214,13 @@ class ChatGPTAdvisor:
             elif signal_direction == "SHORT" and btc_dir == "BULLISH":
                 return False, f"BTC_STRONG_BULLISH_IMPULSE (blocks SHORT)"
         
-        # SIMPLE CANDLE COLOR RULE (only if NOT wick-dominated)
-        if not wick_dominated:
+        # CANDLE COLOR RULE: Only block if IMPULSE detected
+        # (Don't block MILD/MODERATE moves based on color alone)
+        if not wick_dominated and impulse:
             if signal_direction == "SHORT" and candle_color == "GREEN":
-                return False, f"BTC_GREEN_CANDLE (blocks SHORT)"
+                return False, f"BTC_GREEN_IMPULSE (blocks SHORT)"
             elif signal_direction == "LONG" and candle_color == "RED":
-                return False, f"BTC_RED_CANDLE (blocks LONG)"
+                return False, f"BTC_RED_IMPULSE (blocks LONG)"
         
         # MILD/MODERATE moves - allow (context only)
         if btc_strength in ["MILD", "MODERATE", "WEAK"]:
