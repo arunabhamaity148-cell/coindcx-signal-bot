@@ -457,5 +457,4 @@ class ChatGPTAdvisor:
         print(f"📊 TOTAL ADVANCED SCORE: {total_score:.1f}/100")
         print(f"{'='*70}\n")
         
-        return {
-            '
+        return {}
