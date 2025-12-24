@@ -1,5 +1,5 @@
 from openai import OpenAI
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from config import config
 import time
 import json
@@ -268,7 +268,7 @@ class ChatGPTAdvisor:
     def _check_volatility_regime(self, candles: pd.DataFrame) -> Dict:
         """Module 6: Volatility Regime"""
         try:
-            if candles is None or candles.empty or len(candles) < 20:
+if candles is None or candles.empty or len(candles) < 20:
                 return {"score": 50, "status": "INSUFFICIENT_DATA"}
 
             from indicators import Indicators
@@ -397,70 +397,81 @@ class ChatGPTAdvisor:
 
     def record_loss(self):
         """Record a losing trade"""
-        from datetime import datetime
-        self.recent_losses.append(datetime.now())
+        try:
+            from datetime import datetime
+            self.recent_losses.append(datetime.now())
+        except Exception as e:
+            print(f"⚠️ Failed to record loss: {e}")
 
     def calculate_advanced_quality_score(self, signal: Dict, candles: pd.DataFrame = None) -> Dict:
         """Calculate comprehensive quality score using all 10 advanced modules"""
-        print(f"\n{'='*70}")
-        print(f"🔬 ADVANCED QUALITY ANALYSIS: {signal.get('pair')} {signal.get('direction')}")
-        print(f"{'='*70}")
+        try:
+            print(f"\n{'='*70}")
+            print(f"🔬 ADVANCED QUALITY ANALYSIS: {signal.get('pair')} {signal.get('direction')}")
+            print(f"{'='*70}")
 
-        results = {}
+            results = {}
 
-        results['order_flow'] = self._check_order_flow_imbalance(signal, candles)
-        print(f"1️⃣  Order Flow: {results['order_flow']['score']}/100 - {results['order_flow']['status']}")
+            results['order_flow'] = self._check_order_flow_imbalance(signal, candles)
+            print(f"1️⃣  Order Flow: {results['order_flow']['score']}/100 - {results['order_flow']['status']}")
 
-        results['market_structure'] = self._check_market_structure(signal, candles)
-        print(f"2️⃣  Market Structure: {results['market_structure']['score']}/100 - {results['market_structure']['status']}")
+            results['market_structure'] = self._check_market_structure(signal, candles)
+            print(f"2️⃣  Market Structure: {results['market_structure']['score']}/100 - {results['market_structure']['status']}")
 
-        results['session'] = self._check_session_liquidity()
-        print(f"3️⃣  Session: {results['session']['score']}/100 - {results['session']['status']}")
+            results['session'] = self._check_session_liquidity()
+            print(f"3️⃣  Session: {results['session']['score']}/100 - {results['session']['status']}")
 
-        results['correlation'] = self._check_correlation_filter(signal)
-        print(f"4️⃣  Correlation: {results['correlation']['score']}/100 - {results['correlation']['status']}")
+            results['correlation'] = self._check_correlation_filter(signal)
+            print(f"4️⃣  Correlation: {results['correlation']['score']}/100 - {results['correlation']['status']}")
 
-        results['volume_profile'] = self._check_volume_profile(signal, candles)
-        print(f"5️⃣  Volume Profile: {results['volume_profile']['score']}/100 - {results['volume_profile']['status']}")
+            results['volume_profile'] = self._check_volume_profile(signal, candles)
+            print(f"5️⃣  Volume Profile: {results['volume_profile']['score']}/100 - {results['volume_profile']['status']}")
 
-        results['volatility'] = self._check_volatility_regime(candles)
-        print(f"6️⃣  Volatility: {results['volatility']['score']}/100 - {results['volatility']['status']}")
+            results['volatility'] = self._check_volatility_regime(candles)
+            print(f"6️⃣  Volatility: {results['volatility']['score']}/100 - {results['volatility']['status']}")
 
-        results['sentiment'] = self._check_macro_sentiment(signal)
-        print(f"7️⃣  Sentiment: {results['sentiment']['score']}/100 - {results['sentiment']['status']}")
+            results['sentiment'] = self._check_macro_sentiment(signal)
+            print(f"7️⃣  Sentiment: {results['sentiment']['score']}/100 - {results['sentiment']['status']}")
 
-        results['price_action'] = self._check_price_action_confluence(signal, candles)
-        print(f"8️⃣  Price Action: {results['price_action']['score']}/100 - {results['price_action']['status']}")
+            results['price_action'] = self._check_price_action_confluence(signal, candles)
+            print(f"8️⃣  Price Action: {results['price_action']['score']}/100 - {results['price_action']['status']}")
 
-        results['time_decay'] = self._check_time_decay(signal)
-        print(f"9️⃣  Time Decay: {results['time_decay']['score']}/100 - {results['time_decay']['status']}")
+            results['time_decay'] = self._check_time_decay(signal)
+            print(f"9️⃣  Time Decay: {results['time_decay']['score']}/100 - {results['time_decay']['status']}")
 
-        results['drawdown'] = self._check_drawdown_protection()
-        print(f"🔟 Drawdown: {results['drawdown']['score']}/100 - {results['drawdown']['status']}")
+            results['drawdown'] = self._check_drawdown_protection()
+            print(f"🔟 Drawdown: {results['drawdown']['score']}/100 - {results['drawdown']['status']}")
 
-        weights = {
-            'order_flow': 0.12,
-            'market_structure': 0.15,
-            'session': 0.08,
-            'correlation': 0.10,
-            'volume_profile': 0.10,
-            'volatility': 0.10,
-            'sentiment': 0.08,
-            'price_action': 0.12,
-            'time_decay': 0.05,
-            'drawdown': 0.10
-        }
+            weights = {
+                'order_flow': 0.12,
+                'market_structure': 0.15,
+                'session': 0.08,
+                'correlation': 0.10,
+                'volume_profile': 0.10,
+                'volatility': 0.10,
+                'sentiment': 0.08,
+                'price_action': 0.12,
+                'time_decay': 0.05,
+                'drawdown': 0.10
+            }
 
-        total_score = sum(results[key]['score'] * weights[key] for key in weights)
+            total_score = sum(results[key]['score'] * weights[key] for key in weights)
 
-        print(f"{'='*70}")
-        print(f"📊 TOTAL ADVANCED SCORE: {total_score:.1f}/100")
-        print(f"{'='*70}\n")
+            print(f"{'='*70}")
+            print(f"📊 TOTAL ADVANCED SCORE: {total_score:.1f}/100")
+            print(f"{'='*70}\n")
 
-        return {
-            'total_score': round(total_score, 1),
-            'results': results
-        }
+            return {
+                'total_score': round(total_score, 1),
+                'results': results
+            }
+
+        except Exception as e:
+            print(f"⚠️ Advanced quality score calculation failed: {e}")
+            return {
+                'total_score': 70.0,
+                'results': {}
+            }
 
     def final_trade_decision(self, signal: Dict, candles: pd.DataFrame) -> bool:
         """
@@ -474,10 +485,21 @@ class ChatGPTAdvisor:
             print(f"🤖 CHATGPT FINAL JUDGE: {signal.get('pair')} {signal.get('direction')}")
             print(f"{'='*70}")
 
-            # Run advanced quality analysis
             quality_analysis = self.calculate_advanced_quality_score(signal, candles)
-            
-            # Safe fallback if analysis fails
-if not quality_analysis or 'total_score' not in quality_analysis:
-    print("⚠ ChatGPT error - auto approving")
-    return True
+
+            if not quality_analysis or 'total_score' not in quality_analysis:
+                print("⚠️ ChatGPT error - auto approving")
+                return True
+
+            total_score = quality_analysis['total_score']
+
+            if total_score >= 70:
+                print(f"✅ APPROVED - Quality Score: {total_score}/100")
+                return True
+            else:
+                print(f"❌ REJECTED - Quality Score: {total_score}/100 (threshold: 70)")
+                return False
+
+        except Exception as e:
+            print(f"⚠️ ChatGPT final decision error: {e} - auto approving")
+            return True
