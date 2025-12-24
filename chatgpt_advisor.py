@@ -166,8 +166,7 @@ class ChatGPTAdvisor:
             from datetime import datetime
             now = datetime.now()
             hour = now.hour
-
-            if 18 <= hour < 22:
+if 18 <= hour < 22:
                 return {"score": 100, "status": "NY_SESSION", "liquidity": "VERY_HIGH"}
             elif 13 <= hour < 18:
                 return {"score": 90, "status": "LONDON_SESSION", "liquidity": "HIGH"}
@@ -478,4 +477,28 @@ class ChatGPTAdvisor:
         FINAL TRADE DECISION - Called by SignalGenerator
         
         This is the MANDATORY method that signal_generator.py expects.
-        Returns True to approve signal,
+        Returns True to approve signal, False to reject.
+        """
+        try:
+            print(f"\n{'='*70}")
+            print(f"🤖 CHATGPT FINAL JUDGE: {signal.get('pair')} {signal.get('direction')}")
+            print(f"{'='*70}")
+
+            quality_analysis = self.calculate_advanced_quality_score(signal, candles)
+
+            if not quality_analysis or 'total_score' not in quality_analysis:
+                print("⚠️ ChatGPT error - auto approving")
+                return True
+
+            total_score = quality_analysis['total_score']
+
+            if total_score >= 70:
+                print(f"✅ APPROVED - Quality Score: {total_score}/100")
+                return True
+            else:
+                print(f"❌ REJECTED - Quality Score: {total_score}/100 (threshold: 70)")
+                return False
+
+        except Exception as e:
+            print(f"⚠️ ChatGPT final decision error: {e} - auto approving")
+            return True
