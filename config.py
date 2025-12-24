@@ -84,7 +84,10 @@ class Config:
     # Risk Management - TIGHTENED
     LIQUIDATION_BUFFER = 0.012   # 1.2%
     MIN_ADX_STRENGTH = 20
-    COOLDOWN_MINUTES = 8
+    COOLDOWN_MINUTES = 8  # Legacy - kept for compatibility
+    
+    # ⏸️ SAME-PAIR COOLDOWN (prevents signal spam)
+    SAME_PAIR_COOLDOWN_MINUTES = 30  # 30 minutes per (PAIR + MODE)
 
     # Position sizing
     POSITION_SIZE_PERCENT = 1.5
@@ -199,7 +202,7 @@ class Config:
         # Risk parameters
         print(f"⚡ Min ADX: {cls.MIN_ADX_STRENGTH}")
         print(f"🛡️ Liquidation buffer: {cls.LIQUIDATION_BUFFER*100}%")
-        print(f"⏰ Cooldown: {cls.COOLDOWN_MINUTES} minutes")
+        print(f"⏸️  Same-pair cooldown: {cls.SAME_PAIR_COOLDOWN_MINUTES} minutes")
         print(f"🎯 Min TP distance: {cls.MIN_TP_DISTANCE_PERCENT}%")
         
         # 🤖 ChatGPT Final Judge status
