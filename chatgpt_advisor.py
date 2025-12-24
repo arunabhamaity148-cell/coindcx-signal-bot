@@ -166,7 +166,8 @@ class ChatGPTAdvisor:
             from datetime import datetime
             now = datetime.now()
             hour = now.hour
-if 18 <= hour < 22:
+
+            if 18 <= hour < 22:
                 return {"score": 100, "status": "NY_SESSION", "liquidity": "VERY_HIGH"}
             elif 13 <= hour < 18:
                 return {"score": 90, "status": "LONDON_SESSION", "liquidity": "HIGH"}
