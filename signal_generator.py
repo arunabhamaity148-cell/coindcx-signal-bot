@@ -229,24 +229,30 @@ class SignalGenerator:
 
         is_blocked, reason = news_guard.is_blocked()
         if is_blocked:
+            print(f"❌ BLOCKED: {pair} | {mode} | News guard active: {reason}")
             return None
 
         if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
+            print(f"❌ BLOCKED: {pair} | {mode} | Daily limit reached ({self.signal_count}/{config.MAX_SIGNALS_PER_DAY})")
             return None
 
         max_per_mode = config.MAX_SIGNALS_PER_DAY // len(config.ACTIVE_MODES)
         if self.mode_signal_count[mode] >= max_per_mode:
+            print(f"❌ BLOCKED: {pair} | {mode} | Mode limit reached ({self.mode_signal_count[mode]}/{max_per_mode})")
             return None
 
         if not self._check_cooldown(pair, mode):
+            print(f"❌ BLOCKED: {pair} | {mode} | Cooldown active")
             return None
 
         if len(candles) < 50:
+            print(f"❌ BLOCKED: {pair} | {mode} | Insufficient data (candles: {len(candles)} < 50)")
             return None
 
         try:
             candles = candles.dropna()
             if len(candles) < 50:
+                print(f"❌ BLOCKED: {pair} | {mode} | Insufficient data after dropna (candles: {len(candles)} < 50)")
                 return None
 
             close = candles['close']
@@ -273,6 +279,7 @@ class SignalGenerator:
             volume_surge = volume_surge.dropna()
 
             if len(rsi) < 2 or len(adx) < 2 or len(atr) < 2:
+                print(f"❌ BLOCKED: {pair} | {mode} | Insufficient indicator data (RSI: {len(rsi)}, ADX: {len(adx)}, ATR: {len(atr)})")
                 return None
 
             current_price = float(close.iloc[-1])
@@ -284,6 +291,7 @@ class SignalGenerator:
             current_volume_surge = float(volume_surge.iloc[-1]) if len(volume_surge) > 0 else 1.0
 
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
+                print(f"❌ BLOCKED: {pair} | {mode} | NaN values detected (Price: {current_price}, RSI: {current_rsi}, ADX: {current_adx}, ATR: {current_atr})")
                 return None
 
             ticker = CoinDCXAPI.get_ticker(pair)
@@ -298,6 +306,7 @@ class SignalGenerator:
             trap_reasons = TrapDetector.get_trap_reasons(traps)
 
             if trapped_count >= 3:
+                print(f"❌ BLOCKED: {pair} | {mode} | Trap count too high ({trapped_count} >= 3) | Traps: {trap_reasons}")
                 return None
 
             trend = None
@@ -310,22 +319,28 @@ class SignalGenerator:
                   minus_di.iloc[-1] > plus_di.iloc[-1]):
                 trend = "SHORT"
             else:
+                print(f"❌ BLOCKED: {pair} | {mode} | No clear trend detected (EMA/MACD/DI mixed signals)")
                 return None
 
             if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
+                print(f"❌ BLOCKED: {pair} | {mode} | RSI overbought on LONG ({current_rsi:.1f} > {config.RSI_OVERBOUGHT})")
                 return None
             if trend == "SHORT" and current_rsi < config.RSI_OVERSOLD:
+                print(f"❌ BLOCKED: {pair} | {mode} | RSI oversold on SHORT ({current_rsi:.1f} < {config.RSI_OVERSOLD})")
                 return None
 
             if current_adx < min_adx:
+                print(f"❌ BLOCKED: {pair} | {mode} | ADX too weak ({current_adx:.1f} < {min_adx})")
                 return None
 
             levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
             if levels is None:
+                print(f"❌ BLOCKED: {pair} | {mode} | Invalid entry/SL/TP calculation (TP distance too small or invalid levels)")
                 return None
 
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
             if not is_safe:
+                print(f"❌ BLOCKED: {pair} | {mode} | SL too close to liquidation ({sl_distance_pct:.1f}% < {config.LIQUIDATION_BUFFER * 100}%)")
                 return None
 
             try:
@@ -355,6 +370,7 @@ class SignalGenerator:
             score = self._calculate_signal_score(indicators_data, mtf_trend)
 
             if score < min_score:
+                print(f"❌ BLOCKED: {pair} | {mode} | Score too low ({score} < {min_score})")
                 return None
 
             signal = {
@@ -383,6 +399,7 @@ class SignalGenerator:
 
             if not chatgpt_approved:
                 self.chatgpt_rejected += 1
+                print(f"❌ BLOCKED: {pair} | {mode} | ChatGPT rejected signal")
                 print(f"🚫 Signal silently dropped (no Telegram output)")
                 print(f"{'='*60}\n")
                 return None
@@ -411,7 +428,7 @@ class SignalGenerator:
             return signal
 
         except Exception as e:
-            print(f"❌ Error in {mode} analysis for {pair}: {e}")
+            print(f"❌ BLOCKED: {pair} | {mode} | Exception occurred: {e}")
             import traceback
             traceback.print_exc()
             return None
