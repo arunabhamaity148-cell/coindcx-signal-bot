@@ -268,7 +268,7 @@ class ChatGPTAdvisor:
     def _check_volatility_regime(self, candles: pd.DataFrame) -> Dict:
         """Module 6: Volatility Regime"""
         try:
-if candles is None or candles.empty or len(candles) < 20:
+            if candles is None or candles.empty or len(candles) < 20:
                 return {"score": 50, "status": "INSUFFICIENT_DATA"}
 
             from indicators import Indicators
@@ -478,28 +478,4 @@ if candles is None or candles.empty or len(candles) < 20:
         FINAL TRADE DECISION - Called by SignalGenerator
         
         This is the MANDATORY method that signal_generator.py expects.
-        Returns True to approve signal, False to reject.
-        """
-        try:
-            print(f"\n{'='*70}")
-            print(f"🤖 CHATGPT FINAL JUDGE: {signal.get('pair')} {signal.get('direction')}")
-            print(f"{'='*70}")
-
-            quality_analysis = self.calculate_advanced_quality_score(signal, candles)
-
-            if not quality_analysis or 'total_score' not in quality_analysis:
-                print("⚠️ ChatGPT error - auto approving")
-                return True
-
-            total_score = quality_analysis['total_score']
-
-            if total_score >= 70:
-                print(f"✅ APPROVED - Quality Score: {total_score}/100")
-                return True
-            else:
-                print(f"❌ REJECTED - Quality Score: {total_score}/100 (threshold: 70)")
-                return False
-
-        except Exception as e:
-            print(f"⚠️ ChatGPT final decision error: {e} - auto approving")
-            return True
+        Returns True to approve signal,
