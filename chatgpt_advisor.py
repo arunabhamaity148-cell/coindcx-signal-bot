@@ -102,7 +102,7 @@ class ChatGPTAdvisor:
             
             # Get recent BTC 5m candles
             btc_candles = CoinDCXAPI.get_candles('BTCUSDT', '5m', 3)
-            if btc_candles.empty or len(btc_candles) < 3:
+            if btc_candles is None or btc_candles.empty or len(btc_candles) < 3:
                 return False  # No data = don't block
             
             # Check last 2 candles
@@ -131,7 +131,8 @@ class ChatGPTAdvisor:
                     return True
             
             return False
-except Exception as e:
+            
+        except Exception as e:
             print(f"⚠️ BTC momentum check failed: {e}")
             return False  # Error = don't block
 
@@ -404,8 +405,7 @@ except Exception as e:
             self.recent_losses.append(datetime.now())
         except Exception as e:
             print(f"⚠️ Failed to record loss: {e}")
-
-    # ================================================================
+# ================================================================
     # FINAL DECISION (Called by signal_generator.py)
     # ================================================================
 
