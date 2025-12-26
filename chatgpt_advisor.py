@@ -114,9 +114,9 @@ class ChatGPTAdvisor:
 
             return False, "PASS"
 
-    except Exception as e:
-        print(f"⚠️ CRITICAL: Hard rejection check failed: {e}")
-        return True, f"HARD_REJECT: Critical error - {str(e)[:50]}"
+        except Exception as e:
+            print(f"⚠️ CRITICAL: Hard rejection check failed: {e}")
+            return True, f"HARD_REJECT: Critical error - {str(e)[:50]}"
 
     def _check_btc_momentum_flip(self, direction: str) -> bool:
         """
