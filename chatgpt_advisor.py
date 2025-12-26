@@ -13,19 +13,19 @@ class ChatGPTAdvisor:
     
     PHILOSOPHY: Conservative veto power - better to miss trades than take false ones
     
-    HARD REJECT CRITERIA (Expanded - Non-negotiable):
+    HARD REJECT CRITERIA (Mode-specific):
     1. R:R < 1.5
     2. SL < 0.8% or SL == entry
-    3. HARD exhaustion: ADX > 55 AND (RSI > 68 for LONG OR RSI < 32 for SHORT)
+    3. HARD exhaustion: ADX > 60 AND (RSI > 72 for LONG OR RSI < 28 for SHORT)
     4. Invalid price data
-    5. BTC strong impulse AGAINST signal direction
-    6. MTF MIXED or AGAINST signal direction
-    7. Volume < 0.8x (extremely weak)
+    5. BTC strong impulse AGAINST signal (2 candles > ±0.7% AND combined > 1.5%)
+    6. MTF MIXED (except QUICK with soft_score ≥ 75) or AGAINST direction
+    7. Volume weak (mode-specific: QUICK < 0.6x, MID < 0.8x, TREND < 1.0x)
     
     SOFT SCORING (Advisory with higher thresholds):
+    - QUICK mode: threshold ≥65
     - MID mode: threshold ≥70
     - TREND mode: threshold ≥75
-    - QUICK mode: threshold ≥65
     
     OUTPUT: bool (True = APPROVE, False = REJECT)
     FAIL-SAFE: Returns False on critical errors (not fail-open)
@@ -39,7 +39,7 @@ class ChatGPTAdvisor:
         self.recent_losses = []
 
     # ================================================================
-    # HARD REJECTION CHECKS (Expanded - Non-negotiable)
+    # HARD REJECTION CHECKS (Mode-specific, refined)
     # ================================================================
 
     def _check_hard_rejections(self, signal: Dict) -> tuple[bool, str]:
@@ -72,28 +72,31 @@ class ChatGPTAdvisor:
             if sl_distance < 0.8:
                 return True, f"HARD_REJECT: SL={sl_distance:.2f}% < 0.8%"
             
-            if abs(sl - entry) < 0.000001:  # SL == entry
+            if abs(sl - entry) < 0.000001:
                 return True, f"HARD_REJECT: SL equals entry"
 
-            # HARD REJECT 3: HARD exhaustion (stricter)
-            if adx > 55:
-                if direction == "LONG" and rsi > 68:
+            # HARD REJECT 3: HARD exhaustion (refined thresholds)
+            if adx > 60:
+                if direction == "LONG" and rsi > 72:
                     return True, f"HARD_REJECT: HARD Exhaustion (RSI={rsi:.1f}, ADX={adx:.1f})"
-                elif direction == "SHORT" and rsi < 32:
+                elif direction == "SHORT" and rsi < 28:
                     return True, f"HARD_REJECT: HARD Exhaustion (RSI={rsi:.1f}, ADX={adx:.1f})"
 
             # HARD REJECT 4: Invalid price data
             if entry <= 0 or sl <= 0 or tp1 <= 0:
                 return True, "HARD_REJECT: Invalid price levels"
 
-            # HARD REJECT 5: BTC strong impulse against
+            # HARD REJECT 5: BTC strong impulse against (refined)
             btc_against = self._check_btc_momentum_flip(direction)
             if btc_against:
-                return True, "HARD_REJECT: BTC impulse against direction"
+                return True, "HARD_REJECT: BTC strong impulse against direction"
 
-            # HARD REJECT 6: MTF MIXED or AGAINST direction
+            # HARD REJECT 6: MTF MIXED or AGAINST direction (mode-specific)
             if mtf_trend == 'MIXED':
-                return True, f"HARD_REJECT: MTF is MIXED"
+                if mode != 'QUICK':
+                    return True, f"HARD_REJECT: MTF is MIXED ({mode} mode)"
+                # For QUICK mode, MIXED is allowed if soft_score will be high
+                # We'll let soft scoring handle this
             
             if direction == "LONG" and mtf_trend in ['MODERATE_DOWN', 'STRONG_DOWN']:
                 return True, f"HARD_REJECT: MTF {mtf_trend} against LONG"
@@ -101,9 +104,13 @@ class ChatGPTAdvisor:
             if direction == "SHORT" and mtf_trend in ['MODERATE_UP', 'STRONG_UP']:
                 return True, f"HARD_REJECT: MTF {mtf_trend} against SHORT"
 
-            # HARD REJECT 7: Extremely weak volume
-            if volume_surge < 0.8:
-                return True, f"HARD_REJECT: Volume extremely weak ({volume_surge:.2f}x < 0.8x)"
+            # HARD REJECT 7: Weak volume (mode-specific thresholds)
+            if mode == 'QUICK' and volume_surge < 0.6:
+                return True, f"HARD_REJECT: Volume extremely weak for QUICK ({volume_surge:.2f}x < 0.6x)"
+            elif mode == 'MID' and volume_surge < 0.8:
+                return True, f"HARD_REJECT: Volume weak for MID ({volume_surge:.2f}x < 0.8x)"
+            elif mode == 'TREND' and volume_surge < 1.0:
+                return True, f"HARD_REJECT: Volume weak for TREND ({volume_surge:.2f}x < 1.0x)"
 
             return False, "PASS"
 except Exception as e:
@@ -112,9 +119,13 @@ except Exception as e:
 
     def _check_btc_momentum_flip(self, direction: str) -> bool:
         """
-        Check if BTC momentum is against signal direction
-        Returns True if should reject
+        Check if BTC momentum is strongly against signal direction
         
+        Refined rule: Reject ONLY if:
+        - 2 consecutive BTC candles move > ±0.7%
+        - Combined move > 1.5%
+        
+        Returns True if should reject
         FAIL-SAFE: Returns False on error (don't block on data issues)
         """
         try:
@@ -132,16 +143,22 @@ except Exception as e:
             prev_close = float(prev_candle['close'])
             prev_open = float(prev_candle['open'])
 
+            # Calculate individual candle moves
             last_move = (last_close - last_open) / last_open * 100
             prev_move = (prev_close - prev_open) / prev_open * 100
+            
+            # Calculate combined move
+            combined_move = abs(last_move) + abs(prev_move)
 
             if direction == "LONG":
-                if last_move < -0.5 and prev_move < -0.5:
-                    print(f"⏸️  BTC bearish momentum against LONG")
+                # Reject if both candles bearish > 0.7% AND combined > 1.5%
+                if last_move < -0.7 and prev_move < -0.7 and combined_move > 1.5:
+                    print(f"⏸️  BTC strong bearish momentum against LONG (combined: {combined_move:.2f}%)")
                     return True
-            else:
-                if last_move > 0.5 and prev_move > 0.5:
-                    print(f"⏸️  BTC bullish momentum against SHORT")
+            else:  # SHORT
+                # Reject if both candles bullish > 0.7% AND combined > 1.5%
+                if last_move > 0.7 and prev_move > 0.7 and combined_move > 1.5:
+                    print(f"⏸️  BTC strong bullish momentum against SHORT (combined: {combined_move:.2f}%)")
                     return True
 
             return False
@@ -164,21 +181,28 @@ except Exception as e:
         try:
             score = 70
             notes = []
+            mode = signal.get('mode', 'QUICK')
 
-            # Soft factor 1: Volume (already hard-rejected if < 0.8x)
+            # Soft factor 1: Volume (bonus for high volume)
             volume_surge = signal.get('volume_surge', 1.0)
             if volume_surge < 1.2:
-                score -= 5
-                notes.append(f"Low volume ({volume_surge:.2f}x) -5")
+                score -= 3
+                notes.append(f"Low volume ({volume_surge:.2f}x) -3")
             elif volume_surge > 1.8:
                 score += 5
                 notes.append(f"High volume ({volume_surge:.2f}x) +5")
 
-            # Soft factor 2: MTF alignment (already hard-rejected if against)
+            # Soft factor 2: MTF alignment
             mtf = signal.get('mtf_trend', 'UNKNOWN')
             if mtf == 'UNKNOWN':
                 score -= 5
                 notes.append("MTF unknown -5")
+            elif mtf == 'MIXED':
+                if mode == 'QUICK':
+                    # QUICK mode: MIXED is okay with penalty
+                    score -= 3
+                    notes.append("MTF mixed -3")
+                # For MID/TREND: already hard-rejected, won't reach here
             elif mtf in ['STRONG_UP', 'STRONG_DOWN']:
                 score += 10
                 notes.append(f"MTF strongly aligned ({mtf}) +10")
@@ -189,8 +213,8 @@ except Exception as e:
             # Soft factor 3: Session liquidity
             session_result = self._check_session_liquidity()
             if session_result['score'] < 50:
-                score -= 5
-                notes.append(f"Weak session ({session_result['status']}) -5")
+                score -= 3
+                notes.append(f"Weak session ({session_result['status']}) -3")
             elif session_result['score'] > 80:
                 score += 3
                 notes.append(f"Strong session ({session_result['status']}) +3")
@@ -436,7 +460,7 @@ except Exception as e:
             print(f"🤖 CHATGPT HARD VETO: {pair} {direction} | Mode: {mode} | Score: {score}")
             print(f"{'='*70}")
 
-            # STEP 1: Check hard rejections (Expanded to 7 conditions)
+            # STEP 1: Check hard rejections (Mode-specific, refined)
             is_hard_rejected, hard_reason = self._check_hard_rejections(signal)
             if is_hard_rejected:
                 decision_log = {
@@ -463,13 +487,30 @@ except Exception as e:
                 for note in notes:
                     print(f"   • {note}")
 
-            # STEP 3: Mode-specific thresholds (STRICTER)
+            # STEP 3: Mode-specific thresholds
             if mode == 'TREND':
                 threshold = 75
             elif mode == 'MID':
                 threshold = 70
             else:  # QUICK
                 threshold = 65
+
+            # Special case: QUICK mode with MIXED MTF needs high soft score
+            mtf = signal.get('mtf_trend', 'UNKNOWN')
+            if mode == 'QUICK' and mtf == 'MIXED' and soft_score < 75:
+                decision_log = {
+                    "approved": False,
+                    "confidence": "MEDIUM",
+                    "reason": f"QUICK + MIXED MTF requires score ≥75 (got {soft_score})",
+                    "pair": pair,
+                    "mode": mode,
+                    "soft_score": soft_score,
+                    "type": "SOFT_REJECT"
+                }
+                print(f"❌ QUICK + MIXED MTF: Score too low ({soft_score}/75)")
+                print(f"📊 DECISION: {json.dumps(decision_log, indent=2)}")
+                print(f"{'='*70}\n")
+                return False
 
             approved = soft_score >= threshold
 
