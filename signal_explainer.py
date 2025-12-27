@@ -24,7 +24,7 @@ class SignalExplainer:
             os.makedirs('charts', exist_ok=True)
             df = candles.tail(100).copy()
             df.index = pd.to_datetime(df.index)
-            
+
             ema_fast_period = signal.get('ema_fast_period', 20)
             ema_slow_period = signal.get('ema_slow_period', 50)
             df['EMA_Fast'] = Indicators.ema(df['close'], ema_fast_period)
@@ -63,6 +63,9 @@ class SignalExplainer:
         Returns: formatted string for Telegram
         """
         try:
+            ema_fast = signal.get('ema_fast_period', 20)
+            ema_slow = signal.get('ema_slow_period', 50)
+            
             explanation = f"""
 📚 TRADE BREAKDOWN
 
@@ -73,6 +76,7 @@ SIGNAL DATA
 • Mode: {signal['mode']}
 • Timeframe: {signal['timeframe']}
 • HTF Alignment: Passed
+• EMA Fast ({ema_fast}) and EMA Slow ({ema_slow}) aligned
 • RSI: {signal['rsi']}
 • ADX: {signal['adx']}
 • Volume: {signal['volume_surge']}x
@@ -116,7 +120,6 @@ Trade invalidated if price closes {"below" if signal['direction'] == "LONG" else
 ━━━━━━━━━━━━━━━━━━━━
 CONTEXT
 
-• Market Regime: {signal.get('market_regime', 'NORMAL')}
 • Score: {signal['score']}/100
 • MTF Trend: {signal.get('mtf_trend', 'N/A')}
 
