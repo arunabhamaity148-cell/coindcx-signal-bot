@@ -8,6 +8,8 @@ from trap_detector import TrapDetector
 from coindcx_api import CoinDCXAPI
 from news_guard import news_guard
 from chatgpt_advisor import ChatGPTAdvisor
+from signal_explainer import SignalExplainer
+from telegram_notifier import TelegramNotifier
 
 
 class SignalGenerator:
@@ -397,6 +399,16 @@ class SignalGenerator:
             if near_key_level:
                 print(f"   🎯 {key_level_info}")
             print(f"{'='*60}\n")
+            
+            try:
+                explainer_result = SignalExplainer.explain_signal(signal, candles)
+                if explainer_result['chart_path']:
+                    TelegramNotifier.send_chart(explainer_result['chart_path'])
+                if explainer_result['explanation']:
+                    TelegramNotifier.send_explanation(explainer_result['explanation'])
+            except Exception as e:
+                print(f"⚠️ Explainer failed (non-critical): {e}")
+            
             self._log_signal_performance(signal)
             self.signal_count += 1
             self.mode_signal_count[mode] += 1
