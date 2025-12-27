@@ -31,38 +31,41 @@ class SignalExplainer:
             df['EMA_Slow'] = Indicators.ema(df['close'], ema_slow_period)
 
             ap = [
-                mpf.make_addplot(df['EMA_Fast'], color='#00D9FF', width=2, alpha=0.9),
-                mpf.make_addplot(df['EMA_Slow'], color='#FFB800', width=2, alpha=0.9)
+                mpf.make_addplot(df['EMA_Fast'], color='#4A90E2', width=1.8, alpha=0.9),
+                mpf.make_addplot(df['EMA_Slow'], color='#F5A623', width=1.8, alpha=0.9)
             ]
 
             hlines = {
-                'hlines': [signal['entry'], signal['sl'], signal['tp1'], signal['tp2']],
-                'colors': ['#00FF41', '#FF3B30', '#7FFF00', '#32CD32'],
-                'linestyle': '--',
-                'linewidths': 2
+                'hlines': [signal['sl'], signal['tp1'], signal['tp2']],
+                'colors': ['#E74C3C', '#85C1E9', '#27AE60'],
+                'linestyle': '-',
+                'linewidths': 2,
+                'alpha': 0.95
             }
 
             mc = mpf.make_marketcolors(
-                up='#26A69A', down='#EF5350',
+                up='#00C853', down='#FF5252',
                 edge='inherit',
-                wick={'up':'#26A69A', 'down':'#EF5350'},
+                wick={'up':'#00C853', 'down':'#FF5252'},
                 volume='in'
             )
             
             s = mpf.make_mpf_style(
                 marketcolors=mc,
                 gridstyle='',
-                gridcolor='#1E1E1E',
-                facecolor='#0D1117',
-                figcolor='#0D1117',
-                edgecolor='#30363D',
+                gridcolor='#2A2A2A',
+                facecolor='#0E1117',
+                figcolor='#0E1117',
+                edgecolor='#1E1E1E',
                 rc={
-                    'font.size': 10,
-                    'axes.labelcolor': '#C9D1D9',
-                    'axes.edgecolor': '#30363D',
-                    'xtick.color': '#8B949E',
-                    'ytick.color': '#8B949E',
-                    'grid.alpha': 0.1
+                    'font.size': 9,
+                    'font.family': 'monospace',
+                    'axes.labelcolor': '#D0D0D0',
+                    'axes.edgecolor': '#2A2A2A',
+                    'xtick.color': '#808080',
+                    'ytick.color': '#808080',
+                    'grid.alpha': 0.08,
+                    'axes.linewidth': 0.5
                 }
             )
 
@@ -75,15 +78,25 @@ class SignalExplainer:
                 style=s, 
                 addplot=ap, 
                 hlines=hlines,
-                title=f"{signal['pair']} {signal['direction']} - {signal['timeframe']}",
-                figsize=(14, 8),
+                title=dict(title=f"{signal['pair']} | {signal['direction']} | {signal['timeframe']}", color='#E0E0E0', fontsize=12, weight='bold'),
+                figsize=(15, 8),
                 returnfig=True,
                 volume=False,
-                tight_layout=True
+                tight_layout=True,
+                scale_padding={'left': 0.3, 'top': 0.3, 'right': 1.2, 'bottom': 0.3}
             )
             
-            axes[0].set_facecolor('#0D1117')
-            fig.savefig(filepath, facecolor='#0D1117', dpi=150)
+            axes[0].set_facecolor('#0E1117')
+            axes[0].tick_params(labelsize=8, colors='#808080')
+            
+            entry_price = signal['entry']
+            last_index = df.index[-1]
+            axes[0].plot(last_index, entry_price, marker='o', markersize=12, color='#00E676', markeredgecolor='#00C853', markeredgewidth=2.5, zorder=10)
+            axes[0].text(last_index, entry_price, '  ENTRY', fontsize=9, color='#00E676', verticalalignment='center', weight='bold', alpha=0.95)
+            
+            axes[0].text(0.98, 0.02, 'CryptoBot Pro', transform=axes[0].transAxes, fontsize=8, color='#404040', alpha=0.4, ha='right', va='bottom', style='italic')
+            
+            fig.savefig(filepath, facecolor='#0E1117', dpi=150, bbox_inches='tight', pad_inches=0.1)
             plt.close(fig)
 
             print(f"📊 Chart saved: {filepath}")
@@ -113,76 +126,64 @@ class SignalExplainer:
             
             sl_distance = abs(entry - sl) / entry * 100
             tp1_distance = abs(tp1 - entry) / entry * 100
-            tp2_distance = abs(tp2 - entry) / entry * 100
             rr1 = tp1_distance / sl_distance if sl_distance > 0 else 0
-            rr2 = tp2_distance / sl_distance if sl_distance > 0 else 0
 
             if direction == "LONG":
-                explanation = f"""🟢 আমি বলছি দাম উপরে যাওয়ার চান্স আছে, তাই এটা LONG ট্রেড।
+                explanation = f"""🟢 আমি বলছি দাম উপরে যাওয়ার দিক আছে, তাই এটা LONG ট্রেড।
 
-⏱️ {timeframe} চার্টে দেখি — মানে ছোট নড়াচড়া না, একটু স্থির ট্রেন্ড।
+⏱️ {timeframe} চার্টে দেখি — মানে ছোট নড়াচড়া না।
 
-📈 EMA {ema_fast} আর EMA {ema_slow} উপরের দিকে, তাই ট্রেন্ড এখন UP।
+📈 EMA {ema_fast} আর EMA {ema_slow} উপরের দিকে।
 
 📉 RSI শক্ত ({rsi}), কিন্তু এখনো ভাঙেনি।
 
 📊 ADX দেখাচ্ছে ট্রেন্ড পরিষ্কার ({adx})।
 
-💰 ₹{entry:,.2f} থেকে লং নিচ্ছো
+💰 ₹{entry:,.2f} এখানে ঢুকছো
 
-🛑 ₹{sl:,.2f} এর নিচে ক্লোজ করলে বেরিয়ে যাবে — কারণ তখন আমি ভুল।
+🛑 ₹{sl:,.2f} এখানে ভুল প্রমাণ হলে বেরোবে
 
-✅ ₹{tp1:,.2f} এ প্রথম লাভ ({rr1:.1f}R)
+✅ ₹{tp1:,.2f} প্রথম লাভ ({rr1:.1f}R)
 
-🚀 ₹{tp2:,.2f} এ বড় লাভ ({rr2:.1f}R)
+🚀 ₹{tp2:,.2f} বড় লাভ
 
-⚖️ ঝুঁকি কম, লাভ বেশি — তাই ট্রেডটা লজিক্যাল।
+⚖️ ঝুঁকি কম, লাভ বেশি
 """
                 if volume_surge < 1.2:
-                    explanation += "\n📦 ভলিউম কম হলে ধীরে উঠতে পারে — ধৈর্য ধরো।"
+                    explanation += "\n📦 ভলিউম কম — ধৈর্য ধরো।"
                 
                 if signal.get('liquidity_sweep'):
-                    explanation += "\n💎 লিকুইডিটি সুইপ হয়েছে — এটা ভালো সাইন।"
-                
-                if signal.get('near_order_block'):
-                    explanation += "\n🎯 অর্ডার ব্লক কাছে — সাপোর্ট শক্ত।"
+                    explanation += "\n💎 লিকুইডিটি সুইপ হয়েছে।"
 
-            else:  # SHORT
-                explanation = f"""🔴 আমি বলছি দাম নিচে নামার চান্স আছে, তাই এটা SHORT ট্রেড।
+            else:
+                explanation = f"""🔴 আমি বলছি দাম নিচে নামার দিক আছে, তাই এটা SHORT ট্রেড।
 
-⏱️ {timeframe} চার্টে দেখি — মানে ছোট নড়াচড়া না, পরিষ্কার ট্রেন্ড।
+⏱️ {timeframe} চার্টে দেখি — পরিষ্কার ট্রেন্ড।
 
-📉 EMA {ema_fast} আর EMA {ema_slow} নিচের দিকে, তাই ট্রেন্ড এখন DOWN।
+📉 EMA {ema_fast} আর EMA {ema_slow} নিচের দিকে।
 
-📈 RSI উপরে ছিল ({rsi}), এখন দুর্বল হচ্ছে।
+📈 RSI উপরে ছিল ({rsi}), এখন দুর্বল।
 
 📊 ADX দেখাচ্ছে ট্রেন্ড শক্ত ({adx})।
 
-💰 ₹{entry:,.2f} থেকে শর্ট নিচ্ছো
+💰 ₹{entry:,.2f} এখানে শর্ট নিচ্ছো
 
-🛑 ₹{sl:,.2f} এর উপরে ক্লোজ করলে বেরিয়ে যাবে — কারণ তখন আমি ভুল।
+🛑 ₹{sl:,.2f} এখানে ভুল প্রমাণ হলে বেরোবে
 
-✅ ₹{tp1:,.2f} এ প্রথম লাভ ({rr1:.1f}R)
+✅ ₹{tp1:,.2f} প্রথম লাভ ({rr1:.1f}R)
 
-🚀 ₹{tp2:,.2f} এ বড় লাভ ({rr2:.1f}R)
+🚀 ₹{tp2:,.2f} বড় লাভ
 
-⚖️ ঝুঁকি কম, লাভ বেশি — তাই ট্রেডটা লজিক্যাল।
+⚖️ ঝুঁকি কম, লাভ বেশি
 """
                 if volume_surge < 1.2:
-                    explanation += "\n📦 ভলিউম কম হলে ধীরে নামতে পারে — ধৈর্য ধরো।"
+                    explanation += "\n📦 ভলিউম কম — ধৈর্য ধরো।"
                 
                 if signal.get('liquidity_sweep'):
-                    explanation += "\n💎 লিকুইডিটি সুইপ হয়েছে — এটা ভালো সাইন।"
-                
-                if signal.get('near_order_block'):
-                    explanation += "\n🎯 অর্ডার ব্লক কাছে — রেজিস্ট্যান্স শক্ত।"
+                    explanation += "\n💎 লিকুইডিটি সুইপ হয়েছে।"
 
-            explanation += """
-
-❗ নিয়ম ভাঙলে ট্রেড ফেল করবে।
-
-🤖 আমি সিগন্যাল দিই, ডিসিপ্লিন তোমার দায়িত্ব।
-"""
+            explanation += "\n\n🤖 আমি সিগন্যাল দিই, নিয়ম মানা তোমার কাজ।"
+            
             return explanation.strip()
         except Exception as e:
             print(f"⚠️ Explanation generation failed: {e}")
