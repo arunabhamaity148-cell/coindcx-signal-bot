@@ -8,6 +8,7 @@ from signal_generator import SignalGenerator
 from telegram_notifier import TelegramNotifier
 from chatgpt_advisor import ChatGPTAdvisor
 from news_guard import news_guard
+from signal_explainer import SignalExplainer
 
 class ArunBot:
     """
@@ -94,19 +95,19 @@ class ArunBot:
             print("⏸️ Trading paused until news window clears")
             return
 
-        # ✅ Scan each pair in ALL modes
+        # Scan each pair in ALL modes
         for pair in config.PAIRS:
-            
-            # ✅ Analyze in QUICK, MID, and TREND modes
+
+            # Analyze in QUICK, MID, and TREND modes
             for mode in config.ACTIVE_MODES:
                 try:
                     mode_config = config.MODE_CONFIG[mode]
                     timeframe = mode_config['timeframe']
-                    
+
                     print(f"\n{'─'*60}")
                     print(f"📊 {mode} Mode: {pair} ({timeframe})")
                     print(f"{'─'*60}")
-                    
+
                     # Get candles for this specific timeframe
                     candles = CoinDCXAPI.get_candles(pair, timeframe, limit=250)
 
@@ -116,7 +117,7 @@ class ArunBot:
 
                     print(f"🔍 Analyzing {len(candles)} candles...")
 
-                    # ✅ Analyze with specific mode
+                    # Analyze with specific mode
                     signal = self.signal_gen.analyze(pair, candles, mode)
 
                     if signal:
@@ -130,8 +131,25 @@ class ArunBot:
                         print(f"   TP2: ₹{signal['tp2']:,.2f}")
                         print(f"{'🎉'*20}\n")
 
-                        # Send to Telegram
+                        # Send signal to Telegram
                         TelegramNotifier.send_signal(signal)
+
+                        # Generate and send educational content (does NOT affect trading)
+                        try:
+                            print("📊 Generating educational content...")
+                            explanation_data = SignalExplainer.explain_signal(signal, candles)
+                            
+                            # Send chart if generated
+                            if explanation_data['chart_path']:
+                                TelegramNotifier.send_chart(explanation_data['chart_path'])
+                            
+                            # Send explanation
+                            if explanation_data['explanation']:
+                                TelegramNotifier.send_explanation(explanation_data['explanation'])
+                                
+                        except Exception as e:
+                            print(f"⚠️ Educational content generation failed: {e}")
+                            # Continue normal operation even if this fails
 
                         # Place order if auto-trade enabled
                         if config.AUTO_TRADE:
@@ -149,7 +167,7 @@ class ArunBot:
 
                 # Small delay between modes
                 await asyncio.sleep(1)
-            
+
             # Small delay between pairs
             await asyncio.sleep(2)
 
