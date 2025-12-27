@@ -11,7 +11,7 @@ from chatgpt_advisor import ChatGPTAdvisor
 
 
 class SignalGenerator:
-    """95/100 Professional Signal Generator - TOP 3%"""
+    """Pure Rule-Based Signal Generator"""
 
     def __init__(self):
         self.signal_count = 0
@@ -22,8 +22,7 @@ class SignalGenerator:
         self.chatgpt_advisor = ChatGPTAdvisor()
         self.chatgpt_approved = 0
         self.chatgpt_rejected = 0
-        
-        # Trailing stop tracking
+
         self.active_positions: Dict[str, Dict] = {}
 
     def _reset_daily_counters(self):
@@ -55,27 +54,18 @@ class SignalGenerator:
         """HARD BLOCK: 01:00-07:00 IST"""
         now = datetime.now()
         current_hour = now.hour
-        
+
         if 1 <= current_hour < 7:
             return False, f"Dead hours (01:00-07:00 IST)"
-        
+
         return True, "Trading hours OK"
 
-    def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict, regime: str) -> Optional[Dict]:
-        """Calculate entry, SL, TP with regime adjustment"""
+    def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Optional[Dict]:
+        """Calculate entry, SL, TP - NO regime modification"""
         sl_multiplier = mode_config['atr_sl_multiplier']
         tp1_multiplier = mode_config['atr_tp1_multiplier']
         tp2_multiplier = mode_config['atr_tp2_multiplier']
-        
-        # Adjust for market regime
-        if regime == "VOLATILE":
-            sl_multiplier *= 1.2  # Wider stops
-            tp1_multiplier *= 1.2
-            tp2_multiplier *= 1.2
-        elif regime == "RANGING":
-            tp1_multiplier *= 0.9  # Tighter targets
-            tp2_multiplier *= 0.9
-        
+
         decimal_places = config.get_decimal_places(current_price)
 
         if direction == "LONG":
@@ -123,32 +113,6 @@ class SignalGenerator:
         is_safe = distance_pct >= MIN_DISTANCE
         return is_safe, distance_pct
 
-    def _calculate_position_size(self, base_size: float, signal: Dict, regime: str) -> float:
-        """Dynamic position sizing based on confidence and regime"""
-        multiplier = 1.0
-        
-        # Score-based adjustment
-        score = signal.get('score', 70)
-        if score > 85:
-            multiplier *= 1.15
-        elif score > 75:
-            multiplier *= 1.0
-        elif score < 65:
-            multiplier *= 0.85
-        
-        # Regime adjustment
-        if regime == "VOLATILE":
-            multiplier *= 0.8  # Smaller size in volatile markets
-        elif regime == "NORMAL":
-            multiplier *= 1.0
-        
-        # ADX adjustment (trend strength)
-        adx = signal.get('adx', 25)
-        if adx > 40:
-            multiplier *= 1.1  # Strong trend = slightly larger
-        
-        return base_size * multiplier
-
     def _log_signal_performance(self, signal: Dict):
         """Log signal to CSV"""
         if not hasattr(config, 'TRACK_PERFORMANCE') or not config.TRACK_PERFORMANCE:
@@ -168,9 +132,7 @@ class SignalGenerator:
             'score': signal['score'],
             'rsi': signal['rsi'],
             'adx': signal['adx'],
-            'leverage': signal['leverage'],
-            'regime': signal.get('market_regime', 'UNKNOWN'),
-            'chatgpt_approved': 'YES'
+            'leverage': signal['leverage']
         }
 
         try:
@@ -189,10 +151,9 @@ class SignalGenerator:
             print(f"⚠️ Performance logging failed: {e}")
 
     def _calculate_signal_score(self, indicators: Dict, trend_strength: str, sweep: bool, ob: bool, fvg: bool, key_level: bool) -> int:
-        """Enhanced scoring with all professional filters"""
+        """Scoring - affects quality display ONLY, does NOT block"""
         score = 0
 
-        # RSI
         rsi = indicators['rsi']
         if 35 < rsi < 65:
             score += 18
@@ -201,7 +162,6 @@ class SignalGenerator:
         else:
             score += 8
 
-        # ADX
         adx = indicators['adx']
         if adx > 40:
             score += 22
@@ -212,20 +172,18 @@ class SignalGenerator:
         else:
             score += 8
 
-        # MACD momentum
         if abs(indicators['macd_histogram']) > abs(indicators['prev_macd_histogram']):
             score += 16
         else:
             score += 8
 
-        # Volume
         if indicators['volume_surge'] > 1.5:
             score += 14
         elif indicators['volume_surge'] > 1.2:
             score += 10
         else:
-            score += 5 
-# MTF
+            score += 5
+
         if trend_strength in ['STRONG_UP', 'STRONG_DOWN']:
             score += 16
         elif trend_strength in ['MODERATE_UP', 'MODERATE_DOWN']:
@@ -233,7 +191,6 @@ class SignalGenerator:
         else:
             score += 4
 
-        # Professional bonuses
         if sweep:
             score += 8
         if ob:
@@ -246,7 +203,7 @@ class SignalGenerator:
         return min(score, 100)
 
     def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
-        """95/100 Professional Analysis"""
+        """Pure Rule-Based Analysis"""
 
         if mode is None:
             mode = config.MODE
@@ -288,8 +245,7 @@ class SignalGenerator:
             candles = candles.dropna()
             if len(candles) < 50:
                 return None
-
-            close = candles['close']
+close = candles['close']
             high = candles['high']
             low = candles['low']
             volume = candles['volume']
@@ -357,54 +313,51 @@ class SignalGenerator:
             try:
                 candles_1h = CoinDCXAPI.get_candles(pair, '1h', 50)
                 candles_4h = None
-                
+
                 if mode == 'TREND':
                     candles_4h = CoinDCXAPI.get_candles(pair, '4h', 50)
-                
+
                 if candles_1h.empty:
                     print(f"❌ BLOCKED: {pair} | {mode} | 1H fetch fail")
                     return None
-                
+
                 htf_valid, htf_reason = Indicators.check_htf_alignment(
                     trend, mode, candles_1h['close'],
                     candles_4h['close'] if candles_4h is not None and not candles_4h.empty else None
                 )
-                
+
                 if not htf_valid:
                     print(f"❌ BLOCKED: {pair} | {mode} | {htf_reason}")
                     return None
-                
+
                 print(f"✅ HTF: {htf_reason}")
-                
+
             except Exception as e:
                 print(f"❌ BLOCKED: {pair} | {mode} | HTF error: {e}")
                 return None
 
-            # PHASE 2: Market Regime Detection
+            # SOFT: Market context (for display only)
             regime = "NORMAL"
             try:
                 candles_daily = CoinDCXAPI.get_candles(pair, '1d', 30)
                 if not candles_daily.empty:
                     regime = Indicators.detect_market_regime(candles_daily)
-                    print(f"📊 Market Regime: {regime}")
             except:
                 pass
 
-            # PHASE 2: FVG Detection
+            # SOFT: FVG (for display only)
             has_fvg = False
             fvg_info = {}
             try:
                 has_fvg, fvg_info = Indicators.detect_fvg(candles, trend)
                 if has_fvg:
                     in_fvg = Indicators.is_price_in_fvg(current_price, fvg_info)
-                    if in_fvg:
-                        print(f"💎 FVG FILL: {fvg_info['type']} | Gap: {fvg_info['gap_size_pct']}%")
-                    else:
+                    if not in_fvg:
                         has_fvg = False
             except:
                 pass
 
-            # PHASE 2: Daily Key Levels
+            # SOFT: Key levels (for display only)
             near_key_level = False
             key_level_info = ""
             try:
@@ -414,22 +367,18 @@ class SignalGenerator:
                     near_key_level, key_level_info = Indicators.check_key_level_proximity(
                         current_price, key_levels, trend
                     )
-                    if near_key_level:
-                        print(f"🎯 KEY LEVEL: {key_level_info}")
             except:
                 pass
 
-            # PHASE 1: Liquidity Sweep
+            # SOFT: Liquidity sweep (for display only)
             sweep_detected = False
             sweep_info = {}
             try:
                 sweep_detected, sweep_info = Indicators.detect_liquidity_sweep(candles, trend)
-                if sweep_detected:
-                    print(f"💎 SWEEP: {sweep_info['type']} | Strength: {sweep_info['rejection_strength']}x")
             except:
                 pass
 
-            # PHASE 1: Order Blocks
+            # SOFT: Order blocks (for display only)
             near_ob = False
             ob_info = {}
             try:
@@ -437,11 +386,10 @@ class SignalGenerator:
                 if not candles_4h_ob.empty:
                     order_blocks = Indicators.find_order_blocks(candles_4h_ob, trend)
                     near_ob, ob_info = Indicators.is_near_order_block(current_price, order_blocks)
-                    if near_ob:
-                        print(f"🎯 OB: {ob_info['type']} | Distance: {ob_info['distance']}%")
             except:
                 pass
 
+            # HARD: RSI extremes
             if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
                 print(f"❌ BLOCKED: {pair} | {mode} | RSI overbought")
                 return None
@@ -449,20 +397,24 @@ class SignalGenerator:
                 print(f"❌ BLOCKED: {pair} | {mode} | RSI oversold")
                 return None
 
+            # HARD: ADX minimum
             if current_adx < min_adx:
                 print(f"❌ BLOCKED: {pair} | {mode} | ADX weak")
                 return None
 
-            levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config, regime)
+            # HARD: Calculate levels
+            levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
             if levels is None:
                 print(f"❌ BLOCKED: {pair} | {mode} | Invalid SL/TP")
                 return None
 
+            # HARD: Liquidation safety
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
             if not is_safe:
                 print(f"❌ BLOCKED: {pair} | {mode} | Liquidation risk")
                 return None
 
+            # SOFT: MTF trend (for display only)
             try:
                 candles_5m = CoinDCXAPI.get_candles(pair, '5m', 50)
                 candles_15m = CoinDCXAPI.get_candles(pair, '15m', 50)
@@ -477,6 +429,7 @@ class SignalGenerator:
             except:
                 mtf_trend = "UNKNOWN"
 
+            # Calculate score (for display only)
             indicators_data = {
                 'rsi': current_rsi,
                 'adx': current_adx,
@@ -490,18 +443,10 @@ class SignalGenerator:
                 sweep_detected, near_ob, has_fvg, near_key_level
             )
 
-            # PHASE 2: Confirmation wait for low scores
-            if score < 75:
-                print(f"⏸️  {pair} | {mode} | Score {score}/75 - needs confirmation")
-                print(f"   Waiting for stronger setup...")
-                return None
-
+            # HARD: Minimum score
             if score < min_score:
                 print(f"❌ BLOCKED: {pair} | {mode} | Score: {score}/{min_score}")
                 return None
-
-            # Dynamic position size
-            position_multiplier = self._calculate_position_size(1.0, {'score': score, 'adx': current_adx}, regime)
 
             signal = {
                 'pair': pair,
@@ -520,22 +465,26 @@ class SignalGenerator:
                 'volume_surge': round(current_volume_surge, 2),
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'market_regime': regime,
-                'position_multiplier': round(position_multiplier, 2),
                 'liquidity_sweep': sweep_detected,
                 'near_order_block': near_ob,
                 'fvg_fill': has_fvg,
-                'near_key_level': near_key_level
+                'near_key_level': near_key_level,
+                'sweep_info': sweep_info if sweep_detected else {},
+                'ob_info': ob_info if near_ob else {},
+                'fvg_info': fvg_info if has_fvg else {},
+                'key_level_info': key_level_info if near_key_level else ""
             }
 
             print(f"\n{'='*60}")
             print(f"📊 Rule-based PASSED: {pair} {trend}")
             print(f"{'='*60}")
 
+            # Safety validator only
             chatgpt_approved = self.chatgpt_advisor.final_trade_decision(signal, candles)
 
             if not chatgpt_approved:
                 self.chatgpt_rejected += 1
-                print(f"❌ ChatGPT rejected")
+                print(f"❌ Safety check failed")
                 return None
 
             self.chatgpt_approved += 1
@@ -545,7 +494,6 @@ class SignalGenerator:
             print(f"   SL: ₹{levels['sl']:,.6f}")
             print(f"   TP1: ₹{levels['tp1']:,.6f}")
             print(f"   TP2: ₹{levels['tp2']:,.6f}")
-            print(f"   Position Size: {position_multiplier:.2f}x")
             if sweep_detected:
                 print(f"   💎 Liquidity Swept")
             if near_ob:
