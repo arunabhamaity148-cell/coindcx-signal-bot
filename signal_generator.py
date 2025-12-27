@@ -171,8 +171,7 @@ class SignalGenerator:
             score += 14
         else:
             score += 8
-
-        if abs(indicators['macd_histogram']) > abs(indicators['prev_macd_histogram']):
+if abs(indicators['macd_histogram']) > abs(indicators['prev_macd_histogram']):
             score += 16
         else:
             score += 8
@@ -245,7 +244,8 @@ class SignalGenerator:
             candles = candles.dropna()
             if len(candles) < 50:
                 return None
-close = candles['close']
+
+            close = candles['close']
             high = candles['high']
             low = candles['low']
             volume = candles['volume']
