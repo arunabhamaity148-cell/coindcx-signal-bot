@@ -17,7 +17,7 @@ class SignalExplainer:
     @staticmethod
     def generate_chart(signal: Dict, candles: pd.DataFrame) -> str:
         """
-        Generate chart image with entry, SL, TP marked
+        Generate PREMIUM chart image with entry, SL, TP marked
         Returns: filepath of saved image or None
         """
         try:
@@ -31,24 +31,60 @@ class SignalExplainer:
             df['EMA_Slow'] = Indicators.ema(df['close'], ema_slow_period)
 
             ap = [
-                mpf.make_addplot(df['EMA_Fast'], color='blue', width=1),
-                mpf.make_addplot(df['EMA_Slow'], color='orange', width=1)
+                mpf.make_addplot(df['EMA_Fast'], color='#00D9FF', width=2, alpha=0.9),
+                mpf.make_addplot(df['EMA_Slow'], color='#FFB800', width=2, alpha=0.9)
             ]
 
             hlines = {
                 'hlines': [signal['entry'], signal['sl'], signal['tp1'], signal['tp2']],
-                'colors': ['green', 'red', 'lightgreen', 'darkgreen'],
+                'colors': ['#00FF41', '#FF3B30', '#7FFF00', '#32CD32'],
                 'linestyle': '--',
-                'linewidths': 1.5
+                'linewidths': 2
             }
 
-            style = mpf.make_mpf_style(base_mpf_style='charles', rc={'font.size': 8})
+            mc = mpf.make_marketcolors(
+                up='#26A69A', down='#EF5350',
+                edge='inherit',
+                wick={'up':'#26A69A', 'down':'#EF5350'},
+                volume='in'
+            )
+            
+            s = mpf.make_mpf_style(
+                marketcolors=mc,
+                gridstyle='',
+                gridcolor='#1E1E1E',
+                facecolor='#0D1117',
+                figcolor='#0D1117',
+                edgecolor='#30363D',
+                rc={
+                    'font.size': 10,
+                    'axes.labelcolor': '#C9D1D9',
+                    'axes.edgecolor': '#30363D',
+                    'xtick.color': '#8B949E',
+                    'ytick.color': '#8B949E',
+                    'grid.alpha': 0.1
+                }
+            )
+
             filename = f"chart_{signal['pair']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
             filepath = os.path.join('charts', filename)
 
-            mpf.plot(df, type='candle', style=style, addplot=ap, hlines=hlines,
-                     title=f"{signal['pair']} {signal['direction']} - {signal['timeframe']}",
-                     savefig=filepath, figsize=(12, 6))
+            fig, axes = mpf.plot(
+                df, 
+                type='candle', 
+                style=s, 
+                addplot=ap, 
+                hlines=hlines,
+                title=f"{signal['pair']} {signal['direction']} - {signal['timeframe']}",
+                figsize=(14, 8),
+                returnfig=True,
+                volume=False,
+                tight_layout=True
+            )
+            
+            axes[0].set_facecolor('#0D1117')
+            fig.savefig(filepath, facecolor='#0D1117', dpi=150)
+            plt.close(fig)
 
             print(f"📊 Chart saved: {filepath}")
             return filepath
@@ -59,72 +95,93 @@ class SignalExplainer:
     @staticmethod
     def generate_explanation(signal: Dict) -> str:
         """
-        Generate FACTUAL explanation message (NO judgement, NO predictions)
+        Generate BENGALI explanation with EMOJIS
         Returns: formatted string for Telegram
         """
         try:
+            direction = signal['direction']
             ema_fast = signal.get('ema_fast_period', 20)
             ema_slow = signal.get('ema_slow_period', 50)
+            entry = signal['entry']
+            sl = signal['sl']
+            tp1 = signal['tp1']
+            tp2 = signal['tp2']
+            timeframe = signal['timeframe']
+            rsi = signal['rsi']
+            adx = signal['adx']
+            volume_surge = signal['volume_surge']
             
-            explanation = f"""
-📚 TRADE BREAKDOWN
-
-━━━━━━━━━━━━━━━━━━━━
-SIGNAL DATA
-
-• Direction: {signal['direction']}
-• Mode: {signal['mode']}
-• Timeframe: {signal['timeframe']}
-• HTF Alignment: Passed
-• EMA Fast ({ema_fast}) and EMA Slow ({ema_slow}) aligned
-• RSI: {signal['rsi']}
-• ADX: {signal['adx']}
-• Volume: {signal['volume_surge']}x
-"""
-
-            if signal.get('liquidity_sweep'):
-                sweep_info = signal.get('sweep_info', {})
-                explanation += f"• Liquidity Sweep: {sweep_info.get('type', 'Detected')}\n"
-
-            if signal.get('near_order_block'):
-                ob_info = signal.get('ob_info', {})
-                explanation += f"• Order Block: {ob_info.get('distance', 'N/A')}% away\n"
-
-            if signal.get('fvg_fill'):
-                fvg_info = signal.get('fvg_info', {})
-                explanation += f"• FVG: {fvg_info.get('type', 'Detected')} - {fvg_info.get('gap_size_pct', 'N/A')}%\n"
-
-            if signal.get('near_key_level'):
-                explanation += f"• Key Level: {signal.get('key_level_info', 'Nearby')}\n"
-
-            sl_distance = abs(signal['entry'] - signal['sl']) / signal['entry'] * 100
-            tp1_distance = abs(signal['tp1'] - signal['entry']) / signal['entry'] * 100
-            tp2_distance = abs(signal['tp2'] - signal['entry']) / signal['entry'] * 100
+            sl_distance = abs(entry - sl) / entry * 100
+            tp1_distance = abs(tp1 - entry) / entry * 100
+            tp2_distance = abs(tp2 - entry) / entry * 100
             rr1 = tp1_distance / sl_distance if sl_distance > 0 else 0
             rr2 = tp2_distance / sl_distance if sl_distance > 0 else 0
 
-            explanation += f"""
-━━━━━━━━━━━━━━━━━━━━
-LEVELS
+            if direction == "LONG":
+                explanation = f"""🟢 আমি বলছি দাম উপরে যাওয়ার চান্স আছে, তাই এটা LONG ট্রেড।
 
-Entry: ₹{signal['entry']:,.2f}
-Stop Loss: ₹{signal['sl']:,.2f} ({sl_distance:.2f}%)
-TP1: ₹{signal['tp1']:,.2f} ({tp1_distance:.2f}% / {rr1:.1f}R)
-TP2: ₹{signal['tp2']:,.2f} ({tp2_distance:.2f}% / {rr2:.1f}R)
+⏱️ {timeframe} চার্টে দেখি — মানে ছোট নড়াচড়া না, একটু স্থির ট্রেন্ড।
 
-━━━━━━━━━━━━━━━━━━━━
-INVALIDATION
+📈 EMA {ema_fast} আর EMA {ema_slow} উপরের দিকে, তাই ট্রেন্ড এখন UP।
 
-Trade invalidated if price closes {"below" if signal['direction'] == "LONG" else "above"} SL: ₹{signal['sl']:,.2f}
+📉 RSI শক্ত ({rsi}), কিন্তু এখনো ভাঙেনি।
 
-━━━━━━━━━━━━━━━━━━━━
-CONTEXT
+📊 ADX দেখাচ্ছে ট্রেন্ড পরিষ্কার ({adx})।
 
-• Score: {signal['score']}/100
-• MTF Trend: {signal.get('mtf_trend', 'N/A')}
+💰 ₹{entry:,.2f} থেকে লং নিচ্ছো
 
-━━━━━━━━━━━━━━━━━━━━
-Educational only - Not financial advice
+🛑 ₹{sl:,.2f} এর নিচে ক্লোজ করলে বেরিয়ে যাবে — কারণ তখন আমি ভুল।
+
+✅ ₹{tp1:,.2f} এ প্রথম লাভ ({rr1:.1f}R)
+
+🚀 ₹{tp2:,.2f} এ বড় লাভ ({rr2:.1f}R)
+
+⚖️ ঝুঁকি কম, লাভ বেশি — তাই ট্রেডটা লজিক্যাল।
+"""
+                if volume_surge < 1.2:
+                    explanation += "\n📦 ভলিউম কম হলে ধীরে উঠতে পারে — ধৈর্য ধরো।"
+                
+                if signal.get('liquidity_sweep'):
+                    explanation += "\n💎 লিকুইডিটি সুইপ হয়েছে — এটা ভালো সাইন।"
+                
+                if signal.get('near_order_block'):
+                    explanation += "\n🎯 অর্ডার ব্লক কাছে — সাপোর্ট শক্ত।"
+
+            else:  # SHORT
+                explanation = f"""🔴 আমি বলছি দাম নিচে নামার চান্স আছে, তাই এটা SHORT ট্রেড।
+
+⏱️ {timeframe} চার্টে দেখি — মানে ছোট নড়াচড়া না, পরিষ্কার ট্রেন্ড।
+
+📉 EMA {ema_fast} আর EMA {ema_slow} নিচের দিকে, তাই ট্রেন্ড এখন DOWN।
+
+📈 RSI উপরে ছিল ({rsi}), এখন দুর্বল হচ্ছে।
+
+📊 ADX দেখাচ্ছে ট্রেন্ড শক্ত ({adx})।
+
+💰 ₹{entry:,.2f} থেকে শর্ট নিচ্ছো
+
+🛑 ₹{sl:,.2f} এর উপরে ক্লোজ করলে বেরিয়ে যাবে — কারণ তখন আমি ভুল।
+
+✅ ₹{tp1:,.2f} এ প্রথম লাভ ({rr1:.1f}R)
+
+🚀 ₹{tp2:,.2f} এ বড় লাভ ({rr2:.1f}R)
+
+⚖️ ঝুঁকি কম, লাভ বেশি — তাই ট্রেডটা লজিক্যাল।
+"""
+                if volume_surge < 1.2:
+                    explanation += "\n📦 ভলিউম কম হলে ধীরে নামতে পারে — ধৈর্য ধরো।"
+                
+                if signal.get('liquidity_sweep'):
+                    explanation += "\n💎 লিকুইডিটি সুইপ হয়েছে — এটা ভালো সাইন।"
+                
+                if signal.get('near_order_block'):
+                    explanation += "\n🎯 অর্ডার ব্লক কাছে — রেজিস্ট্যান্স শক্ত।"
+
+            explanation += """
+
+❗ নিয়ম ভাঙলে ট্রেড ফেল করবে।
+
+🤖 আমি সিগন্যাল দিই, ডিসিপ্লিন তোমার দায়িত্ব।
 """
             return explanation.strip()
         except Exception as e:
