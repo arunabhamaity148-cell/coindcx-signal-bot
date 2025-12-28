@@ -153,7 +153,7 @@ class SignalGenerator:
                 return False, "BTC high volatility"
 
             return True, "BTC stable"
-        except:
+        except Exception as e:
             return True, "BTC check skipped"
 
     def _check_trading_hours(self) -> tuple[bool, str]:
@@ -347,8 +347,7 @@ class SignalGenerator:
         if not btc_stable:
             print(f"❌ BLOCKED: {pair} | {mode} | {btc_reason}")
             return None
-
-        if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
+if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             print(f"❌ BLOCKED: {pair} | {mode} | Daily limit")
             return None
         max_per_mode = config.MAX_SIGNALS_PER_DAY // len(config.ACTIVE_MODES)
@@ -400,7 +399,8 @@ class SignalGenerator:
             current_ema_slow = float(ema_slow.iloc[-1])
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
                 return None
-if mode == 'TREND' and current_volume_surge < 0.8:
+
+            if mode == 'TREND' and current_volume_surge < 0.8:
                 print(f"❌ BLOCKED: {pair} | TREND volume < 0.8x (got {current_volume_surge}x)")
                 return None
 
@@ -446,7 +446,7 @@ if mode == 'TREND' and current_volume_surge < 0.8:
                 candles_daily = CoinDCXAPI.get_candles(pair, '1d', 30)
                 if not candles_daily.empty:
                     regime = Indicators.detect_market_regime(candles_daily)
-            except:
+            except Exception as e:
                 pass
             has_fvg = False
             fvg_info = {}
@@ -456,7 +456,7 @@ if mode == 'TREND' and current_volume_surge < 0.8:
                     in_fvg = Indicators.is_price_in_fvg(current_price, fvg_info)
                     if not in_fvg:
                         has_fvg = False
-            except:
+            except Exception as e:
                 pass
             near_key_level = False
             key_level_info = ""
@@ -465,13 +465,13 @@ if mode == 'TREND' and current_volume_surge < 0.8:
                 if not candles_daily.empty:
                     key_levels = Indicators.get_daily_key_levels(candles_daily)
                     near_key_level, key_level_info = Indicators.check_key_level_proximity(current_price, key_levels, trend)
-            except:
+            except Exception as e:
                 pass
             sweep_detected = False
             sweep_info = {}
             try:
                 sweep_detected, sweep_info = Indicators.detect_liquidity_sweep(candles, trend)
-            except:
+            except Exception as e:
                 pass
             near_ob = False
             ob_info = {}
@@ -480,7 +480,7 @@ if mode == 'TREND' and current_volume_surge < 0.8:
                 if not candles_4h_ob.empty:
                     order_blocks = Indicators.find_order_blocks(candles_4h_ob, trend)
                     near_ob, ob_info = Indicators.is_near_order_block(current_price, order_blocks)
-            except:
+            except Exception as e:
                 pass
 
             if mode == 'TREND':
@@ -523,7 +523,7 @@ if mode == 'TREND' and current_volume_surge < 0.8:
                     mtf_trend = Indicators.mtf_trend(candles_5m['close'], candles_15m['close'], candles_1h['close'])
                 else:
                     mtf_trend = "UNKNOWN"
-            except:
+            except Exception as e:
                 mtf_trend = "UNKNOWN"
 
             if mode == 'TREND' and mtf_trend not in ['STRONG_UP', 'STRONG_DOWN']:
