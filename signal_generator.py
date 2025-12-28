@@ -19,8 +19,10 @@ class SignalGenerator:
         self.signal_count = 0
         self.signals_today = []
         self.last_signal_time: Dict[str, datetime] = {}
+        self.last_signal_price: Dict[str, float] = {}
         self.last_reset_date = datetime.now().date()
         self.mode_signal_count = {mode: 0 for mode in config.ACTIVE_MODES}
+        self.coin_signal_count: Dict[str, int] = {}
         self.chatgpt_advisor = ChatGPTAdvisor()
         self.chatgpt_approved = 0
         self.chatgpt_rejected = 0
@@ -33,6 +35,8 @@ class SignalGenerator:
             self.signal_count = 0
             self.signals_today = []
             self.mode_signal_count = {mode: 0 for mode in config.ACTIVE_MODES}
+            self.coin_signal_count = {}
+            self.last_signal_price = {}
             self.chatgpt_approved = 0
             self.chatgpt_rejected = 0
             self.last_reset_date = today
@@ -43,11 +47,39 @@ class SignalGenerator:
         key = f"{pair}_{mode}"
         if key in self.last_signal_time:
             time_since_last = datetime.now() - self.last_signal_time[key]
-            cooldown_duration = timedelta(minutes=config.SAME_PAIR_COOLDOWN_MINUTES)
+            if mode == 'TREND':
+                cooldown_duration = timedelta(hours=2)
+            elif mode == 'MID':
+                cooldown_duration = timedelta(hours=1)
+            else:
+                cooldown_duration = timedelta(minutes=config.SAME_PAIR_COOLDOWN_MINUTES)
+            
             if time_since_last < cooldown_duration:
                 remaining = cooldown_duration - time_since_last
                 remaining_mins = int(remaining.total_seconds() / 60)
                 print(f"⏸️  {pair} ({mode}) in cooldown - {remaining_mins}m remaining")
+                return False
+        return True
+
+    def _check_price_movement(self, pair: str, current_price: float, direction: str) -> bool:
+        """Check if price has moved significantly since last signal"""
+        key = f"{pair}"
+        if key in self.last_signal_price:
+            last_price = self.last_signal_price[key]
+            price_change_pct = abs(current_price - last_price) / last_price * 100
+            
+            if price_change_pct < 1.0:
+                print(f"❌ BLOCKED: {pair} | Price stagnant ({price_change_pct:.2f}% change)")
+                return False
+        return True
+
+    def _check_coin_daily_limit(self, pair: str) -> bool:
+        """Check per-coin daily signal limit"""
+        MAX_SIGNALS_PER_COIN = 3
+        coin = pair.split('USDT')[0]
+        if coin in self.coin_signal_count:
+            if self.coin_signal_count[coin] >= MAX_SIGNALS_PER_COIN:
+                print(f"❌ BLOCKED: {pair} | Coin daily limit ({MAX_SIGNALS_PER_COIN})")
                 return False
         return True
 
@@ -60,7 +92,7 @@ class SignalGenerator:
         return True, "Trading hours OK"
 
     def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Optional[Dict]:
-        """Calculate entry, SL, TP - NO regime modification"""
+        """Calculate entry, SL, TP with minimum distance enforcement"""
         sl_multiplier = mode_config['atr_sl_multiplier']
         tp1_multiplier = mode_config['atr_tp1_multiplier']
         tp2_multiplier = mode_config['atr_tp2_multiplier']
@@ -81,24 +113,30 @@ class SignalGenerator:
         sl = round(sl_raw, decimal_places)
         tp1 = round(tp1_raw, decimal_places)
         tp2 = round(tp2_raw, decimal_places)
+        
+        min_sl_distance = entry * 0.008
         min_tp_distance = entry * (config.MIN_TP_DISTANCE_PERCENT / 100)
 
         if direction == "LONG":
+            if entry - sl < min_sl_distance:
+                sl = round(entry - min_sl_distance, decimal_places)
             if tp1 - entry < min_tp_distance:
                 tp1 = round(entry + min_tp_distance, decimal_places)
-            if tp2 - entry < min_tp_distance * 1.5:
-                tp2 = round(entry + min_tp_distance * 1.5, decimal_places)
+            if tp2 - tp1 < min_tp_distance * 0.5:
+                tp2 = round(tp1 + min_tp_distance * 0.5, decimal_places)
         else:
+            if sl - entry < min_sl_distance:
+                sl = round(entry + min_sl_distance, decimal_places)
             if entry - tp1 < min_tp_distance:
                 tp1 = round(entry - min_tp_distance, decimal_places)
-            if entry - tp2 < min_tp_distance * 1.5:
-                tp2 = round(entry - min_tp_distance * 1.5, decimal_places)
+            if tp1 - tp2 < min_tp_distance * 0.5:
+                tp2 = round(tp1 - min_tp_distance * 0.5, decimal_places)
 
         if direction == "LONG":
-            if tp1 <= entry or tp2 <= entry or tp1 >= tp2:
+            if tp1 <= entry or tp2 <= entry or tp1 >= tp2 or sl >= entry:
                 return None
         else:
-            if tp1 >= entry or tp2 >= entry or tp1 <= tp2:
+            if tp1 >= entry or tp2 >= entry or tp1 <= tp2 or sl <= entry:
                 return None
 
         return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
@@ -109,6 +147,26 @@ class SignalGenerator:
         MIN_DISTANCE = config.LIQUIDATION_BUFFER * 100
         is_safe = distance_pct >= MIN_DISTANCE
         return is_safe, distance_pct
+
+    def _check_minimum_rr(self, entry: float, sl: float, tp1: float, mode: str) -> tuple[bool, float]:
+        """Check minimum Risk-Reward ratio"""
+        sl_distance = abs(entry - sl) / entry * 100
+        tp1_distance = abs(tp1 - entry) / entry * 100
+        rr = tp1_distance / sl_distance if sl_distance > 0 else 0
+        
+        MIN_RR = {'TREND': 2.0, 'MID': 1.8, 'SCALP': 1.5}
+        required_rr = MIN_RR.get(mode, 1.5)
+        
+        if rr < required_rr:
+            return False, rr
+        return True, rr
+
+    def _check_volume_adx_correlation(self, volume_surge: float, adx: float, mtf_trend: str) -> bool:
+        """Reject low volume + strong trend claims"""
+        if volume_surge < 0.5 and adx > 40 and mtf_trend in ['STRONG_UP', 'STRONG_DOWN']:
+            print(f"❌ BLOCKED: Low volume ({volume_surge}x) but high ADX ({adx}) + strong MTF")
+            return False
+        return True
 
     def _log_signal_performance(self, signal: Dict):
         """Log signal to CSV"""
@@ -216,6 +274,8 @@ class SignalGenerator:
             return None
         if not self._check_cooldown(pair, mode):
             return None
+        if not self._check_coin_daily_limit(pair):
+            return None
         if len(candles) < 50:
             print(f"❌ BLOCKED: {pair} | {mode} | Insufficient data")
             return None
@@ -255,7 +315,10 @@ class SignalGenerator:
             current_volume_surge = float(volume_surge.iloc[-1]) if len(volume_surge) > 0 else 1.0
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
                 return None
-            ticker = CoinDCXAPI.get_ticker(pair)
+            
+            if not self._check_price_movement(pair, current_price, ""):
+                return None
+ticker = CoinDCXAPI.get_ticker(pair)
             bid = ticker['bid'] if ticker else current_price
             ask = ticker['ask'] if ticker else current_price
             traps = TrapDetector.check_all_traps(candles, bid, ask, current_rsi, current_adx, current_macd_hist)
@@ -330,12 +393,22 @@ class SignalGenerator:
                     near_ob, ob_info = Indicators.is_near_order_block(current_price, order_blocks)
             except:
                 pass
-            if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
-                print(f"❌ BLOCKED: {pair} | {mode} | RSI overbought")
-                return None
-            if trend == "SHORT" and current_rsi < config.RSI_OVERSOLD:
-                print(f"❌ BLOCKED: {pair} | {mode} | RSI oversold")
-                return None
+            
+            if mode == 'TREND':
+                if trend == "LONG" and current_rsi > 65:
+                    print(f"❌ BLOCKED: {pair} | {mode} | RSI too high for TREND entry")
+                    return None
+                if trend == "SHORT" and current_rsi < 35:
+                    print(f"❌ BLOCKED: {pair} | {mode} | RSI too low for TREND entry")
+                    return None
+            else:
+                if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
+                    print(f"❌ BLOCKED: {pair} | {mode} | RSI overbought")
+                    return None
+                if trend == "SHORT" and current_rsi < config.RSI_OVERSOLD:
+                    print(f"❌ BLOCKED: {pair} | {mode} | RSI oversold")
+                    return None
+            
             if current_adx < min_adx:
                 print(f"❌ BLOCKED: {pair} | {mode} | ADX weak")
                 return None
@@ -346,6 +419,11 @@ class SignalGenerator:
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
             if not is_safe:
                 print(f"❌ BLOCKED: {pair} | {mode} | Liquidation risk")
+                return None
+            
+            rr_valid, rr_value = self._check_minimum_rr(levels['entry'], levels['sl'], levels['tp1'], mode)
+            if not rr_valid:
+                print(f"❌ BLOCKED: {pair} | {mode} | RR too low ({rr_value:.2f})")
                 return None
 
             try:
@@ -358,6 +436,13 @@ class SignalGenerator:
                     mtf_trend = "UNKNOWN"
             except:
                 mtf_trend = "UNKNOWN"
+            
+            if mode == 'TREND' and mtf_trend == 'MIXED':
+                print(f"❌ BLOCKED: {pair} | {mode} | MTF MIXED not allowed in TREND")
+                return None
+            
+            if not self._check_volume_adx_correlation(current_volume_surge, current_adx, mtf_trend):
+                return None
 
             indicators_data = {'rsi': current_rsi, 'adx': current_adx, 'macd_histogram': current_macd_hist, 'prev_macd_histogram': prev_macd_hist, 'volume_surge': current_volume_surge}
             score = self._calculate_signal_score(indicators_data, mtf_trend, sweep_detected, near_ob, has_fvg, near_key_level)
@@ -385,7 +470,7 @@ class SignalGenerator:
                 return None
             self.chatgpt_approved += 1
             print(f"✅ {mode}: {pair} APPROVED!")
-            print(f"   Score: {score}/100 | Regime: {regime}")
+            print(f"   Score: {score}/100 | RR: {rr_value:.2f}R")
             print(f"   Entry: ₹{levels['entry']:,.6f}")
             print(f"   SL: ₹{levels['sl']:,.6f}")
             print(f"   TP1: ₹{levels['tp1']:,.6f}")
@@ -399,7 +484,7 @@ class SignalGenerator:
             if near_key_level:
                 print(f"   🎯 {key_level_info}")
             print(f"{'='*60}\n")
-            
+
             try:
                 explainer_result = SignalExplainer.explain_signal(signal, candles)
                 if explainer_result['chart_path']:
@@ -408,13 +493,20 @@ class SignalGenerator:
                     TelegramNotifier.send_explanation(explainer_result['explanation'])
             except Exception as e:
                 print(f"⚠️ Explainer failed (non-critical): {e}")
-            
+
             self._log_signal_performance(signal)
             self.signal_count += 1
             self.mode_signal_count[mode] += 1
+            
+            coin = pair.split('USDT')[0]
+            if coin not in self.coin_signal_count:
+                self.coin_signal_count[coin] = 0
+            self.coin_signal_count[coin] += 1
+            
             self.signals_today.append(signal)
             cooldown_key = f"{pair}_{mode}"
             self.last_signal_time[cooldown_key] = datetime.now()
+            self.last_signal_price[pair] = current_price
             return signal
         except Exception as e:
             print(f"❌ BLOCKED: {pair} | {mode} | Exception: {e}")
@@ -428,7 +520,8 @@ class SignalGenerator:
         approval_rate = (self.chatgpt_approved / total_evaluated * 100) if total_evaluated > 0 else 0
         return {
             'signals_today': self.signal_count, 'signals_remaining': config.MAX_SIGNALS_PER_DAY - self.signal_count,
-            'mode_breakdown': self.mode_signal_count, 'mode': 'MULTI' if config.MULTI_MODE_ENABLED else config.MODE,
+            'mode_breakdown': self.mode_signal_count, 'coin_breakdown': self.coin_signal_count,
+            'mode': 'MULTI' if config.MULTI_MODE_ENABLED else config.MODE,
             'last_reset': self.last_reset_date.strftime('%Y-%m-%d'), 'chatgpt_approved': self.chatgpt_approved,
             'chatgpt_rejected': self.chatgpt_rejected, 'chatgpt_approval_rate': f"{approval_rate:.1f}%"
         }
