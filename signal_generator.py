@@ -211,8 +211,7 @@ class SignalGenerator:
         else:
             if tp1 >= entry or tp2 >= entry or tp1 <= tp2 or sl <= entry:
                 return None
-        
-        return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
+return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
 
     def _check_liquidation_safety(self, entry: float, sl: float) -> tuple[bool, float]:
         """Ensure SL is far enough from liquidation price"""
@@ -338,6 +337,7 @@ class SignalGenerator:
         if not trading_allowed:
             print(f"❌ BLOCKED: {pair} | {mode} | {time_reason}")
             return None
+        
         is_blocked, reason = news_guard.is_blocked()
         if is_blocked:
             print(f"❌ BLOCKED: {pair} | {mode} | News: {reason}")
@@ -347,17 +347,22 @@ class SignalGenerator:
         if not btc_stable:
             print(f"❌ BLOCKED: {pair} | {mode} | {btc_reason}")
             return None
-if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
+
+        if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             print(f"❌ BLOCKED: {pair} | {mode} | Daily limit")
             return None
+        
         max_per_mode = config.MAX_SIGNALS_PER_DAY // len(config.ACTIVE_MODES)
         if self.mode_signal_count[mode] >= max_per_mode:
             print(f"❌ BLOCKED: {pair} | {mode} | Mode limit")
             return None
+        
         if not self._check_cooldown(pair, mode):
             return None
+        
         if not self._check_coin_daily_limit(pair, mode):
             return None
+        
         if len(candles) < 50:
             print(f"❌ BLOCKED: {pair} | {mode} | Insufficient data")
             return None
@@ -366,10 +371,12 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             candles = candles.dropna()
             if len(candles) < 50:
                 return None
+            
             close = candles['close']
             high = candles['high']
             low = candles['low']
             volume = candles['volume']
+            
             ema_fast = Indicators.ema(close, mode_config['ema_fast'])
             ema_slow = Indicators.ema(close, mode_config['ema_slow'])
             macd_line, signal_line, histogram = Indicators.macd(close)
@@ -377,6 +384,7 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             adx, plus_di, minus_di = Indicators.adx(high, low, close)
             atr = Indicators.atr(high, low, close)
             volume_surge = Indicators.volume_surge(volume)
+            
             ema_fast = ema_fast.dropna()
             ema_slow = ema_slow.dropna()
             macd_line = macd_line.dropna()
@@ -386,8 +394,10 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             adx = adx.dropna()
             atr = atr.dropna()
             volume_surge = volume_surge.dropna()
+            
             if len(rsi) < 2 or len(adx) < 2 or len(atr) < 2:
                 return None
+            
             current_price = float(close.iloc[-1])
             current_rsi = float(rsi.iloc[-1])
             current_adx = float(adx.iloc[-1])
@@ -397,6 +407,7 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             current_volume_surge = float(volume_surge.iloc[-1]) if len(volume_surge) > 0 else 1.0
             current_ema_fast = float(ema_fast.iloc[-1])
             current_ema_slow = float(ema_slow.iloc[-1])
+            
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
                 return None
 
@@ -415,6 +426,7 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             if trapped_count >= 3:
                 print(f"❌ BLOCKED: {pair} | {mode} | Traps: {trapped_count}")
                 return None
+            
             trend = None
             if (ema_fast.iloc[-1] > ema_slow.iloc[-1] and macd_line.iloc[-1] > signal_line.iloc[-1] and plus_di.iloc[-1] > minus_di.iloc[-1]):
                 trend = "LONG"
@@ -448,6 +460,7 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
                     regime = Indicators.detect_market_regime(candles_daily)
             except Exception as e:
                 pass
+            
             has_fvg = False
             fvg_info = {}
             try:
@@ -458,6 +471,7 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
                         has_fvg = False
             except Exception as e:
                 pass
+            
             near_key_level = False
             key_level_info = ""
             try:
@@ -467,12 +481,14 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
                     near_key_level, key_level_info = Indicators.check_key_level_proximity(current_price, key_levels, trend)
             except Exception as e:
                 pass
+            
             sweep_detected = False
             sweep_info = {}
             try:
                 sweep_detected, sweep_info = Indicators.detect_liquidity_sweep(candles, trend)
             except Exception as e:
                 pass
+            
             near_ob = False
             ob_info = {}
             try:
@@ -501,10 +517,12 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             if current_adx < min_adx:
                 print(f"❌ BLOCKED: {pair} | {mode} | ADX weak")
                 return None
+            
             levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
             if levels is None:
                 print(f"❌ BLOCKED: {pair} | {mode} | Invalid SL/TP")
                 return None
+            
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
             if not is_safe:
                 print(f"❌ BLOCKED: {pair} | {mode} | Liquidation risk")
@@ -530,7 +548,13 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
                 print(f"❌ BLOCKED: {pair} | TREND requires STRONG MTF (got {mtf_trend})")
                 return None
 
-            indicators_data = {'rsi': current_rsi, 'adx': current_adx, 'macd_histogram': current_macd_hist, 'prev_macd_histogram': prev_macd_hist, 'volume_surge': current_volume_surge}
+            indicators_data = {
+                'rsi': current_rsi,
+                'adx': current_adx,
+                'macd_histogram': current_macd_hist,
+                'prev_macd_histogram': prev_macd_hist,
+                'volume_surge': current_volume_surge
+            }
             score = self._calculate_signal_score(indicators_data, mtf_trend, sweep_detected, near_ob, has_fvg, near_key_level, mode)
             if score < min_score:
                 print(f"❌ BLOCKED: {pair} | {mode} | Score: {score}/{min_score}")
@@ -541,13 +565,32 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
                     return None
 
             signal = {
-                'pair': pair, 'direction': trend, 'entry': levels['entry'], 'sl': levels['sl'], 'tp1': levels['tp1'], 'tp2': levels['tp2'],
-                'leverage': mode_config['leverage'], 'score': score, 'rsi': round(current_rsi, 1), 'adx': round(current_adx, 1),
-                'mtf_trend': mtf_trend, 'mode': mode, 'timeframe': mode_config['timeframe'], 'volume_surge': round(current_volume_surge, 2),
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'market_regime': regime, 'liquidity_sweep': sweep_detected,
-                'near_order_block': near_ob, 'fvg_fill': has_fvg, 'near_key_level': near_key_level, 'sweep_info': sweep_info if sweep_detected else {},
-                'ob_info': ob_info if near_ob else {}, 'fvg_info': fvg_info if has_fvg else {}, 'key_level_info': key_level_info if near_key_level else "",
-                'ema_fast_period': mode_config['ema_fast'], 'ema_slow_period': mode_config['ema_slow']
+                'pair': pair,
+                'direction': trend,
+                'entry': levels['entry'],
+                'sl': levels['sl'],
+                'tp1': levels['tp1'],
+                'tp2': levels['tp2'],
+                'leverage': mode_config['leverage'],
+                'score': score,
+                'rsi': round(current_rsi, 1),
+                'adx': round(current_adx, 1),
+                'mtf_trend': mtf_trend,
+                'mode': mode,
+                'timeframe': mode_config['timeframe'],
+                'volume_surge': round(current_volume_surge, 2),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'market_regime': regime,
+                'liquidity_sweep': sweep_detected,
+                'near_order_block': near_ob,
+                'fvg_fill': has_fvg,
+                'near_key_level': near_key_level,
+                'sweep_info': sweep_info if sweep_detected else {},
+                'ob_info': ob_info if near_ob else {},
+                'fvg_info': fvg_info if has_fvg else {},
+                'key_level_info': key_level_info if near_key_level else "",
+                'ema_fast_period': mode_config['ema_fast'],
+                'ema_slow_period': mode_config['ema_slow']
             }
 
             print(f"\n{'='*60}")
@@ -580,42 +623,4 @@ if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             try:
                 explainer_result = SignalExplainer.explain_signal(signal, candles)
                 if explainer_result['chart_path']:
-                    TelegramNotifier.send_chart(explainer_result['chart_path'])
-                if explainer_result['explanation']:
-                    TelegramNotifier.send_explanation(explainer_result['explanation'])
-            except Exception as e:
-                print(f"⚠️ Explainer failed (non-critical): {e}")
-
-            self._log_signal_performance(signal)
-            self.signal_count += 1
-            self.mode_signal_count[mode] += 1
-
-            coin = pair.split('USDT')[0]
-            if coin not in self.coin_signal_count:
-                self.coin_signal_count[coin] = 0
-            self.coin_signal_count[coin] += 1
-
-            coin_mode_key = f"{coin}_{mode}"
-            if coin_mode_key not in self.coin_mode_signal_count:
-                self.coin_mode_signal_count[coin_mode_key] = 0
-            self.coin_mode_signal_count[coin_mode_key] += 1
-
-            self.last_signal_time[f"{pair}_{mode}"] = datetime.now()
-            self.last_signal_price[pair] = current_price
-
-            if mode == 'TREND':
-                trend_key = f"{pair}_{trend}"
-                self.active_trends[trend_key] = {
-                    'started': datetime.now(),
-                    'entry_price': current_price,
-                    'direction': trend
-                }
-
-            self.signals_today.append(signal)
-            return signal
-
-        except Exception as e:
-            print(f"❌ ERROR analyzing {pair}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None
+                    TelegramNotifier.send_chart(explainer
