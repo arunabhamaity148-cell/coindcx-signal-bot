@@ -13,7 +13,7 @@ from telegram_notifier import TelegramNotifier
 
 
 class SignalGenerator:
-    """Pure Rule-Based Signal Generator"""
+    """Pure Rule-Based Signal Generator - Smart Filtering"""
 
     def __init__(self):
         self.signal_count = 0
@@ -72,7 +72,7 @@ class SignalGenerator:
             last_price = self.last_signal_price[key]
             price_change_pct = abs(current_price - last_price) / last_price * 100
             
-            MIN_MOVE = {'TREND': 2.0, 'MID': 1.2, 'SCALP': 0.8}
+            MIN_MOVE = {'TREND': 1.5, 'MID': 1.0, 'SCALP': 0.6}
             required_move = MIN_MOVE.get(mode, 1.0)
             
             if price_change_pct < required_move:
@@ -96,23 +96,65 @@ class SignalGenerator:
             return False
         return True
 
-    def _check_active_trend(self, pair: str, trend: str, current_price: float) -> bool:
-        """Check if trend is already active for this pair"""
+    def _check_active_trend(self, pair: str, trend: str, current_price: float, ema_fast: float, ema_slow: float, macd_hist: float) -> bool:
+        """Smart trend invalidation: price + structure"""
         trend_key = f"{pair}_{trend}"
         if trend_key in self.active_trends:
             active = self.active_trends[trend_key]
+            time_elapsed = (datetime.now() - active['started']).total_seconds() / 3600
+            
+            if time_elapsed > 8:
+                del self.active_trends[trend_key]
+                print(f"🔓 TREND expired: {pair} {trend} (8h TTL)")
+                return True
+            
             price_change = (current_price - active['entry_price']) / active['entry_price'] * 100
             
-            if trend == 'LONG' and price_change < -3.0:
-                del self.active_trends[trend_key]
-                print(f"🔓 TREND invalidated: {pair} LONG (price dropped 3%)")
-            elif trend == 'SHORT' and price_change > 3.0:
-                del self.active_trends[trend_key]
-                print(f"🔓 TREND invalidated: {pair} SHORT (price rose 3%)")
+            structural_break = False
+            if trend == 'LONG':
+                if price_change < -2.5:
+                    structural_break = True
+                if ema_fast < ema_slow:
+                    structural_break = True
             else:
-                print(f"❌ BLOCKED: {pair} | TREND already active since {active['started'].strftime('%H:%M')}")
+                if price_change > 2.5:
+                    structural_break = True
+                if ema_fast > ema_slow:
+                    structural_break = True
+            
+            if structural_break:
+                del self.active_trends[trend_key]
+                print(f"🔓 TREND invalidated: {pair} {trend} (structure broken)")
+                return True
+            else:
+                print(f"❌ BLOCKED: {pair} | TREND active since {active['started'].strftime('%H:%M')} ({time_elapsed:.1f}h)")
                 return False
         return True
+
+    def _check_btc_context(self) -> tuple[bool, str]:
+        """Minimal BTC stability check"""
+        try:
+            btc_candles = CoinDCXAPI.get_candles('BTCUSDT', '15m', 20)
+            if btc_candles.empty:
+                return True, "BTC check skipped"
+            
+            btc_close = btc_candles['close']
+            btc_high = btc_candles['high']
+            btc_low = btc_candles['low']
+            
+            btc_atr = Indicators.atr(btc_high, btc_low, btc_close)
+            if len(btc_atr) < 2:
+                return True, "BTC check skipped"
+            
+            current_btc_atr = float(btc_atr.iloc[-1])
+            avg_btc_atr = float(btc_atr.tail(10).mean())
+            
+            if current_btc_atr > avg_btc_atr * 2.0:
+                return False, "BTC high volatility"
+            
+            return True, "BTC stable"
+        except:
+            return True, "BTC check skipped"
 
     def _check_trading_hours(self) -> tuple[bool, str]:
         """HARD BLOCK: 01:00-07:00 IST"""
@@ -169,8 +211,7 @@ class SignalGenerator:
         else:
             if tp1 >= entry or tp2 >= entry or tp1 <= tp2 or sl <= entry:
                 return None
-
-        return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
+return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
 
     def _check_liquidation_safety(self, entry: float, sl: float) -> tuple[bool, float]:
         """Ensure SL is far enough from liquidation price"""
@@ -228,7 +269,7 @@ class SignalGenerator:
             print(f"⚠️ Performance logging failed: {e}")
 
     def _calculate_signal_score(self, indicators: Dict, trend_strength: str, sweep: bool, ob: bool, fvg: bool, key_level: bool, mode: str) -> int:
-        """Scoring - mode-aware volume gating"""
+        """Smart volume-aware scoring"""
         score = 0
         rsi = indicators['rsi']
         if 35 < rsi < 65:
@@ -251,17 +292,18 @@ class SignalGenerator:
         else:
             score += 8
         
+        volume = indicators['volume_surge']
         if mode == 'TREND':
-            if indicators['volume_surge'] > 1.5:
+            if volume >= 1.2:
                 score += 14
-            elif indicators['volume_surge'] > 1.2:
+            elif volume >= 1.0:
                 score += 10
-            else:
-                score += 7
+            elif volume >= 0.8:
+                score += 6
         else:
-            if indicators['volume_surge'] > 1.5:
+            if volume > 1.5:
                 score += 14
-            elif indicators['volume_surge'] > 1.0:
+            elif volume > 1.0:
                 score += 10
             else:
                 score += 5
@@ -283,7 +325,7 @@ class SignalGenerator:
         return min(score, 100)
 
     def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
-        """Pure Rule-Based Analysis"""
+        """Smart Rule-Based Analysis"""
         if mode is None:
             mode = config.MODE
         mode_config = config.MODE_CONFIG[mode]
@@ -299,6 +341,12 @@ class SignalGenerator:
         if is_blocked:
             print(f"❌ BLOCKED: {pair} | {mode} | News: {reason}")
             return None
+        
+        btc_stable, btc_reason = self._check_btc_context()
+        if not btc_stable:
+            print(f"❌ BLOCKED: {pair} | {mode} | {btc_reason}")
+            return None
+        
         if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             print(f"❌ BLOCKED: {pair} | {mode} | Daily limit")
             return None
@@ -347,6 +395,8 @@ class SignalGenerator:
             current_macd_hist = float(histogram.iloc[-1])
             prev_macd_hist = float(histogram.iloc[-2]) if len(histogram) > 1 else 0.0
             current_volume_surge = float(volume_surge.iloc[-1]) if len(volume_surge) > 0 else 1.0
+            current_ema_fast = float(ema_fast.iloc[-1])
+            current_ema_slow = float(ema_slow.iloc[-1])
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
                 return None
             
@@ -432,12 +482,13 @@ class SignalGenerator:
                     near_ob, ob_info = Indicators.is_near_order_block(current_price, order_blocks)
             except:
                 pass
-if mode == 'TREND':
-                if trend == "LONG" and (current_rsi > 60 or current_rsi < 40):
-                    print(f"❌ BLOCKED: {pair} | TREND RSI out of pullback zone (40-60) | Got {current_rsi}")
+            
+            if mode == 'TREND':
+                if trend == "LONG" and (current_rsi > 65 or current_rsi < 38):
+                    print(f"❌ BLOCKED: {pair} | TREND RSI out of range (38-65) | Got {current_rsi}")
                     return None
-                if trend == "SHORT" and (current_rsi < 40 or current_rsi > 60):
-                    print(f"❌ BLOCKED: {pair} | TREND RSI out of pullback zone (40-60) | Got {current_rsi}")
+                if trend == "SHORT" and (current_rsi < 35 or current_rsi > 62):
+                    print(f"❌ BLOCKED: {pair} | TREND RSI out of range (35-62) | Got {current_rsi}")
                     return None
             else:
                 if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
@@ -486,7 +537,7 @@ if mode == 'TREND':
                 return None
             
             if mode == 'TREND':
-                if not self._check_active_trend(pair, trend, current_price):
+                if not self._check_active_trend(pair, trend, current_price, current_ema_fast, current_ema_slow, current_macd_hist):
                     return None
 
             signal = {
@@ -502,14 +553,16 @@ if mode == 'TREND':
             print(f"\n{'='*60}")
             print(f"📊 Rule-based PASSED: {pair} {trend}")
             print(f"{'='*60}")
+            
             chatgpt_approved = self.chatgpt_advisor.final_trade_decision(signal, candles)
             if not chatgpt_approved:
                 self.chatgpt_rejected += 1
                 print(f"❌ Safety check failed")
                 return None
+            
             self.chatgpt_approved += 1
             print(f"✅ {mode}: {pair} APPROVED!")
-            print(f"   Score: {score}/100 | RR: {rr_value:.2f}R")
+            print(f"   Score: {score}/100 | RR: {rr_value:.2f}R | Vol: {current_volume_surge:.2f}x")
             print(f"   Entry: ₹{levels['entry']:,.6f}")
             print(f"   SL: ₹{levels['sl']:,.6f}")
             print(f"   TP1: ₹{levels['tp1']:,.6f}")
@@ -539,42 +592,5 @@ if mode == 'TREND':
             
             coin = pair.split('USDT')[0]
             if coin not in self.coin_signal_count:
-                self.coin_signal_count[coin] = 0
-            self.coin_signal_count[coin] += 1
-            
-            coin_mode_key = f"{coin}_{mode}"
-            if coin_mode_key not in self.coin_mode_signal_count:
-                self.coin_mode_signal_count[coin_mode_key] = 0
-            self.coin_mode_signal_count[coin_mode_key] += 1
-            
-            if mode == 'TREND':
-                trend_key = f"{pair}_{trend}"
-                self.active_trends[trend_key] = {
-                    'direction': trend,
-                    'entry_price': current_price,
-                    'started': datetime.now()
-                }
-            
-            self.signals_today.append(signal)
-            cooldown_key = f"{pair}_{mode}"
-            self.last_signal_time[cooldown_key] = datetime.now()
-            self.last_signal_price[pair] = current_price
-            return signal
-        except Exception as e:
-            print(f"❌ BLOCKED: {pair} | {mode} | Exception: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-    def get_stats(self) -> Dict:
-        """Get statistics"""
-        total_evaluated = self.chatgpt_approved + self.chatgpt_rejected
-        approval_rate = (self.chatgpt_approved / total_evaluated * 100) if total_evaluated > 0 else 0
-        return {
-            'signals_today': self.signal_count, 'signals_remaining': config.MAX_SIGNALS_PER_DAY - self.signal_count,
-            'mode_breakdown': self.mode_signal_count, 'coin_breakdown': self.coin_signal_count,
-            'mode': 'MULTI' if config.MULTI_MODE_ENABLED else config.MODE,
-            'last_reset': self.last_reset_date.strftime('%Y-%m-%d'), 'chatgpt_approved': self.chatgpt_approved,
-            'chatgpt_rejected': self.chatgpt_rejected, 'chatgpt_approval_rate': f"{approval_rate:.1f}%",
-            'active_trends': len(self.active_trends)
-        }
+    self.coin_signal_count[coin] = 0
+self.coin_signal_count[coin] += 1
