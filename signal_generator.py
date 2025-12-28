@@ -36,20 +36,13 @@ class SignalGenerator:
     def get_stats(self) -> dict:
         """Return a dict with counters that main.py prints/shows."""
         return {
-            "total_signals_today": self.signal_count,
+            "signals_today": self.signal_count,
             "mode_breakdown": dict(self.mode_signal_count),
             "coin_breakdown": dict(self.coin_signal_count),
             "chatgpt_approved": self.chatgpt_approved,
             "chatgpt_rejected": self.chatgpt_rejected,
             "signals_today_list": self.signals_today.copy()
         }
-
-    # optional convenience helper
-    def print_stats(self):
-        stats = self.get_stats()
-        print("📊 SignalGenerator stats:")
-        for k, v in stats.items():
-            print(f"   {k}: {v}")
 
     def _reset_daily_counters(self):
         """Reset signal counters at midnight"""
