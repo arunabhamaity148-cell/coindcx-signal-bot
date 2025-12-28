@@ -211,7 +211,8 @@ class SignalGenerator:
         else:
             if tp1 >= entry or tp2 >= entry or tp1 <= tp2 or sl <= entry:
                 return None
-return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
+        
+        return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
 
     def _check_liquidation_safety(self, entry: float, sl: float) -> tuple[bool, float]:
         """Ensure SL is far enough from liquidation price"""
@@ -623,4 +624,42 @@ return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
             try:
                 explainer_result = SignalExplainer.explain_signal(signal, candles)
                 if explainer_result['chart_path']:
-                    TelegramNotifier.send_chart(explainer
+                    TelegramNotifier.send_chart(explainer_result['chart_path'])
+                if explainer_result['explanation']:
+                    TelegramNotifier.send_explanation(explainer_result['explanation'])
+            except Exception as e:
+                print(f"⚠️ Explainer failed (non-critical): {e}")
+
+            self._log_signal_performance(signal)
+            self.signal_count += 1
+            self.mode_signal_count[mode] += 1
+
+            coin = pair.split('USDT')[0]
+            if coin not in self.coin_signal_count:
+                self.coin_signal_count[coin] = 0
+            self.coin_signal_count[coin] += 1
+
+            coin_mode_key = f"{coin}_{mode}"
+            if coin_mode_key not in self.coin_mode_signal_count:
+                self.coin_mode_signal_count[coin_mode_key] = 0
+            self.coin_mode_signal_count[coin_mode_key] += 1
+
+            self.last_signal_time[f"{pair}_{mode}"] = datetime.now()
+            self.last_signal_price[pair] = current_price
+
+            if mode == 'TREND':
+                trend_key = f"{pair}_{trend}"
+                self.active_trends[trend_key] = {
+                    'started': datetime.now(),
+                    'entry_price': current_price,
+                    'direction': trend
+                }
+
+            self.signals_today.append(signal)
+            return signal
+
+        except Exception as e:
+            print(f"❌ ERROR analyzing {pair}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
