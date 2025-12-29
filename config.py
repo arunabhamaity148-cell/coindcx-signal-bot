@@ -6,10 +6,8 @@ class Config:
     """
     Multi-Mode Bot Configuration: QUICK + MID + TREND Together
     
-    ✅ NEW: ChatGPT as Final Trade Judge
-    - Every signal reviewed by ChatGPT before sending
-    - Timeout/error = signal rejected (safety first)
-    - Strict JSON-only responses
+    ✅ OPTIMIZED: 14 pairs + 90s interval for balanced coverage
+    ✅ ChatGPT as Final Trade Judge
     """
 
     # API Keys (Railway environment variables)
@@ -28,11 +26,13 @@ class Config:
     ACTIVE_MODES = ['QUICK', 'MID', 'TREND']
 
     MODE = 'QUICK'  # Default (for backward compatibility)
-    MAX_SIGNALS_PER_DAY = 18  # 6 per mode (3 modes × 6 = 18 total)
+    MAX_SIGNALS_PER_DAY = 24  # ✅ INCREASED: 8 per mode (3 modes × 8 = 24 total)
     MAX_LEVERAGE = 15
 
-    # Trading Pairs - CoinDCX format
+    # ✅ OPTIMIZED: 14 high-quality pairs (9 → 14)
+    # Added: MATIC, LINK, ATOM, LTC, TRX (all high volume)
     PAIRS = [
+        # Original 9 (kept)
         'BTCUSDT',
         'ETHUSDT',
         'SOLUSDT',
@@ -41,10 +41,23 @@ class Config:
         'DOGEUSDT',
         'BNBUSDT',
         'BCHUSDT',
-        'SUIUSDT'
+        'SUIUSDT',
+        
+        # ✅ NEW: 5 high-volume additions
+        'MATICUSDT',  # Good for scalping, consistent volume
+        'LINKUSDT',   # Strong trends, DeFi leader
+        'ATOMUSDT',   # Good volatility, cosmos ecosystem
+        'LTCUSDT',    # Established, very liquid
+        'TRXUSDT',    # Highest volume, stable moves
     ]
 
-    # ✅ FINAL TUNED: Compact SL-TP + High Quality + FIXED ADX
+    # ✅ SCAN INTERVAL: Increased for 14 pairs (60s → 90s)
+    # 14 pairs × 3 modes = 42 scans
+    # ~2-3s per scan = ~90-120s total
+    # 90s interval = perfect timing
+    SCAN_INTERVAL_SECONDS = 90  # ✅ NEW: Was 60, now 90
+
+    # ✅ FINAL TUNED: Compact SL-TP + High Quality
     MODE_CONFIG = {
         'QUICK': {
             'timeframe': '5m',
@@ -55,7 +68,7 @@ class Config:
             'atr_tp1_multiplier': 3.6,   # 2:1 R:R
             'atr_tp2_multiplier': 5.4,   # 3:1 R:R
             'min_score': 55,
-            'min_adx': 25  # ✅ FIX #3: Changed from 20 to 25 (stricter)
+            'min_adx': 25
         },
         'MID': {
             'timeframe': '15m',
@@ -85,7 +98,7 @@ class Config:
     LIQUIDATION_BUFFER = 0.012   # 1.2%
     MIN_ADX_STRENGTH = 20
     COOLDOWN_MINUTES = 8  # Legacy - kept for compatibility
-    
+
     # ⏸️ SAME-PAIR COOLDOWN (prevents signal spam)
     SAME_PAIR_COOLDOWN_MINUTES = 30  # 30 minutes per (PAIR + MODE)
 
@@ -105,11 +118,10 @@ class Config:
     # Score
     MIN_SIGNAL_SCORE = 35
 
-    # ✅ FIX #1 & #4: Minimum TP distance protection for low-price coins
+    # ✅ Minimum TP distance protection for low-price coins
     MIN_TP_DISTANCE_PERCENT = 0.8  # 0.8% minimum TP distance from entry
 
-    # ✅ FIX #1: Dynamic decimal precision based on price
-    # For coins < $1: use more decimals to preserve TP accuracy
+    # ✅ Dynamic decimal precision based on price
     PRICE_DECIMAL_RULES = {
         'low': (1.0, 4),      # Price < $1: 4 decimals (e.g., 0.1234)
         'mid': (100.0, 2),    # $1-$100: 2 decimals (e.g., 12.34)
@@ -132,25 +144,25 @@ class Config:
     # ================================
     # 🤖 CHATGPT FINAL JUDGE SETTINGS
     # ================================
-    
+
     # ChatGPT as Final Trade Judge (MANDATORY)
     CHATGPT_FINAL_JUDGE_ENABLED = True  # Set to False to disable ChatGPT review
-    
+
     # Timeout settings (safety first)
     CHATGPT_TIMEOUT = 8  # seconds per API call
     CHATGPT_MAX_RETRIES = 2  # retry attempts before giving up
-    
+
     # Fallback behavior on ChatGPT failure
     # If True: timeout/error = approve signal (risky)
     # If False: timeout/error = reject signal (safe) ✅ RECOMMENDED
     CHATGPT_FALLBACK_APPROVE = False
-    
+
     # Temperature for consistency (0.0-1.0)
     CHATGPT_TEMPERATURE = 0.2  # Low = more consistent decisions
-    
+
     # Max tokens for response (keep low for JSON-only)
     CHATGPT_MAX_TOKENS = 100
-    
+
     # ChatGPT Evaluation Criteria (informational only)
     CHATGPT_REJECTION_CRITERIA = [
         "Late entries (momentum exhausted)",
@@ -160,10 +172,10 @@ class Config:
         "No pullback confirmation",
         "Chasing price action"
     ]
-    
+
     # Minimum approval confidence (if ChatGPT provides it)
     CHATGPT_MIN_CONFIDENCE = 70  # 0-100 scale
-    
+
     # ================================
     # LEGACY CHATGPT SETTINGS (kept for trap validation)
     # ================================
@@ -179,32 +191,34 @@ class Config:
             'TELEGRAM_BOT_TOKEN',
             'TELEGRAM_CHAT_ID'
         ]
-        
+
         # ChatGPT API key required if final judge is enabled
         if cls.CHATGPT_FINAL_JUDGE_ENABLED:
             required.append('CHATGPT_API_KEY')
-        
+
         missing = [v for v in required if not getattr(cls, v)]
         if missing:
             raise ValueError(f"❌ Missing env vars: {', '.join(missing)}")
 
         print("✅ Configuration validated")
-        
+
         # Multi-mode info
         if cls.MULTI_MODE_ENABLED:
             print(f"🎯 Multi-Mode: {', '.join(cls.ACTIVE_MODES)}")
         else:
             print(f"📊 Mode: {cls.MODE}")
-        
-        # Signal limits
-        print(f"📈 Max signals: {cls.MAX_SIGNALS_PER_DAY}/day")
-        
+
+        # ✅ NEW: Display optimized settings
+        print(f"📊 Tracking: {len(cls.PAIRS)} pairs")
+        print(f"⏱️  Scan interval: {cls.SCAN_INTERVAL_SECONDS}s")
+        print(f"📈 Max signals: {cls.MAX_SIGNALS_PER_DAY}/day ({cls.MAX_SIGNALS_PER_DAY // len(cls.ACTIVE_MODES)} per mode)")
+
         # Risk parameters
         print(f"⚡ Min ADX: {cls.MIN_ADX_STRENGTH}")
         print(f"🛡️ Liquidation buffer: {cls.LIQUIDATION_BUFFER*100}%")
         print(f"⏸️  Same-pair cooldown: {cls.SAME_PAIR_COOLDOWN_MINUTES} minutes")
         print(f"🎯 Min TP distance: {cls.MIN_TP_DISTANCE_PERCENT}%")
-        
+
         # 🤖 ChatGPT Final Judge status
         print(f"\n{'='*50}")
         if cls.CHATGPT_FINAL_JUDGE_ENABLED:
@@ -219,7 +233,7 @@ class Config:
             print(f"⚠️  ChatGPT Final Judge: DISABLED")
             print(f"   Signals will be sent based on rules only")
         print(f"{'='*50}\n")
-        
+
         return True
 
 
@@ -235,7 +249,7 @@ class Config:
     def get_decimal_places(cls, price: float) -> int:
         """
         Get appropriate decimal places based on price
-        ✅ FIX #1: Prevents rounding errors for low-price coins
+        ✅ Prevents rounding errors for low-price coins
         """
         for rule_name, (threshold, decimals) in cls.PRICE_DECIMAL_RULES.items():
             if price < threshold:
@@ -248,7 +262,7 @@ class Config:
         """Get formatted ChatGPT configuration for display"""
         if not cls.CHATGPT_FINAL_JUDGE_ENABLED:
             return "ChatGPT Final Judge: DISABLED"
-        
+
         return f"""
 🤖 ChatGPT Final Judge Configuration:
    ├─ Model: {cls.CHATGPT_MODEL}
