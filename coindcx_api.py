@@ -9,9 +9,9 @@ from config import config
 
 class CoinDCXAPI:
     """CoinDCX API with Binance Historical Data"""
-    
+
     BASE_URL = config.COINDCX_BASE_URL
-    
+
     @staticmethod
     def _generate_signature(secret: str, payload: str) -> str:
         """Generate HMAC SHA256 signature"""
@@ -20,18 +20,18 @@ class CoinDCXAPI:
             payload.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
-    
+
     @staticmethod
     def _get_headers(payload: str) -> Dict:
         """Generate headers with signature"""
         signature = CoinDCXAPI._generate_signature(config.COINDCX_SECRET, payload)
-        
+
         return {
             'Content-Type': 'application/json',
             'X-AUTH-APIKEY': config.COINDCX_API_KEY,
             'X-AUTH-SIGNATURE': signature
         }
-    
+
     @staticmethod
     def get_candles(pair: str, interval: str, limit: int = 250) -> pd.DataFrame:
         """
@@ -40,9 +40,9 @@ class CoinDCXAPI:
         Returns:
             DataFrame with adjusted OHLCV candles
         """
-        
+
         print(f"🔄 Fetching data for {pair}...")
-        
+
         try:
             # Step 1: Get CoinDCX current price
             print(f"   Step 1: Getting CoinDCX price...")
@@ -50,18 +50,18 @@ class CoinDCXAPI:
             response = requests.get(ticker_url, timeout=10)
             response.raise_for_status()
             tickers = response.json()
-            
+
             coindcx_price = None
             for ticker in tickers:
                 if ticker.get('market') == pair:
                     coindcx_price = float(ticker.get('last_price', 0))
                     print(f"   ✅ CoinDCX price: ₹{coindcx_price:,.2f}")
                     break
-            
+
             if not coindcx_price or coindcx_price <= 0:
                 print(f"   ❌ CoinDCX price not found")
                 return pd.DataFrame()
-            
+
             # Step 2: Get Binance candles
             print(f"   Step 2: Fetching {limit} Binance candles...")
             binance_url = "https://api.binance.com/api/v3/klines"
@@ -70,17 +70,20 @@ class CoinDCXAPI:
                 'interval': interval,
                 'limit': limit
             }
-            
+
             response = requests.get(binance_url, params=params, timeout=10)
             response.raise_for_status()
             binance_data = response.json()
+
+            # Smart minimum check based on requested limit
+            min_required = min(20, limit)  # At least 20 or whatever was requested
             
-            if not binance_data or len(binance_data) < 50:
-                print(f"   ❌ Binance data insufficient ({len(binance_data) if binance_data else 0} candles)")
+            if not binance_data or len(binance_data) < min_required:
+                print(f"   ❌ Binance data insufficient ({len(binance_data) if binance_data else 0} candles, need {min_required})")
                 return pd.DataFrame()
-            
+
             print(f"   ✅ Got {len(binance_data)} Binance candles")
-            
+
             # Step 3: Parse candles
             print(f"   Step 3: Parsing candles...")
             candles = []
@@ -93,26 +96,26 @@ class CoinDCXAPI:
                     'close': float(candle[4]),
                     'volume': float(candle[5])
                 })
-            
+
             df = pd.DataFrame(candles)
-            
+
             # Step 4: Adjust prices
             print(f"   Step 4: Adjusting to CoinDCX price...")
             binance_last = df['close'].iloc[-1]
             ratio = coindcx_price / binance_last
-            
+
             df['open'] = df['open'] * ratio
             df['high'] = df['high'] * ratio
             df['low'] = df['low'] * ratio
             df['close'] = df['close'] * ratio
-            
+
             final_price = df['close'].iloc[-1]
-            
+
             print(f"   ✅ Adjusted: Binance ${binance_last:,.2f} → CoinDCX ₹{final_price:,.2f}")
             print(f"✅ {pair}: Ready with {len(df)} candles")
-            
+
             return df
-            
+
         except requests.exceptions.Timeout:
             print(f"   ❌ Timeout fetching data for {pair}")
             return pd.DataFrame()
@@ -124,7 +127,7 @@ class CoinDCXAPI:
             import traceback
             traceback.print_exc()
             return pd.DataFrame()
-    
+
     @staticmethod
     def get_ticker(pair: str) -> Optional[Dict]:
         """Get current ticker price"""
@@ -133,7 +136,7 @@ class CoinDCXAPI:
             response = requests.get(endpoint, timeout=10)
             response.raise_for_status()
             tickers = response.json()
-            
+
             for ticker in tickers:
                 if ticker.get('market') == pair:
                     return {
@@ -141,16 +144,16 @@ class CoinDCXAPI:
                         'ask': float(ticker.get('ask', 0)),
                         'last': float(ticker.get('last_price', 0))
                     }
-            
+
             return None
-            
+
         except:
             return None
-    
+
     @staticmethod
     def place_order(pair: str, side: str, price: float, quantity: float, leverage: int) -> Dict:
         """Place futures order"""
-        
+
         if not config.AUTO_TRADE:
             print(f"\n{'='*50}")
             print(f"🔸 DRY RUN MODE - NO REAL ORDER")
@@ -161,13 +164,13 @@ class CoinDCXAPI:
             print(f"Quantity: {quantity}")
             print(f"Leverage: {leverage}x")
             print(f"{'='*50}\n")
-            
+
             return {'status': 'dry_run', 'message': 'Order not placed'}
-        
+
         # Real order code here...
         endpoint = f"{CoinDCXAPI.BASE_URL}/exchange/v1/orders/create"
         timestamp = int(time.time() * 1000)
-        
+
         body = {
             "side": side.lower(),
             "order_type": "limit_order",
@@ -177,10 +180,10 @@ class CoinDCXAPI:
             "leverage": leverage,
             "timestamp": timestamp
         }
-        
+
         payload = json.dumps(body, separators=(',', ':'))
         headers = CoinDCXAPI._get_headers(payload)
-        
+
         try:
             response = requests.post(endpoint, data=payload, headers=headers, timeout=10)
             response.raise_for_status()
@@ -188,7 +191,7 @@ class CoinDCXAPI:
         except Exception as e:
             print(f"❌ Order failed: {e}")
             return {'status': 'error', 'message': str(e)}
-    
+
     @staticmethod
     def test_connection() -> bool:
         """Test API connection"""
