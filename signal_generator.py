@@ -30,20 +30,6 @@ class SignalGenerator:
         self.chatgpt_rejected = 0
         self.active_positions: Dict[str, Dict] = {}
 
-    # ------------------------------------------------------------------
-    #  STATS – called from main.py every cycle and on shutdown
-    # ------------------------------------------------------------------
-    def get_stats(self) -> dict:
-        """Return a dict with counters that main.py prints/shows."""
-        return {
-            "signals_today": self.signal_count,
-            "mode_breakdown": dict(self.mode_signal_count),
-            "coin_breakdown": dict(self.coin_signal_count),
-            "chatgpt_approved": self.chatgpt_approved,
-            "chatgpt_rejected": self.chatgpt_rejected,
-            "signals_today_list": self.signals_today.copy()
-        }
-
     def _reset_daily_counters(self):
         """Reset signal counters at midnight"""
         today = datetime.now().date()
@@ -149,7 +135,7 @@ class SignalGenerator:
         """Minimal BTC stability check"""
         try:
             btc_candles = CoinDCXAPI.get_candles('BTCUSDT', '15m', 20)
-            if btc_candles.empty:
+            if btc_candles is None or btc_candles.empty or len(btc_candles) < 10:
                 return True, "BTC check skipped"
 
             btc_close = btc_candles['close']
@@ -157,7 +143,7 @@ class SignalGenerator:
             btc_low = btc_candles['low']
 
             btc_atr = Indicators.atr(btc_high, btc_low, btc_close)
-            if len(btc_atr) < 2:
+            if btc_atr is None or len(btc_atr) < 2:
                 return True, "BTC check skipped"
 
             current_btc_atr = float(btc_atr.iloc[-1])
@@ -168,15 +154,12 @@ class SignalGenerator:
 
             return True, "BTC stable"
         except Exception as e:
+            print(f"⚠️ BTC check error: {e}")
             return True, "BTC check skipped"
 
     def _check_trading_hours(self) -> tuple[bool, str]:
-        """HARD BLOCK: 01:00-07:00 IST"""
-        now = datetime.now()
-        current_hour = now.hour
-        if 1 <= current_hour < 7:
-            return False, f"Dead hours (01:00-07:00 IST)"
-        return True, "Trading hours OK"
+        """Trading hours check - DISABLED (24/7 trading)"""
+        return True, "24/7 Trading"
 
     def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Optional[Dict]:
         """Calculate entry, SL, TP with minimum distance enforcement"""
@@ -338,8 +321,7 @@ class SignalGenerator:
         if key_level:
             score += 6
         return min(score, 100)
-
-    def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
+def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
         """Smart Rule-Based Analysis"""
         if mode is None:
             mode = config.MODE
@@ -677,3 +659,15 @@ class SignalGenerator:
             import traceback
             traceback.print_exc()
             return None
+
+    def get_stats(self) -> Dict:
+        """Get current statistics"""
+        return {
+            'total_signals': self.signal_count,
+            'signals_today': len(self.signals_today),
+            'chatgpt_approved': self.chatgpt_approved,
+            'chatgpt_rejected': self.chatgpt_rejected,
+            'mode_signals': self.mode_signal_count.copy(),
+            'coin_signals': self.coin_signal_count.copy(),
+            'active_trends': len(self.active_trends)
+        }
