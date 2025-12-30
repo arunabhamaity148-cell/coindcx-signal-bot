@@ -13,7 +13,7 @@ from telegram_notifier import TelegramNotifier
 
 
 class SignalGenerator:
-    """Pure Rule-Based Signal Generator - Smart Filtering"""
+    """Pure Rule-Based Signal Generator - SMART Quality Filters"""
 
     def __init__(self):
         self.signal_count = 0
@@ -83,7 +83,7 @@ class SignalGenerator:
             last_price = self.last_signal_price[key]
             price_change_pct = abs(current_price - last_price) / last_price * 100
 
-            MIN_MOVE = {'TREND': 1.5, 'MID': 1.0, 'SCALP': 0.6}
+            MIN_MOVE = {'TREND': 1.5, 'MID': 1.0, 'QUICK': 0.6, 'SCALP': 0.6}
             required_move = MIN_MOVE.get(mode, 1.0)
 
             if price_change_pct < required_move:
@@ -93,7 +93,7 @@ class SignalGenerator:
 
     def _check_coin_daily_limit(self, pair: str, mode: str) -> bool:
         """Check per-coin per-mode daily signal limit"""
-        LIMITS = {'TREND': 2, 'MID': 3, 'SCALP': 4}
+        LIMITS = {'TREND': 2, 'MID': 3, 'QUICK': 4, 'SCALP': 4}
         max_signals = LIMITS.get(mode, 3)
 
         coin = pair.split('USDT')[0]
@@ -235,7 +235,7 @@ class SignalGenerator:
         tp1_distance = abs(tp1 - entry) / entry * 100
         rr = tp1_distance / sl_distance if sl_distance > 0 else 0
 
-        MIN_RR = {'TREND': 2.0, 'MID': 1.8, 'SCALP': 1.5}
+        MIN_RR = {'TREND': 2.0, 'MID': 1.8, 'QUICK': 1.5, 'SCALP': 1.5}
         required_rr = MIN_RR.get(mode, 1.5)
 
         if rr < required_rr:
@@ -334,7 +334,7 @@ class SignalGenerator:
         return min(score, 100)
 
     def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
-        """Smart Rule-Based Analysis"""
+        """Smart Rule-Based Analysis with Quality Filters"""
         if mode is None:
             mode = config.MODE
         mode_config = config.MODE_CONFIG[mode]
@@ -420,8 +420,13 @@ class SignalGenerator:
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
                 return None
 
+            # ✅ VOLUME CHECKS (Mode-specific)
             if mode == 'TREND' and current_volume_surge < 0.8:
                 print(f"❌ BLOCKED: {pair} | TREND volume < 0.8x (got {current_volume_surge}x)")
+                return None
+
+            if mode == 'QUICK' and current_volume_surge < 1.0:
+                print(f"❌ BLOCKED: {pair} | QUICK volume < 1.0x (got {current_volume_surge:.2f}x)")
                 return None
 
             if not self._check_price_movement(pair, current_price, mode):
@@ -508,6 +513,7 @@ class SignalGenerator:
             except Exception as e:
                 pass
 
+            # ✅ MODE-SPECIFIC RSI & ADX QUALITY FILTERS
             if mode == 'TREND':
                 if trend == "LONG" and (current_rsi > 65 or current_rsi < 38):
                     print(f"❌ BLOCKED: {pair} | TREND RSI out of range (38-65) | Got {current_rsi}")
@@ -515,7 +521,42 @@ class SignalGenerator:
                 if trend == "SHORT" and (current_rsi < 35 or current_rsi > 62):
                     print(f"❌ BLOCKED: {pair} | TREND RSI out of range (35-62) | Got {current_rsi}")
                     return None
-            else:
+            
+            elif mode == 'MID':
+                # ✅ FIX 4: ADX exhaustion filter FIRST (before general RSI check)
+                if trend == "SHORT":
+                    if current_adx > 50 and current_rsi < 32:
+                        print(f"❌ BLOCKED: {pair} | MID SHORT | Exhaustion zone (ADX {current_adx:.1f}, RSI {current_rsi:.1f})")
+                        return None
+                
+                # ✅ FIX 1: MID mode stricter RSI floor for SHORT
+                if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
+                    print(f"❌ BLOCKED: {pair} | MID | RSI overbought")
+                    return None
+                if trend == "SHORT" and current_rsi < 35:
+                    print(f"❌ BLOCKED: {pair} | MID SHORT | RSI too low (need >35, got {current_rsi:.1f})")
+                    return None
+                
+                # ✅ FIX 2: MID mode volume floor (SHORT only)
+                if trend == "SHORT" and current_volume_surge < 0.8:
+                    print(f"❌ BLOCKED: {pair} | MID SHORT | Volume too low (need >0.8x, got {current_volume_surge:.2f}x)")
+                    return None
+            
+            elif mode == 'QUICK':
+                # ✅ QUICK mode SMART filters
+                if trend == "LONG" and current_rsi > 60:
+                    print(f"❌ BLOCKED: {pair} | QUICK LONG | RSI too high (need ≤60, got {current_rsi:.1f})")
+                    return None
+                if trend == "SHORT" and current_rsi < 40:
+                    print(f"❌ BLOCKED: {pair} | QUICK SHORT | RSI too low (need ≥40, got {current_rsi:.1f})")
+                    return None
+                
+                # Block QUICK if ADX too strong (trending market, not scalp)
+                if current_adx > 35:
+                    print(f"❌ BLOCKED: {pair} | QUICK | ADX too strong (need <35, got {current_adx:.1f})")
+                    return None
+            
+            else:  # SCALP mode - keep original logic
                 if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
                     print(f"❌ BLOCKED: {pair} | {mode} | RSI overbought")
                     return None
@@ -531,6 +572,13 @@ class SignalGenerator:
             if levels is None:
                 print(f"❌ BLOCKED: {pair} | {mode} | Invalid SL/TP")
                 return None
+
+            # ✅ FIX 3: Post-rounding TP sanity check (MID mode)
+            if mode == 'MID':
+                tp1_distance_pct = abs(levels['tp1'] - levels['entry']) / levels['entry'] * 100
+                if tp1_distance_pct < 0.4:
+                    print(f"❌ BLOCKED: {pair} | MID | TP1 too close to entry ({tp1_distance_pct:.2f}%)")
+                    return None
 
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
             if not is_safe:
@@ -553,121 +601,13 @@ class SignalGenerator:
             except Exception as e:
                 mtf_trend = "UNKNOWN"
 
-            if mode == 'TREND' and mtf_trend not in ['STRONG_UP', 'STRONG_DOWN']:
-                print(f"❌ BLOCKED: {pair} | TREND requires STRONG MTF (got {mtf_trend})")
-                return None
-
-            indicators_data = {
-                'rsi': current_rsi,
-                'adx': current_adx,
-                'macd_histogram': current_macd_hist,
-                'prev_macd_histogram': prev_macd_hist,
-                'volume_surge': current_volume_surge
-            }
-            score = self._calculate_signal_score(indicators_data, mtf_trend, sweep_detected, near_ob, has_fvg, near_key_level, mode)
-            if score < min_score:
-                print(f"❌ BLOCKED: {pair} | {mode} | Score: {score}/{min_score}")
-                return None
-
+            # ✅ FIX 5: TREND counter-trend SHORT confirmation (simplified)
             if mode == 'TREND':
-                if not self._check_active_trend(pair, trend, current_price, current_ema_fast, current_ema_slow, current_macd_hist):
+                if mtf_trend not in ['STRONG_UP', 'STRONG_DOWN']:
+                    print(f"❌ BLOCKED: {pair} | TREND requires STRONG MTF (got {mtf_trend})")
                     return None
-
-            signal = {
-                'pair': pair,
-                'direction': trend,
-                'entry': levels['entry'],
-                'sl': levels['sl'],
-                'tp1': levels['tp1'],
-                'tp2': levels['tp2'],
-                'leverage': mode_config['leverage'],
-                'score': score,
-                'rsi': round(current_rsi, 1),
-                'adx': round(current_adx, 1),
-                'mtf_trend': mtf_trend,
-                'mode': mode,
-                'timeframe': mode_config['timeframe'],
-                'volume_surge': round(current_volume_surge, 2),
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'market_regime': regime,
-                'liquidity_sweep': sweep_detected,
-                'near_order_block': near_ob,
-                'fvg_fill': has_fvg,
-                'near_key_level': near_key_level,
-                'sweep_info': sweep_info if sweep_detected else {},
-                'ob_info': ob_info if near_ob else {},
-                'fvg_info': fvg_info if has_fvg else {},
-                'key_level_info': key_level_info if near_key_level else "",
-                'ema_fast_period': mode_config['ema_fast'],
-                'ema_slow_period': mode_config['ema_slow']
-            }
-
-            print(f"\n{'='*60}")
-            print(f"📊 Rule-based PASSED: {pair} {trend}")
-            print(f"{'='*60}")
-
-            chatgpt_approved = self.chatgpt_advisor.final_trade_decision(signal, candles)
-            if not chatgpt_approved:
-                self.chatgpt_rejected += 1
-                print(f"❌ Safety check failed")
-                return None
-
-            self.chatgpt_approved += 1
-            print(f"✅ {mode}: {pair} APPROVED!")
-            print(f"   Score: {score}/100 | RR: {rr_value:.2f}R | Vol: {current_volume_surge:.2f}x")
-            print(f"   Entry: ₹{levels['entry']:,.6f}")
-            print(f"   SL: ₹{levels['sl']:,.6f}")
-            print(f"   TP1: ₹{levels['tp1']:,.6f}")
-            print(f"   TP2: ₹{levels['tp2']:,.6f}")
-            if sweep_detected:
-                print(f"   💎 Liquidity Swept")
-            if near_ob:
-                print(f"   🎯 Near OB")
-            if has_fvg:
-                print(f"   💎 FVG Fill")
-            if near_key_level:
-                print(f"   🎯 {key_level_info}")
-            print(f"{'='*60}\n")
-
-            try:
-                explainer_result = SignalExplainer.explain_signal(signal, candles)
-                if explainer_result['chart_path']:
-                    TelegramNotifier.send_chart(explainer_result['chart_path'])
-                if explainer_result['explanation']:
-                    TelegramNotifier.send_explanation(explainer_result['explanation'])
-            except Exception as e:
-                print(f"⚠️ Explainer failed (non-critical): {e}")
-
-            self._log_signal_performance(signal)
-            self.signal_count += 1
-            self.mode_signal_count[mode] += 1
-
-            coin = pair.split('USDT')[0]
-            if coin not in self.coin_signal_count:
-                self.coin_signal_count[coin] = 0
-            self.coin_signal_count[coin] += 1
-
-            coin_mode_key = f"{coin}_{mode}"
-            if coin_mode_key not in self.coin_mode_signal_count:
-                self.coin_mode_signal_count[coin_mode_key] = 0
-            self.coin_mode_signal_count[coin_mode_key] += 1
-
-            self.last_signal_time[f"{pair}_{mode}"] = datetime.now()
-            self.last_signal_price[pair] = current_price
-
-            if mode == 'TREND':
-                trend_key = f"{pair}_{trend}"
-                self.active_trends[trend_key] = {
-                    'started': datetime.now(),
-                    'entry_price': current_price,
-                    'direction': trend
-                }
-
-            self.signals_today.append(signal)
-            return signal
-
-        except Exception as e:
-            print(f"❌ ERROR analyzing {pair}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None
+                
+                # Counter-trend SHORT: require RSI bearish + latest lower high
+                if mtf_trend == 'STRONG_UP' and trend == "SHORT":
+                    if current_rsi >= 50:
+                        print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | RSI not bearish ({current_rsi:.1f})")
