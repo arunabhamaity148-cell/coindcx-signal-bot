@@ -610,4 +610,126 @@ class SignalGenerator:
                 # Counter-trend SHORT: require RSI bearish + latest lower high
                 if mtf_trend == 'STRONG_UP' and trend == "SHORT":
                     if current_rsi >= 50:
-                        print(f"❌ BLOCKED: {pair} |
+                        print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | RSI not bearish ({current_rsi:.1f})")
+                        return None
+                    # Check only latest candle for lower high
+                    if len(candles) >= 2:
+                        recent_highs = candles['high'].tail(2).values
+                        if recent_highs[1] >= recent_highs[0]:
+                            print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | No lower high confirmation")
+                            return None
+
+            indicators_data = {
+                'rsi': current_rsi,
+                'adx': current_adx,
+                'macd_histogram': current_macd_hist,
+                'prev_macd_histogram': prev_macd_hist,
+                'volume_surge': current_volume_surge
+            }
+            score = self._calculate_signal_score(indicators_data, mtf_trend, sweep_detected, near_ob, has_fvg, near_key_level, mode)
+            if score < min_score:
+                print(f"❌ BLOCKED: {pair} | {mode} | Score: {score}/{min_score}")
+                return None
+
+            if mode == 'TREND':
+                if not self._check_active_trend(pair, trend, current_price, current_ema_fast, current_ema_slow, current_macd_hist):
+                    return None
+
+            signal = {
+                'pair': pair,
+                'direction': trend,
+                'entry': levels['entry'],
+                'sl': levels['sl'],
+                'tp1': levels['tp1'],
+                'tp2': levels['tp2'],
+                'leverage': mode_config['leverage'],
+                'score': score,
+                'rsi': round(current_rsi, 1),
+                'adx': round(current_adx, 1),
+                'mtf_trend': mtf_trend,
+                'mode': mode,
+                'timeframe': mode_config['timeframe'],
+                'volume_surge': round(current_volume_surge, 2),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'market_regime': regime,
+                'liquidity_sweep': sweep_detected,
+                'near_order_block': near_ob,
+                'fvg_fill': has_fvg,
+                'near_key_level': near_key_level,
+                'sweep_info': sweep_info if sweep_detected else {},
+                'ob_info': ob_info if near_ob else {},
+                'fvg_info': fvg_info if has_fvg else {},
+                'key_level_info': key_level_info if near_key_level else "",
+                'ema_fast_period': mode_config['ema_fast'],
+                'ema_slow_period': mode_config['ema_slow']
+            }
+
+            print(f"\n{'='*60}")
+            print(f"📊 Rule-based PASSED: {pair} {trend}")
+            print(f"{'='*60}")
+
+            chatgpt_approved = self.chatgpt_advisor.final_trade_decision(signal, candles)
+            if not chatgpt_approved:
+                self.chatgpt_rejected += 1
+                print(f"❌ Safety check failed")
+                return None
+
+            self.chatgpt_approved += 1
+            print(f"✅ {mode}: {pair} APPROVED!")
+            print(f"   Score: {score}/100 | RR: {rr_value:.2f}R | Vol: {current_volume_surge:.2f}x")
+            print(f"   Entry: ₹{levels['entry']:,.6f}")
+            print(f"   SL: ₹{levels['sl']:,.6f}")
+            print(f"   TP1: ₹{levels['tp1']:,.6f}")
+            print(f"   TP2: ₹{levels['tp2']:,.6f}")
+            if sweep_detected:
+                print(f"   💎 Liquidity Swept")
+            if near_ob:
+                print(f"   🎯 Near OB")
+            if has_fvg:
+                print(f"   💎 FVG Fill")
+            if near_key_level:
+                print(f"   🎯 {key_level_info}")
+            print(f"{'='*60}\n")
+
+            try:
+                explainer_result = SignalExplainer.explain_signal(signal, candles)
+                if explainer_result['chart_path']:
+                    TelegramNotifier.send_chart(explainer_result['chart_path'])
+                if explainer_result['explanation']:
+                    TelegramNotifier.send_explanation(explainer_result['explanation'])
+            except Exception as e:
+                print(f"⚠️ Explainer failed (non-critical): {e}")
+
+            self._log_signal_performance(signal)
+            self.signal_count += 1
+            self.mode_signal_count[mode] += 1
+
+            coin = pair.split('USDT')[0]
+            if coin not in self.coin_signal_count:
+                self.coin_signal_count[coin] = 0
+            self.coin_signal_count[coin] += 1
+
+            coin_mode_key = f"{coin}_{mode}"
+            if coin_mode_key not in self.coin_mode_signal_count:
+                self.coin_mode_signal_count[coin_mode_key] = 0
+            self.coin_mode_signal_count[coin_mode_key] += 1
+
+            self.last_signal_time[f"{pair}_{mode}"] = datetime.now()
+            self.last_signal_price[pair] = current_price
+
+            if mode == 'TREND':
+                trend_key = f"{pair}_{trend}"
+                self.active_trends[trend_key] = {
+                    'started': datetime.now(),
+                    'entry_price': current_price,
+                    'direction': trend
+                }
+
+            self.signals_today.append(signal)
+            return signal
+
+        except Exception as e:
+            print(f"❌ ERROR analyzing {pair}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
