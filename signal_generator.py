@@ -30,6 +30,17 @@ class SignalGenerator:
         self.chatgpt_rejected = 0
         self.active_positions: Dict[str, Dict] = {}
 
+    def get_stats(self) -> dict:
+        """Return a dict with counters that main.py prints/shows."""
+        return {
+            "signals_today": self.signal_count,
+            "mode_breakdown": dict(self.mode_signal_count),
+            "coin_breakdown": dict(self.coin_signal_count),
+            "chatgpt_approved": self.chatgpt_approved,
+            "chatgpt_rejected": self.chatgpt_rejected,
+            "signals_today_list": self.signals_today.copy()
+        }
+
     def _reset_daily_counters(self):
         """Reset signal counters at midnight"""
         today = datetime.now().date()
@@ -158,7 +169,7 @@ class SignalGenerator:
             return True, "BTC check skipped"
 
     def _check_trading_hours(self) -> tuple[bool, str]:
-        """Trading hours check - DISABLED (24/7 trading)"""
+        """Trading hours check - 24/7 enabled"""
         return True, "24/7 Trading"
 
     def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Optional[Dict]:
@@ -208,7 +219,7 @@ class SignalGenerator:
         else:
             if tp1 >= entry or tp2 >= entry or tp1 <= tp2 or sl <= entry:
                 return None
-        
+
         return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
 
     def _check_liquidation_safety(self, entry: float, sl: float) -> tuple[bool, float]:
@@ -321,7 +332,8 @@ class SignalGenerator:
         if key_level:
             score += 6
         return min(score, 100)
-def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
+
+    def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
         """Smart Rule-Based Analysis"""
         if mode is None:
             mode = config.MODE
@@ -334,7 +346,7 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
         if not trading_allowed:
             print(f"❌ BLOCKED: {pair} | {mode} | {time_reason}")
             return None
-        
+
         is_blocked, reason = news_guard.is_blocked()
         if is_blocked:
             print(f"❌ BLOCKED: {pair} | {mode} | News: {reason}")
@@ -348,18 +360,18 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
         if self.signal_count >= config.MAX_SIGNALS_PER_DAY:
             print(f"❌ BLOCKED: {pair} | {mode} | Daily limit")
             return None
-        
+
         max_per_mode = config.MAX_SIGNALS_PER_DAY // len(config.ACTIVE_MODES)
         if self.mode_signal_count[mode] >= max_per_mode:
             print(f"❌ BLOCKED: {pair} | {mode} | Mode limit")
             return None
-        
+
         if not self._check_cooldown(pair, mode):
             return None
-        
+
         if not self._check_coin_daily_limit(pair, mode):
             return None
-        
+
         if len(candles) < 50:
             print(f"❌ BLOCKED: {pair} | {mode} | Insufficient data")
             return None
@@ -368,12 +380,11 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
             candles = candles.dropna()
             if len(candles) < 50:
                 return None
-            
-            close = candles['close']
+close = candles['close']
             high = candles['high']
             low = candles['low']
             volume = candles['volume']
-            
+
             ema_fast = Indicators.ema(close, mode_config['ema_fast'])
             ema_slow = Indicators.ema(close, mode_config['ema_slow'])
             macd_line, signal_line, histogram = Indicators.macd(close)
@@ -381,7 +392,7 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
             adx, plus_di, minus_di = Indicators.adx(high, low, close)
             atr = Indicators.atr(high, low, close)
             volume_surge = Indicators.volume_surge(volume)
-            
+
             ema_fast = ema_fast.dropna()
             ema_slow = ema_slow.dropna()
             macd_line = macd_line.dropna()
@@ -391,10 +402,10 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
             adx = adx.dropna()
             atr = atr.dropna()
             volume_surge = volume_surge.dropna()
-            
+
             if len(rsi) < 2 or len(adx) < 2 or len(atr) < 2:
                 return None
-            
+
             current_price = float(close.iloc[-1])
             current_rsi = float(rsi.iloc[-1])
             current_adx = float(adx.iloc[-1])
@@ -404,7 +415,7 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
             current_volume_surge = float(volume_surge.iloc[-1]) if len(volume_surge) > 0 else 1.0
             current_ema_fast = float(ema_fast.iloc[-1])
             current_ema_slow = float(ema_slow.iloc[-1])
-            
+
             if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
                 return None
 
@@ -423,7 +434,7 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
             if trapped_count >= 3:
                 print(f"❌ BLOCKED: {pair} | {mode} | Traps: {trapped_count}")
                 return None
-            
+
             trend = None
             if (ema_fast.iloc[-1] > ema_slow.iloc[-1] and macd_line.iloc[-1] > signal_line.iloc[-1] and plus_di.iloc[-1] > minus_di.iloc[-1]):
                 trend = "LONG"
@@ -457,7 +468,7 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
                     regime = Indicators.detect_market_regime(candles_daily)
             except Exception as e:
                 pass
-            
+
             has_fvg = False
             fvg_info = {}
             try:
@@ -468,7 +479,7 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
                         has_fvg = False
             except Exception as e:
                 pass
-            
+
             near_key_level = False
             key_level_info = ""
             try:
@@ -478,14 +489,14 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
                     near_key_level, key_level_info = Indicators.check_key_level_proximity(current_price, key_levels, trend)
             except Exception as e:
                 pass
-            
+
             sweep_detected = False
             sweep_info = {}
             try:
                 sweep_detected, sweep_info = Indicators.detect_liquidity_sweep(candles, trend)
             except Exception as e:
                 pass
-            
+
             near_ob = False
             ob_info = {}
             try:
@@ -514,12 +525,12 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
             if current_adx < min_adx:
                 print(f"❌ BLOCKED: {pair} | {mode} | ADX weak")
                 return None
-            
+
             levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
             if levels is None:
                 print(f"❌ BLOCKED: {pair} | {mode} | Invalid SL/TP")
                 return None
-            
+
             is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
             if not is_safe:
                 print(f"❌ BLOCKED: {pair} | {mode} | Liquidation risk")
@@ -659,15 +670,3 @@ def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optiona
             import traceback
             traceback.print_exc()
             return None
-
-    def get_stats(self) -> Dict:
-        """Get current statistics"""
-        return {
-            'total_signals': self.signal_count,
-            'signals_today': len(self.signals_today),
-            'chatgpt_approved': self.chatgpt_approved,
-            'chatgpt_rejected': self.chatgpt_rejected,
-            'mode_signals': self.mode_signal_count.copy(),
-            'coin_signals': self.coin_signal_count.copy(),
-            'active_trends': len(self.active_trends)
-        }
