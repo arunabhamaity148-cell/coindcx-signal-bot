@@ -380,7 +380,8 @@ class SignalGenerator:
             candles = candles.dropna()
             if len(candles) < 50:
                 return None
-close = candles['close']
+
+            close = candles['close']
             high = candles['high']
             low = candles['low']
             volume = candles['volume']
