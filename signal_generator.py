@@ -610,4 +610,4 @@ class SignalGenerator:
                 # Counter-trend SHORT: require RSI bearish + latest lower high
                 if mtf_trend == 'STRONG_UP' and trend == "SHORT":
                     if current_rsi >= 50:
-                        print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | RSI not bearish ({current_rsi:.1f})")
+                        print(f"❌ BLOCKED: {pair} |
