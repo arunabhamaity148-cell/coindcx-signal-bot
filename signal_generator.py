@@ -13,7 +13,7 @@ from telegram_notifier import TelegramNotifier
 
 
 class SignalGenerator:
-    """Pure Rule-Based Signal Generator - SMART Quality Filters"""
+    """SMART Rule-Based Signal Generator – Balanced Quality Filtering"""
 
     def __init__(self):
         self.signal_count = 0
@@ -30,264 +30,215 @@ class SignalGenerator:
         self.chatgpt_rejected = 0
         self.active_positions: Dict[str, Dict] = {}
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
     def get_stats(self) -> dict:
-        """Return a dict with counters that main.py prints/shows."""
         return {
             "signals_today": self.signal_count,
             "mode_breakdown": dict(self.mode_signal_count),
             "coin_breakdown": dict(self.coin_signal_count),
             "chatgpt_approved": self.chatgpt_approved,
             "chatgpt_rejected": self.chatgpt_rejected,
-            "signals_today_list": self.signals_today.copy()
+            "signals_today_list": self.signals_today.copy(),
         }
 
     def _reset_daily_counters(self):
-        """Reset signal counters at midnight"""
         today = datetime.now().date()
         if today != self.last_reset_date:
             self.signal_count = 0
-            self.signals_today = []
+            self.signals_today.clear()
             self.mode_signal_count = {mode: 0 for mode in config.ACTIVE_MODES}
-            self.coin_signal_count = {}
-            self.coin_mode_signal_count = {}
-            self.last_signal_price = {}
-            self.active_trends = {}
+            self.coin_signal_count.clear()
+            self.coin_mode_signal_count.clear()
+            self.last_signal_price.clear()
+            self.active_trends.clear()
             self.chatgpt_approved = 0
             self.chatgpt_rejected = 0
             self.last_reset_date = today
             print(f"🔄 Daily counters reset for {today}")
 
     def _check_cooldown(self, pair: str, mode: str) -> bool:
-        """Check if pair is in cooldown period"""
         key = f"{pair}_{mode}"
         if key in self.last_signal_time:
-            time_since_last = datetime.now() - self.last_signal_time[key]
-            if mode == 'TREND':
-                cooldown_duration = timedelta(hours=2)
-            elif mode == 'MID':
-                cooldown_duration = timedelta(hours=1)
-            else:
-                cooldown_duration = timedelta(minutes=config.SAME_PAIR_COOLDOWN_MINUTES)
-
-            if time_since_last < cooldown_duration:
-                remaining = cooldown_duration - time_since_last
-                remaining_mins = int(remaining.total_seconds() / 60)
-                print(f"⏸️  {pair} ({mode}) in cooldown - {remaining_mins}m remaining")
+            elapsed = datetime.now() - self.last_signal_time[key]
+            cooldown_map = {
+                "TREND": timedelta(hours=2),
+                "MID": timedelta(hours=1),
+            }
+            cooldown = cooldown_map.get(mode, timedelta(minutes=config.SAME_PAIR_COOLDOWN_MINUTES))
+            if elapsed < cooldown:
+                mins_left = int((cooldown - elapsed).total_seconds() / 60)
+                print(f"⏸️  {pair} ({mode}) in cooldown – {mins_left}m remaining")
                 return False
         return True
 
     def _check_price_movement(self, pair: str, current_price: float, mode: str) -> bool:
-        """Check if price has moved significantly since last signal"""
-        key = f"{pair}"
+        key = f"{pair}_{mode}"
         if key in self.last_signal_price:
-            last_price = self.last_signal_price[key]
-            price_change_pct = abs(current_price - last_price) / last_price * 100
-
-            MIN_MOVE = {'TREND': 1.5, 'MID': 1.0, 'QUICK': 0.6, 'SCALP': 0.6}
-            required_move = MIN_MOVE.get(mode, 1.0)
-
-            if price_change_pct < required_move:
-                print(f"❌ BLOCKED: {pair} | {mode} needs {required_move}% move (got {price_change_pct:.2f}%)")
+            last = self.last_signal_price[key]
+            pct = abs(current_price - last) / last * 100
+            min_move = {"TREND": 1.5, "MID": 1.0, "QUICK": 0.6, "SCALP": 0.6}.get(mode, 1.0)
+            if pct < min_move:
+                print(f"❌ BLOCKED: {pair} | {mode} needs {min_move}% move (got {pct:.2f}%)")
                 return False
         return True
 
     def _check_coin_daily_limit(self, pair: str, mode: str) -> bool:
-        """Check per-coin per-mode daily signal limit"""
-        LIMITS = {'TREND': 2, 'MID': 3, 'QUICK': 4, 'SCALP': 4}
-        max_signals = LIMITS.get(mode, 3)
-
-        coin = pair.split('USDT')[0]
-        coin_mode_key = f"{coin}_{mode}"
-
-        if coin_mode_key not in self.coin_mode_signal_count:
-            self.coin_mode_signal_count[coin_mode_key] = 0
-
-        if self.coin_mode_signal_count[coin_mode_key] >= max_signals:
-            print(f"❌ BLOCKED: {pair} | {mode} coin limit ({max_signals})")
+        coin = pair.split("USDT")[0]
+        key = f"{coin}_{mode}"
+        self.coin_mode_signal_count.setdefault(key, 0)
+        limit = {"TREND": 2, "MID": 3, "QUICK": 4, "SCALP": 4}.get(mode, 3)
+        if self.coin_mode_signal_count[key] >= limit:
+            print(f"❌ BLOCKED: {pair} | {mode} coin limit ({limit})")
             return False
         return True
 
-    def _check_active_trend(self, pair: str, trend: str, current_price: float, ema_fast: float, ema_slow: float, macd_hist: float) -> bool:
-        """Smart trend invalidation: price + structure"""
-        trend_key = f"{pair}_{trend}"
-        if trend_key in self.active_trends:
-            active = self.active_trends[trend_key]
-            time_elapsed = (datetime.now() - active['started']).total_seconds() / 3600
-
-            if time_elapsed > 8:
-                del self.active_trends[trend_key]
-                print(f"🔓 TREND expired: {pair} {trend} (8h TTL)")
-                return True
-
-            price_change = (current_price - active['entry_price']) / active['entry_price'] * 100
-
-            structural_break = False
-            if trend == 'LONG':
-                if price_change < -2.5:
-                    structural_break = True
-                if ema_fast < ema_slow:
-                    structural_break = True
-            else:
-                if price_change > 2.5:
-                    structural_break = True
-                if ema_fast > ema_slow:
-                    structural_break = True
-
-            if structural_break:
-                del self.active_trends[trend_key]
-                print(f"🔓 TREND invalidated: {pair} {trend} (structure broken)")
-                return True
-            else:
-                print(f"❌ BLOCKED: {pair} | TREND active since {active['started'].strftime('%H:%M')} ({time_elapsed:.1f}h)")
-                return False
-        return True
+    def _check_active_trend(self, pair: str, trend: str, price: float, ema_f: float, ema_s: float, macd: float) -> bool:
+        key = f"{pair}_{trend}"
+        if key not in self.active_trends:
+            return True
+        active = self.active_trends[key]
+        hrs = (datetime.now() - active["started"]).total_seconds() / 3600
+        if hrs > 8:
+            del self.active_trends[key]
+            print(f"🔓 TREND expired: {pair} {trend} (8h TTL)")
+            return True
+        pct = (price - active["entry_price"]) / active["entry_price"] * 100
+        broken = (
+            (trend == "LONG" and (pct < -2.5 or ema_f < ema_s))
+            or (trend == "SHORT" and (pct > 2.5 or ema_f > ema_s))
+        )
+        if broken:
+            del self.active_trends[key]
+            print(f"🔓 TREND invalidated: {pair} {trend} (structure broken)")
+            return True
+        print(f"❌ BLOCKED: {pair} | TREND active since {active['started'].strftime('%H:%M')} ({hrs:.1f}h)")
+        return False
 
     def _check_btc_context(self) -> tuple[bool, str]:
-        """Minimal BTC stability check"""
         try:
-            btc_candles = CoinDCXAPI.get_candles('BTCUSDT', '15m', 20)
-            if btc_candles is None or btc_candles.empty or len(btc_candles) < 10:
+            btc = CoinDCXAPI.get_candles("BTCUSDT", "15m", 20)
+            if btc is None or btc.empty or len(btc) < 10:
                 return True, "BTC check skipped"
-
-            btc_close = btc_candles['close']
-            btc_high = btc_candles['high']
-            btc_low = btc_candles['low']
-
-            btc_atr = Indicators.atr(btc_high, btc_low, btc_close)
-            if btc_atr is None or len(btc_atr) < 2:
+            atr = Indicators.atr(btc["high"], btc["low"], btc["close"])
+            if atr is None or len(atr) < 2:
                 return True, "BTC check skipped"
-
-            current_btc_atr = float(btc_atr.iloc[-1])
-            avg_btc_atr = float(btc_atr.tail(10).mean())
-
-            if current_btc_atr > avg_btc_atr * 2.0:
+            curr, avg = float(atr.iloc[-1]), float(atr.tail(10).mean())
+            if curr > avg * 2.0:
                 return False, "BTC high volatility"
-
             return True, "BTC stable"
         except Exception as e:
             print(f"⚠️ BTC check error: {e}")
             return True, "BTC check skipped"
 
     def _check_trading_hours(self) -> tuple[bool, str]:
-        """Trading hours check - 24/7 enabled"""
         return True, "24/7 Trading"
 
-    def _calculate_entry_sl_tp(self, direction: str, current_price: float, atr: float, mode_config: Dict) -> Optional[Dict]:
-        """Calculate entry, SL, TP with minimum distance enforcement"""
-        sl_multiplier = mode_config['atr_sl_multiplier']
-        tp1_multiplier = mode_config['atr_tp1_multiplier']
-        tp2_multiplier = mode_config['atr_tp2_multiplier']
-        decimal_places = config.get_decimal_places(current_price)
+    # ------------------------------------------------------------------
+    # SL / TP
+    # ------------------------------------------------------------------
+    def _calculate_entry_sl_tp(self, direction: str, price: float, atr: float, cfg: Dict) -> Optional[Dict]:
+        sl_mult = cfg["atr_sl_multiplier"]
+        tp1_mult = cfg["atr_tp1_multiplier"]
+        tp2_mult = cfg["atr_tp2_multiplier"]
+        dec = config.get_decimal_places(price)
 
         if direction == "LONG":
-            entry = current_price
-            sl_raw = entry - (atr * sl_multiplier)
-            tp1_raw = entry + (atr * tp1_multiplier)
-            tp2_raw = entry + (atr * tp2_multiplier)
+            entry = round(price, dec)
+            sl = round(entry - atr * sl_mult, dec)
+            tp1 = round(entry + atr * tp1_mult, dec)
+            tp2 = round(entry + atr * tp2_mult, dec)
         else:
-            entry = current_price
-            sl_raw = entry + (atr * sl_multiplier)
-            tp1_raw = entry - (atr * tp1_multiplier)
-            tp2_raw = entry - (atr * tp2_multiplier)
+            entry = round(price, dec)
+            sl = round(entry + atr * sl_mult, dec)
+            tp1 = round(entry - atr * tp1_mult, dec)
+            tp2 = round(entry - atr * tp2_mult, dec)
 
-        entry = round(entry, decimal_places)
-        sl = round(sl_raw, decimal_places)
-        tp1 = round(tp1_raw, decimal_places)
-        tp2 = round(tp2_raw, decimal_places)
-
-        min_sl_distance = entry * 0.008
-        min_tp_distance = entry * (config.MIN_TP_DISTANCE_PERCENT / 100)
+        min_sl_dist = entry * 0.008
+        min_tp_dist = entry * (config.MIN_TP_DISTANCE_PERCENT / 100)
 
         if direction == "LONG":
-            if entry - sl < min_sl_distance:
-                sl = round(entry - min_sl_distance, decimal_places)
-            if tp1 - entry < min_tp_distance:
-                tp1 = round(entry + min_tp_distance, decimal_places)
-            if tp2 - tp1 < min_tp_distance * 0.5:
-                tp2 = round(tp1 + min_tp_distance * 0.5, decimal_places)
-        else:
-            if sl - entry < min_sl_distance:
-                sl = round(entry + min_sl_distance, decimal_places)
-            if entry - tp1 < min_tp_distance:
-                tp1 = round(entry - min_tp_distance, decimal_places)
-            if tp1 - tp2 < min_tp_distance * 0.5:
-                tp2 = round(tp1 - min_tp_distance * 0.5, decimal_places)
-
-        if direction == "LONG":
+            if entry - sl < min_sl_dist:
+                sl = round(entry - min_sl_dist, dec)
+            if tp1 - entry < min_tp_dist:
+                tp1 = round(entry + min_tp_dist, dec)
+            if tp2 - tp1 < min_tp_dist * 0.5:
+                tp2 = round(tp1 + min_tp_dist * 0.5, dec)
             if tp1 <= entry or tp2 <= entry or tp1 >= tp2 or sl >= entry:
                 return None
         else:
+            if sl - entry < min_sl_dist:
+                sl = round(entry + min_sl_dist, dec)
+            if entry - tp1 < min_tp_dist:
+                tp1 = round(entry - min_tp_dist, dec)
+            if tp1 - tp2 < min_tp_dist * 0.5:
+                tp2 = round(tp1 - min_tp_dist * 0.5, dec)
             if tp1 >= entry or tp2 >= entry or tp1 <= tp2 or sl <= entry:
                 return None
 
-        return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
+        return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2}
 
     def _check_liquidation_safety(self, entry: float, sl: float) -> tuple[bool, float]:
-        """Ensure SL is far enough from liquidation price"""
-        distance_pct = abs(entry - sl) / entry * 100
-        MIN_DISTANCE = config.LIQUIDATION_BUFFER * 100
-        is_safe = distance_pct >= MIN_DISTANCE
-        return is_safe, distance_pct
+        dist = abs(entry - sl) / entry * 100
+        return dist >= config.LIQUIDATION_BUFFER * 100, dist
 
     def _check_minimum_rr(self, entry: float, sl: float, tp1: float, mode: str) -> tuple[bool, float]:
-        """Check minimum Risk-Reward ratio"""
-        sl_distance = abs(entry - sl) / entry * 100
-        tp1_distance = abs(tp1 - entry) / entry * 100
-        rr = tp1_distance / sl_distance if sl_distance > 0 else 0
+        sl_dist = abs(entry - sl) / entry * 100
+        tp_dist = abs(tp1 - entry) / entry * 100
+        rr = tp_dist / sl_dist if sl_dist else 0
+        required = {"TREND": 2.0, "MID": 1.8, "QUICK": 1.5, "SCALP": 1.5}.get(mode, 1.5)
+        return rr >= required, rr
 
-        MIN_RR = {'TREND': 2.0, 'MID': 1.8, 'QUICK': 1.5, 'SCALP': 1.5}
-        required_rr = MIN_RR.get(mode, 1.5)
-
-        if rr < required_rr:
-            return False, rr
-        return True, rr
-
-    def _log_signal_performance(self, signal: Dict):
-        """Log signal to CSV"""
-        if not hasattr(config, 'TRACK_PERFORMANCE') or not config.TRACK_PERFORMANCE:
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+    def _log_signal_performance(self, sig: Dict):
+        if not getattr(config, "TRACK_PERFORMANCE", False):
             return
-        log_file = getattr(config, 'PERFORMANCE_LOG_FILE', 'signal_performance.csv')
-        log_data = {
-            'timestamp': signal.get('timestamp', datetime.now().isoformat()),
-            'pair': signal['pair'],
-            'direction': signal['direction'],
-            'mode': signal.get('mode', 'UNKNOWN'),
-            'timeframe': signal.get('timeframe', 'UNKNOWN'),
-            'entry': signal['entry'],
-            'sl': signal['sl'],
-            'tp1': signal['tp1'],
-            'tp2': signal['tp2'],
-            'score': signal['score'],
-            'rsi': signal['rsi'],
-            'adx': signal['adx'],
-            'leverage': signal['leverage']
+        log_file = getattr(config, "PERFORMANCE_LOG_FILE", "signal_performance.csv")
+        row = {
+            "timestamp": sig.get("timestamp", datetime.now().isoformat()),
+            "pair": sig["pair"],
+            "direction": sig["direction"],
+            "mode": sig.get("mode", "UNKNOWN"),
+            "timeframe": sig.get("timeframe", "UNKNOWN"),
+            "entry": sig["entry"],
+            "sl": sig["sl"],
+            "tp1": sig["tp1"],
+            "tp2": sig["tp2"],
+            "score": sig["score"],
+            "rsi": sig["rsi"],
+            "adx": sig["adx"],
+            "leverage": sig["leverage"],
         }
         try:
-            file_exists = False
-            try:
-                with open(log_file, 'r') as f:
-                    file_exists = True
-            except FileNotFoundError:
-                file_exists = False
-            with open(log_file, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=log_data.keys())
-                if not file_exists:
+            import os
+            exists = os.path.isfile(log_file)
+            with open(log_file, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=row.keys())
+                if not exists:
                     writer.writeheader()
-                writer.writerow(log_data)
+                writer.writerow(row)
         except Exception as e:
             print(f"⚠️ Performance logging failed: {e}")
 
-    def _calculate_signal_score(self, indicators: Dict, trend_strength: str, sweep: bool, ob: bool, fvg: bool, key_level: bool, mode: str) -> int:
-        """Smart volume-aware scoring"""
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+    def _calculate_signal_score(self, ind: Dict, mtf: str, sweep: bool, ob: bool, fvg: bool, kl: bool, mode: str) -> int:
         score = 0
-        rsi = indicators['rsi']
+        rsi, adx, vol = ind["rsi"], ind["adx"], ind["volume_surge"]
+
+        # RSI
         if 35 < rsi < 65:
             score += 18
         elif 30 < rsi < 70:
             score += 14
         else:
             score += 8
-        adx = indicators['adx']
+
+        # ADX
         if adx > 40:
             score += 22
         elif adx > 30:
@@ -296,64 +247,76 @@ class SignalGenerator:
             score += 14
         else:
             score += 8
-        if abs(indicators['macd_histogram']) > abs(indicators['prev_macd_histogram']):
+
+        # MACD
+        if abs(ind["macd_histogram"]) > abs(ind["prev_macd_histogram"]):
             score += 16
         else:
             score += 8
 
-        volume = indicators['volume_surge']
-        if mode == 'TREND':
-            if volume >= 1.2:
+        # Volume
+        if mode == "TREND":
+            if vol >= 1.2:
                 score += 14
-            elif volume >= 1.0:
+            elif vol >= 1.0:
                 score += 10
-            elif volume >= 0.8:
+            elif vol >= 0.8:
                 score += 6
+            else:
+                score += 0
         else:
-            if volume > 1.5:
+            if vol > 1.5:
                 score += 14
-            elif volume > 1.0:
+            elif vol > 1.0:
                 score += 10
             else:
                 score += 5
 
-        if trend_strength in ['STRONG_UP', 'STRONG_DOWN']:
+        # MTF
+        if mtf in ("STRONG_UP", "STRONG_DOWN"):
             score += 16
-        elif trend_strength in ['MODERATE_UP', 'MODERATE_DOWN']:
+        elif mtf in ("MODERATE_UP", "MODERATE_DOWN"):
             score += 12
         else:
             score += 4
+
+        # Extras
         if sweep:
             score += 8
         if ob:
             score += 8
         if fvg:
             score += 6
-        if key_level:
+        if kl:
             score += 6
+
         return min(score, 100)
 
+    # ------------------------------------------------------------------
+    # Main analyser
+    # ------------------------------------------------------------------
     def analyze(self, pair: str, candles: pd.DataFrame, mode: str = None) -> Optional[Dict]:
-        """Smart Rule-Based Analysis with Quality Filters"""
         if mode is None:
             mode = config.MODE
-        mode_config = config.MODE_CONFIG[mode]
-        min_score = mode_config.get('min_score', config.MIN_SIGNAL_SCORE)
-        min_adx = mode_config.get('min_adx', config.MIN_ADX_STRENGTH)
+        cfg = config.MODE_CONFIG[mode]
+        min_score = cfg.get("min_score", config.MIN_SIGNAL_SCORE)
+        min_adx = cfg.get("min_adx", config.MIN_ADX_STRENGTH)
         self._reset_daily_counters()
 
-        trading_allowed, time_reason = self._check_trading_hours()
-        if not trading_allowed:
-            print(f"❌ BLOCKED: {pair} | {mode} | {time_reason}")
+        penalties: list[tuple[str, int]] = []
+
+        # ---------------- Global gatekeepers ----------------
+        ok, reason = self._check_trading_hours()
+        if not ok:
+            print(f"❌ BLOCKED: {pair} | {mode} | {reason}")
             return None
 
-        is_blocked, reason = news_guard.is_blocked()
-        if is_blocked:
-            print(f"❌ BLOCKED: {pair} | {mode} | News: {reason}")
+        if news_guard.is_blocked()[0]:
+            print(f"❌ BLOCKED: {pair} | {mode} | News: {news_guard.is_blocked()[1]}")
             return None
 
-        btc_stable, btc_reason = self._check_btc_context()
-        if not btc_stable:
+        btc_ok, btc_reason = self._check_btc_context()
+        if not btc_ok:
             print(f"❌ BLOCKED: {pair} | {mode} | {btc_reason}")
             return None
 
@@ -376,373 +339,352 @@ class SignalGenerator:
             print(f"❌ BLOCKED: {pair} | {mode} | Insufficient data")
             return None
 
+        # ---------------- Technical prep ----------------
         try:
             candles = candles.dropna()
             if len(candles) < 50:
                 return None
 
-            close = candles['close']
-            high = candles['high']
-            low = candles['low']
-            volume = candles['volume']
+            c = candles["close"]
+            h = candles["high"]
+            l = candles["low"]
+            v = candles["volume"]
 
-            ema_fast = Indicators.ema(close, mode_config['ema_fast'])
-            ema_slow = Indicators.ema(close, mode_config['ema_slow'])
-            macd_line, signal_line, histogram = Indicators.macd(close)
-            rsi = Indicators.rsi(close)
-            adx, plus_di, minus_di = Indicators.adx(high, low, close)
-            atr = Indicators.atr(high, low, close)
-            volume_surge = Indicators.volume_surge(volume)
+            ema_f = Indicators.ema(c, cfg["ema_fast"]).dropna()
+            ema_s = Indicators.ema(c, cfg["ema_slow"]).dropna()
+            macd_l, sig_l, hist = Indicators.macd(c)
+            rsi = Indicators.rsi(c).dropna()
+            adx, pdi, mdi = Indicators.adx(h, l, c)
+            atr = Indicators.atr(h, l, c).dropna()
+            vol_surge = Indicators.volume_surge(v).dropna()
 
-            ema_fast = ema_fast.dropna()
-            ema_slow = ema_slow.dropna()
-            macd_line = macd_line.dropna()
-            signal_line = signal_line.dropna()
-            histogram = histogram.dropna()
-            rsi = rsi.dropna()
-            adx = adx.dropna()
-            atr = atr.dropna()
-            volume_surge = volume_surge.dropna()
-
-            if len(rsi) < 2 or len(adx) < 2 or len(atr) < 2:
+            if any(
+                len(x) < 2
+                for x in (rsi, adx, atr, vol_surge, ema_f, ema_s, hist, pdi, mdi)
+            ):
                 return None
 
-            current_price = float(close.iloc[-1])
-            current_rsi = float(rsi.iloc[-1])
-            current_adx = float(adx.iloc[-1])
-            current_atr = float(atr.iloc[-1])
-            current_macd_hist = float(histogram.iloc[-1])
-            prev_macd_hist = float(histogram.iloc[-2]) if len(histogram) > 1 else 0.0
-            current_volume_surge = float(volume_surge.iloc[-1]) if len(volume_surge) > 0 else 1.0
-            current_ema_fast = float(ema_fast.iloc[-1])
-            current_ema_slow = float(ema_slow.iloc[-1])
+            price = float(c.iloc[-1])
+            cur_rsi = float(rsi.iloc[-1])
+            cur_adx = float(adx.iloc[-1])
+            cur_atr = float(atr.iloc[-1])
+            cur_hist = float(hist.iloc[-1])
+            prev_hist = float(hist.iloc[-2]) if len(hist) > 1 else 0.0
+            cur_vol = float(vol_surge.iloc[-1]) if len(vol_surge) else 1.0
+            cur_ema_f = float(ema_f.iloc[-1])
+            cur_ema_s = float(ema_s.iloc[-1])
 
-            if any(pd.isna([current_price, current_rsi, current_adx, current_atr])):
+            if any(pd.isna([price, cur_rsi, cur_adx, cur_atr])):
                 return None
 
-            # ✅ VOLUME CHECKS (Mode-specific)
-            if mode == 'TREND' and current_volume_surge < 0.8:
-                print(f"❌ BLOCKED: {pair} | TREND volume < 0.8x (got {current_volume_surge:.2f}x)")
+            # Volume filters
+            if mode == "TREND" and cur_vol < 0.8:
+                print(f"❌ BLOCKED: {pair} | TREND volume < 0.8x (got {cur_vol:.2f}x)")
+                return None
+            if mode == "MID" and cur_vol < 0.5:
+                print(f"❌ BLOCKED: {pair} | MID volume < 0.5x (got {cur_vol:.2f}x)")
+                return None
+            if mode == "QUICK" and cur_vol < 1.0:
+                print(f"❌ BLOCKED: {pair} | QUICK volume < 1.0x (got {cur_vol:.2f}x)")
                 return None
 
-            if mode == 'QUICK' and current_volume_surge < 1.0:
-                print(f"❌ BLOCKED: {pair} | QUICK volume < 1.0x (got {current_volume_surge:.2f}x)")
+            if not self._check_price_movement(pair, price, mode):
                 return None
 
-            if not self._check_price_movement(pair, current_price, mode):
-                return None
-
-            ticker = CoinDCXAPI.get_ticker(pair)
-            bid = ticker['bid'] if ticker else current_price
-            ask = ticker['ask'] if ticker else current_price
-            traps = TrapDetector.check_all_traps(candles, bid, ask, current_rsi, current_adx, current_macd_hist)
-            trapped_count = sum(traps.values())
-            if trapped_count >= 3:
-                print(f"❌ BLOCKED: {pair} | {mode} | Traps: {trapped_count}")
-                return None
-
-            trend = None
-            if (ema_fast.iloc[-1] > ema_slow.iloc[-1] and macd_line.iloc[-1] > signal_line.iloc[-1] and plus_di.iloc[-1] > minus_di.iloc[-1]):
+            # ---------------- Trend direction ----------------
+            if ema_f.iloc[-1] > ema_s.iloc[-1] and macd_l.iloc[-1] > sig_l.iloc[-1] and pdi.iloc[-1] > mdi.iloc[-1]:
                 trend = "LONG"
-            elif (ema_fast.iloc[-1] < ema_slow.iloc[-1] and macd_line.iloc[-1] < signal_line.iloc[-1] and minus_di.iloc[-1] > plus_di.iloc[-1]):
+            elif ema_f.iloc[-1] < ema_s.iloc[-1] and macd_l.iloc[-1] < sig_l.iloc[-1] and mdi.iloc[-1] > pdi.iloc[-1]:
                 trend = "SHORT"
             else:
                 print(f"❌ BLOCKED: {pair} | {mode} | No clear trend")
                 return None
 
+            # ---------------- Higher-time-frame checks ----------------
             try:
-                candles_1h = CoinDCXAPI.get_candles(pair, '1h', 50)
+                candles_1h = CoinDCXAPI.get_candles(pair, "1h", 50)
                 candles_4h = None
-                if mode == 'TREND':
-                    candles_4h = CoinDCXAPI.get_candles(pair, '4h', 50)
+                if mode == "TREND":
+                    candles_4h = CoinDCXAPI.get_candles(pair, "4h", 50)
                 if candles_1h.empty:
                     print(f"❌ BLOCKED: {pair} | {mode} | 1H fetch fail")
                     return None
-                htf_valid, htf_reason = Indicators.check_htf_alignment(trend, mode, candles_1h['close'], candles_4h['close'] if candles_4h is not None and not candles_4h.empty else None)
-                if not htf_valid:
-                    print(f"❌ BLOCKED: {pair} | {mode} | {htf_reason}")
-                    return None
-                print(f"✅ HTF: {htf_reason}")
+                htf_ok, htf_reason = Indicators.check_htf_alignment(
+                    trend,
+                    mode,
+                    candles_1h["close"],
+                    candles_4h["close"] if candles_4h is not None and not candles_4h.empty else None,
+                )
+                if not htf_ok:
+                    penalties.append(("HTF_AGAINST", 12))
+                    print(f"⚠️ WARNING: {pair} | {mode} | {htf_reason} (score -12)")
+                else:
+                    print(f"✅ HTF: {htf_reason}")
             except Exception as e:
                 print(f"❌ BLOCKED: {pair} | {mode} | HTF error: {e}")
                 return None
 
+            # ---------------- Regime ----------------
             regime = "NORMAL"
             try:
-                candles_daily = CoinDCXAPI.get_candles(pair, '1d', 30)
-                if not candles_daily.empty:
-                    regime = Indicators.detect_market_regime(candles_daily)
-            except Exception as e:
+                daily = CoinDCXAPI.get_candles(pair, "1d", 30)
+                if not daily.empty:
+                    regime = Indicators.detect_market_regime(daily)
+            except Exception:
                 pass
 
-            has_fvg = False
-            fvg_info = {}
+            # ---------------- FVG ----------------
+            has_fvg, fvg_info = False, {}
             try:
                 has_fvg, fvg_info = Indicators.detect_fvg(candles, trend)
                 if has_fvg:
-                    in_fvg = Indicators.is_price_in_fvg(current_price, fvg_info)
-                    if not in_fvg:
+                    if not Indicators.is_price_in_fvg(price, fvg_info):
                         has_fvg = False
-            except Exception as e:
+            except Exception:
                 pass
 
-            near_key_level = False
-            key_level_info = ""
+            # ---------------- Key level ----------------
+            near_kl, kl_info = False, ""
             try:
-                candles_daily = CoinDCXAPI.get_candles(pair, '1d', 30)
-                if not candles_daily.empty:
-                    key_levels = Indicators.get_daily_key_levels(candles_daily)
-                    near_key_level, key_level_info = Indicators.check_key_level_proximity(current_price, key_levels, trend)
-            except Exception as e:
+                daily = CoinDCXAPI.get_candles(pair, "1d", 30)
+                if not daily.empty:
+                    levels = Indicators.get_daily_key_levels(daily)
+                    near_kl, kl_info = Indicators.check_key_level_proximity(price, levels, trend)
+            except Exception:
                 pass
 
-            sweep_detected = False
-            sweep_info = {}
+            # ---------------- Sweep ----------------
+            sweep, sweep_info = False, {}
             try:
-                sweep_detected, sweep_info = Indicators.detect_liquidity_sweep(candles, trend)
-            except Exception as e:
+                sweep, sweep_info = Indicators.detect_liquidity_sweep(candles, trend)
+            except Exception:
                 pass
 
-            near_ob = False
-            ob_info = {}
+            # ---------------- Order block ----------------
+            near_ob, ob_info = False, {}
             try:
-                candles_4h_ob = CoinDCXAPI.get_candles(pair, '4h', 100)
-                if not candles_4h_ob.empty:
-                    order_blocks = Indicators.find_order_blocks(candles_4h_ob, trend)
-                    near_ob, ob_info = Indicators.is_near_order_block(current_price, order_blocks)
-            except Exception as e:
+                ob_candles = CoinDCXAPI.get_candles(pair, "4h", 100)
+                if not ob_candles.empty:
+                    obs = Indicators.find_order_blocks(ob_candles, trend)
+                    near_ob, ob_info = Indicators.is_near_order_block(price, obs)
+            except Exception:
                 pass
 
-            # ✅✅✅ BALANCED MODE-SPECIFIC RSI & ADX QUALITY FILTERS ✅✅✅
-            if mode == 'TREND':
-                if trend == "LONG" and (current_rsi > 65 or current_rsi < 38):
-                    print(f"❌ BLOCKED: {pair} | TREND LONG | RSI out of range (38-65) | Got {current_rsi:.1f}")
+            # ---------------- Mode-specific RSI filters ----------------
+            if mode == "TREND":
+                if trend == "LONG" and (cur_rsi > 65 or cur_rsi < 38):
+                    print(f"❌ BLOCKED: {pair} | TREND LONG | RSI out of range (38-65) | Got {cur_rsi:.1f}")
                     return None
-                if trend == "SHORT" and (current_rsi < 35 or current_rsi > 62):
-                    print(f"❌ BLOCKED: {pair} | TREND SHORT | RSI out of range (35-62) | Got {current_rsi:.1f}")
+                if trend == "SHORT" and (cur_rsi < 35 or cur_rsi > 62):
+                    print(f"❌ BLOCKED: {pair} | TREND SHORT | RSI out of range (35-62) | Got {cur_rsi:.1f}")
                     return None
-            
-            elif mode == 'MID':
-                # ✅ FIX 1: Volume floor for BOTH directions
-                if current_volume_surge < 0.8:
-                    print(f"❌ BLOCKED: {pair} | MID | Volume too low (need ≥0.8x, got {current_volume_surge:.2f}x)")
-                    return None
-                
-                # ✅ FIX 2: Symmetric RSI bounds with exhaustion protection
+            elif mode == "MID":
                 if trend == "LONG":
-                    if current_rsi > config.RSI_OVERBOUGHT:
-                        print(f"❌ BLOCKED: {pair} | MID LONG | RSI overbought (>{config.RSI_OVERBOUGHT})")
+                    if cur_rsi > config.RSI_OVERBOUGHT:
+                        print(f"❌ BLOCKED: {pair} | MID LONG | RSI overbought")
                         return None
-                    if current_rsi < 38:
-                        print(f"❌ BLOCKED: {pair} | MID LONG | RSI too low (<35, got {current_rsi:.1f})")
+                    if cur_rsi < 32:
+                        print(f"❌ BLOCKED: {pair} | MID LONG | RSI too low (<32)")
                         return None
-                
                 if trend == "SHORT":
-                    if current_adx > 50 and current_rsi < 32:
-                        print(f"❌ BLOCKED: {pair} | MID SHORT | Exhaustion zone (ADX {current_adx:.1f}, RSI {current_rsi:.1f})")
+                    if cur_adx > 50 and cur_rsi < 32:
+                        print(f"❌ BLOCKED: {pair} | MID SHORT | Exhaustion zone (ADX {cur_adx:.1f}, RSI {cur_rsi:.1f})")
                         return None
-                    if current_rsi < 35:
-                        print(f"❌ BLOCKED: {pair} | MID SHORT | RSI too low (<35, got {current_rsi:.1f})")
+                    if cur_rsi < 35:
+                        print(f"❌ BLOCKED: {pair} | MID SHORT | RSI too low (<35)")
                         return None
-                    if current_rsi > 65:
-                        print(f"❌ BLOCKED: {pair} | MID SHORT | RSI too high (>65, got {current_rsi:.1f})")
+                    if cur_rsi > 65:
+                        print(f"❌ BLOCKED: {pair} | MID SHORT | RSI too high (>65)")
                         return None
-            
-            elif mode == 'QUICK':
-                if trend == "LONG" and current_rsi > 60:
-                    print(f"❌ BLOCKED: {pair} | QUICK LONG | RSI too high (need ≤60, got {current_rsi:.1f})")
+            elif mode == "QUICK":
+                if trend == "LONG" and cur_rsi > 62:
+                    print(f"❌ BLOCKED: {pair} | QUICK LONG | RSI too high (>62)")
                     return None
-                if trend == "SHORT" and current_rsi < 40:
-                    print(f"❌ BLOCKED: {pair} | QUICK SHORT | RSI too low (need ≥40, got {current_rsi:.1f})")
+                if trend == "SHORT" and cur_rsi < 38:
+                    print(f"❌ BLOCKED: {pair} | QUICK SHORT | RSI too low (<38)")
                     return None
-                if current_adx > 35:
-                    print(f"❌ BLOCKED: {pair} | QUICK | ADX too strong (need <35, got {current_adx:.1f})")
+                if cur_adx > 45:
+                    print(f"❌ BLOCKED: {pair} | QUICK | ADX too strong (>45)")
                     return None
-            
-            else:  # SCALP mode
-                if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
+            else:  # SCALP
+                if trend == "LONG" and cur_rsi > config.RSI_OVERBOUGHT:
                     print(f"❌ BLOCKED: {pair} | SCALP LONG | RSI overbought")
                     return None
-                if trend == "SHORT" and current_rsi < config.RSI_OVERSOLD:
+                if trend == "SHORT" and cur_rsi < config.RSI_OVERSOLD:
                     print(f"❌ BLOCKED: {pair} | SCALP SHORT | RSI oversold")
                     return None
 
-            if current_adx < min_adx:
+            if cur_adx < min_adx:
                 print(f"❌ BLOCKED: {pair} | {mode} | ADX weak")
                 return None
 
-            levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
+            # ---------------- SL / TP ----------------
+            levels = self._calculate_entry_sl_tp(trend, price, cur_atr, cfg)
             if levels is None:
                 print(f"❌ BLOCKED: {pair} | {mode} | Invalid SL/TP")
                 return None
 
-            # ✅ FIX 3: Post-rounding TP sanity check
-            if mode == 'MID':
-                tp1_distance_pct = abs(levels['tp1'] - levels['entry']) / levels['entry'] * 100
-                if tp1_distance_pct < 0.4:
-                    print(f"❌ BLOCKED: {pair} | MID | TP1 too close to entry ({tp1_distance_pct:.2f}%)")
+            if mode == "MID":
+                tp1_dist = abs(levels["tp1"] - levels["entry"]) / levels["entry"] * 100
+                if tp1_dist < 0.4:
+                    print(f"❌ BLOCKED: {pair} | MID | TP1 too close to entry ({tp1_dist:.2f}%)")
                     return None
 
-            is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
-            if not is_safe:
+            safe, liq_dist = self._check_liquidation_safety(levels["entry"], levels["sl"])
+            if not safe:
                 print(f"❌ BLOCKED: {pair} | {mode} | Liquidation risk")
                 return None
 
-            rr_valid, rr_value = self._check_minimum_rr(levels['entry'], levels['sl'], levels['tp1'], mode)
-            if not rr_valid:
-                print(f"❌ BLOCKED: {pair} | {mode} | RR too low ({rr_value:.2f})")
+            rr_ok, rr_val = self._check_minimum_rr(levels["entry"], levels["sl"], levels["tp1"], mode)
+            if not rr_ok:
+                print(f"❌ BLOCKED: {pair} | {mode} | RR too low ({rr_val:.2f})")
                 return None
 
+            # ---------------- MTF trend ----------------
             try:
-                candles_5m = CoinDCXAPI.get_candles(pair, '5m', 50)
-                candles_15m = CoinDCXAPI.get_candles(pair, '15m', 50)
-                candles_1h = CoinDCXAPI.get_candles(pair, '1h', 50)
-                if not candles_5m.empty and not candles_15m.empty and not candles_1h.empty:
-                    mtf_trend = Indicators.mtf_trend(candles_5m['close'], candles_15m['close'], candles_1h['close'])
+                c5 = CoinDCXAPI.get_candles(pair, "5m", 50)
+                c15 = CoinDCXAPI.get_candles(pair, "15m", 50)
+                c1h = CoinDCXAPI.get_candles(pair, "1h", 50)
+                if not c5.empty and not c15.empty and not c1h.empty:
+                    mtf = Indicators.mtf_trend(c5["close"], c15["close"], c1h["close"])
                 else:
-                    mtf_trend = "UNKNOWN"
-            except Exception as e:
-                mtf_trend = "UNKNOWN"
+                    mtf = "UNKNOWN"
+            except Exception:
+                mtf = "UNKNOWN"
 
-            # ✅ FIX 4: BALANCED TREND counter-trend protection
-            if mode == 'TREND':
-                if mtf_trend not in ['STRONG_UP', 'STRONG_DOWN']:
-                    print(f"❌ BLOCKED: {pair} | TREND requires STRONG MTF (got {mtf_trend})")
+            if mode == "TREND":
+                if mtf not in ("STRONG_UP", "STRONG_DOWN", "MODERATE_UP", "MODERATE_DOWN"):
+                    print(f"❌ BLOCKED: {pair} | TREND requires trending MTF (got {mtf})")
                     return None
-                
-                # ✅ NEW: LONG vs STRONG_DOWN (counter-trend LONG)
-                if mtf_trend == 'STRONG_DOWN' and trend == "LONG":
-                    if current_rsi <= 50:
-                        print(f"❌ BLOCKED: {pair} | TREND LONG vs STRONG_DOWN | RSI not bullish ({current_rsi:.1f})")
+                if mtf == "MODERATE_UP" or mtf == "MODERATE_DOWN":
+                    penalties.append(("MTF_MODERATE", 5))
+                    print(f"⚠️ WARNING: {pair} | TREND | MODERATE MTF (score -5)")
+                if mtf == "STRONG_DOWN" and trend == "LONG":
+                    if cur_rsi <= 50:
+                        print(f"❌ BLOCKED: {pair} | TREND LONG vs STRONG_DOWN | RSI not bullish")
                         return None
-                    if len(candles) >= 2:
-                        recent_lows = candles['low'].tail(2).values
-                        if recent_lows[1] <= recent_lows[0]:
-                            print(f"❌ BLOCKED: {pair} | TREND LONG vs STRONG_DOWN | No higher low confirmation")
-                            return None
-                
-                # Counter-trend SHORT: require RSI bearish + latest lower high
-                if mtf_trend == 'STRONG_UP' and trend == "SHORT":
-                    if current_rsi >= 50:
-                        print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | RSI not bearish ({current_rsi:.1f})")
+                    if len(candles) >= 2 and candles["low"].iloc[-1] <= candles["low"].iloc[-2]:
+                        print(f"❌ BLOCKED: {pair} | TREND LONG vs STRONG_DOWN | No higher low")
                         return None
-                    if len(candles) >= 2:
-                        recent_highs = candles['high'].tail(2).values
-                        if recent_highs[1] >= recent_highs[0]:
-                            print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | No lower high confirmation")
-                            return None
+                if mtf == "STRONG_UP" and trend == "SHORT":
+                    if cur_rsi >= 50:
+                        print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | RSI not bearish")
+                        return None
+                    if len(candles) >= 2 and candles["high"].iloc[-1] >= candles["high"].iloc[-2]:
+                        print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | No lower high")
+                        return None
+            elif mode in ("MID", "QUICK"):
+                if (mtf == "STRONG_DOWN" and trend == "LONG") or (mtf == "STRONG_UP" and trend == "SHORT"):
+                    penalties.append(("COUNTER_TREND", 8))
+                    print(f"⚠️ WARNING: {pair} | {mode} | Counter-trend setup (score -8)")
 
+            # ---------------- Score ----------------
             indicators_data = {
-                'rsi': current_rsi,
-                'adx': current_adx,
-                'macd_histogram': current_macd_hist,
-                'prev_macd_histogram': prev_macd_hist,
-                'volume_surge': current_volume_surge
+                "rsi": cur_rsi,
+                "adx": cur_adx,
+                "macd_histogram": cur_hist,
+                "prev_macd_histogram": prev_hist,
+                "volume_surge": cur_vol,
             }
-            score = self._calculate_signal_score(indicators_data, mtf_trend, sweep_detected, near_ob, has_fvg, near_key_level, mode)
+            score = self._calculate_signal_score(indicators_data, mtf, sweep, near_ob, has_fvg, near_kl, mode)
+            for reason, val in penalties:
+                score -= val
             if score < min_score:
-                print(f"❌ BLOCKED: {pair} | {mode} | Score: {score}/{min_score}")
+                print(f"❌ BLOCKED: {pair} | {mode} | Score: {score}/{min_score} (after penalties)")
                 return None
 
-            if mode == 'TREND':
-                if not self._check_active_trend(pair, trend, current_price, current_ema_fast, current_ema_slow, current_macd_hist):
+            if mode == "TREND":
+                if not self._check_active_trend(pair, trend, price, cur_ema_f, cur_ema_s, cur_hist):
                     return None
 
+            # ---------------- Build signal ----------------
             signal = {
-                'pair': pair,
-                'direction': trend,
-                'entry': levels['entry'],
-                'sl': levels['sl'],
-                'tp1': levels['tp1'],
-                'tp2': levels['tp2'],
-                'leverage': mode_config['leverage'],
-                'score': score,
-                'rsi': round(current_rsi, 1),
-                'adx': round(current_adx, 1),
-                'mtf_trend': mtf_trend,
-                'mode': mode,
-                'timeframe': mode_config['timeframe'],
-                'volume_surge': round(current_volume_surge, 2),
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'market_regime': regime,
-                'liquidity_sweep': sweep_detected,
-                'near_order_block': near_ob,
-                'fvg_fill': has_fvg,
-                'near_key_level': near_key_level,
-                'sweep_info': sweep_info if sweep_detected else {},
-                'ob_info': ob_info if near_ob else {},
-                'fvg_info': fvg_info if has_fvg else {},
-                'key_level_info': key_level_info if near_key_level else "",
-                'ema_fast_period': mode_config['ema_fast'],
-                'ema_slow_period': mode_config['ema_slow']
+                "pair": pair,
+                "direction": trend,
+                "entry": levels["entry"],
+                "sl": levels["sl"],
+                "tp1": levels["tp1"],
+                "tp2": levels["tp2"],
+                "leverage": cfg["leverage"],
+                "score": score,
+                "rsi": round(cur_rsi, 1),
+                "adx": round(cur_adx, 1),
+                "mtf_trend": mtf,
+                "mode": mode,
+                "timeframe": cfg["timeframe"],
+                "volume_surge": round(cur_vol, 2),
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "market_regime": regime,
+                "liquidity_sweep": sweep,
+                "near_order_block": near_ob,
+                "fvg_fill": has_fvg,
+                "near_key_level": near_kl,
+                "sweep_info": sweep_info if sweep else {},
+                "ob_info": ob_info if near_ob else {},
+                "fvg_info": fvg_info if has_fvg else {},
+                "key_level_info": kl_info if near_kl else "",
+                "ema_fast_period": cfg["ema_fast"],
+                "ema_slow_period": cfg["ema_slow"],
             }
 
-            print(f"\n{'='*60}")
+            print("\n" + "=" * 60)
             print(f"📊 Rule-based PASSED: {pair} {trend}")
-            print(f"{'='*60}")
+            print("=" * 60)
 
-            chatgpt_approved = self.chatgpt_advisor.final_trade_decision(signal, candles)
-            if not chatgpt_approved:
+            # ---------------- AI safety ----------------
+            if not self.chatgpt_advisor.final_trade_decision(signal, candles):
                 self.chatgpt_rejected += 1
-                print(f"❌ Safety check failed")
+                print("❌ Safety check failed")
                 return None
-
             self.chatgpt_approved += 1
             print(f"✅ {mode}: {pair} APPROVED!")
-            print(f"   Score: {score}/100 | RR: {rr_value:.2f}R | Vol: {current_volume_surge:.2f}x")
+            print(f"   Score: {score}/100 | RR: {rr_val:.2f}R | Vol: {cur_vol:.2f}x")
             print(f"   Entry: ₹{levels['entry']:,.6f}")
-            print(f"   SL: ₹{levels['sl']:,.6f}")
-            print(f"   TP1: ₹{levels['tp1']:,.6f}")
-            print(f"   TP2: ₹{levels['tp2']:,.6f}")
-            if sweep_detected:
-                print(f"   💎 Liquidity Swept")
+            print(f"   SL:    ₹{levels['sl']:,.6f}")
+            print(f"   TP1:   ₹{levels['tp1']:,.6f}")
+            print(f"   TP2:   ₹{levels['tp2']:,.6f}")
+            if sweep:
+                print("   💎 Liquidity Swept")
             if near_ob:
-                print(f"   🎯 Near OB")
+                print("   🎯 Near OB")
             if has_fvg:
-                print(f"   💎 FVG Fill")
-            if near_key_level:
-                print(f"   🎯 {key_level_info}")
-            print(f"{'='*60}\n")
+                print("   💎 FVG Fill")
+            if near_kl:
+                print(f"   🎯 {kl_info}")
+            print("=" * 60 + "\n")
 
+            # ---------------- Notify ----------------
             try:
-                explainer_result = SignalExplainer.explain_signal(signal, candles)
-                if explainer_result['chart_path']:
-                    TelegramNotifier.send_chart(explainer_result['chart_path'])
-                if explainer_result['explanation']:
-                    TelegramNotifier.send_explanation(explainer_result['explanation'])
+                exp = SignalExplainer.explain_signal(signal, candles)
+                if exp.get("chart_path"):
+                    TelegramNotifier.send_chart(exp["chart_path"])
+                if exp.get("explanation"):
+                    TelegramNotifier.send_explanation(exp["explanation"])
             except Exception as e:
                 print(f"⚠️ Explainer failed (non-critical): {e}")
 
+            # ---------------- Book-keeping ----------------
             self._log_signal_performance(signal)
             self.signal_count += 1
             self.mode_signal_count[mode] += 1
-
-            coin = pair.split('USDT')[0]
-            if coin not in self.coin_signal_count:
-                self.coin_signal_count[coin] = 0
-            self.coin_signal_count[coin] += 1
-
+            coin = pair.split("USDT")[0]
+            self.coin_signal_count[coin] = self.coin_signal_count.get(coin, 0) + 1
             coin_mode_key = f"{coin}_{mode}"
-            if coin_mode_key not in self.coin_mode_signal_count:
-                self.coin_mode_signal_count[coin_mode_key] = 0
-            self.coin_mode_signal_count[coin_mode_key] += 1
-
+            self.coin_mode_signal_count[coin_mode_key] = self.coin_mode_signal_count.get(coin_mode_key, 0) + 1
             self.last_signal_time[f"{pair}_{mode}"] = datetime.now()
-            self.last_signal_price[pair] = current_price
-
-            if mode == 'TREND':
-                trend_key = f"{pair}_{trend}"
-                self.active_trends[trend_key] = {
-                    'started': datetime.now(),
-                    'entry_price': current_price,
-                    'direction': trend
+            self.last_signal_price[f"{pair}_{mode}"] = price
+            if mode == "TREND":
+                self.active_trends[f"{pair}_{trend}"] = {
+                    "started": datetime.now(),
+                    "entry_price": price,
+                    "direction": trend,
                 }
-
             self.signals_today.append(signal)
             return signal
 
         except Exception as e:
-            print(f"❌ ERROR analyzing {pair}: {str(e)}")
+            print(f"❌ ERROR analyzing {pair}: {e}")
             import traceback
+
             traceback.print_exc()
             return None
