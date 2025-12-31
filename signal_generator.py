@@ -422,7 +422,7 @@ class SignalGenerator:
 
             # ✅ VOLUME CHECKS (Mode-specific)
             if mode == 'TREND' and current_volume_surge < 0.8:
-                print(f"❌ BLOCKED: {pair} | TREND volume < 0.8x (got {current_volume_surge}x)")
+                print(f"❌ BLOCKED: {pair} | TREND volume < 0.8x (got {current_volume_surge:.2f}x)")
                 return None
 
             if mode == 'QUICK' and current_volume_surge < 1.0:
@@ -513,55 +513,58 @@ class SignalGenerator:
             except Exception as e:
                 pass
 
-            # ✅ MODE-SPECIFIC RSI & ADX QUALITY FILTERS
+            # ✅✅✅ BALANCED MODE-SPECIFIC RSI & ADX QUALITY FILTERS ✅✅✅
             if mode == 'TREND':
                 if trend == "LONG" and (current_rsi > 65 or current_rsi < 38):
-                    print(f"❌ BLOCKED: {pair} | TREND RSI out of range (38-65) | Got {current_rsi}")
+                    print(f"❌ BLOCKED: {pair} | TREND LONG | RSI out of range (38-65) | Got {current_rsi:.1f}")
                     return None
                 if trend == "SHORT" and (current_rsi < 35 or current_rsi > 62):
-                    print(f"❌ BLOCKED: {pair} | TREND RSI out of range (35-62) | Got {current_rsi}")
+                    print(f"❌ BLOCKED: {pair} | TREND SHORT | RSI out of range (35-62) | Got {current_rsi:.1f}")
                     return None
             
             elif mode == 'MID':
-                # ✅ FIX 4: ADX exhaustion filter FIRST (before general RSI check)
+                # ✅ FIX 1: Volume floor for BOTH directions
+                if current_volume_surge < 0.8:
+                    print(f"❌ BLOCKED: {pair} | MID | Volume too low (need ≥0.8x, got {current_volume_surge:.2f}x)")
+                    return None
+                
+                # ✅ FIX 2: Symmetric RSI bounds with exhaustion protection
+                if trend == "LONG":
+                    if current_rsi > config.RSI_OVERBOUGHT:
+                        print(f"❌ BLOCKED: {pair} | MID LONG | RSI overbought (>{config.RSI_OVERBOUGHT})")
+                        return None
+                    if current_rsi < 35:
+                        print(f"❌ BLOCKED: {pair} | MID LONG | RSI too low (<35, got {current_rsi:.1f})")
+                        return None
+                
                 if trend == "SHORT":
                     if current_adx > 50 and current_rsi < 32:
                         print(f"❌ BLOCKED: {pair} | MID SHORT | Exhaustion zone (ADX {current_adx:.1f}, RSI {current_rsi:.1f})")
                         return None
-                
-                # ✅ FIX 1: MID mode stricter RSI floor for SHORT
-                if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
-                    print(f"❌ BLOCKED: {pair} | MID | RSI overbought")
-                    return None
-                if trend == "SHORT" and current_rsi < 35:
-                    print(f"❌ BLOCKED: {pair} | MID SHORT | RSI too low (need >35, got {current_rsi:.1f})")
-                    return None
-                
-                # ✅ FIX 2: MID mode volume floor (SHORT only)
-                if trend == "SHORT" and current_volume_surge < 0.8:
-                    print(f"❌ BLOCKED: {pair} | MID SHORT | Volume too low (need >0.8x, got {current_volume_surge:.2f}x)")
-                    return None
+                    if current_rsi < 35:
+                        print(f"❌ BLOCKED: {pair} | MID SHORT | RSI too low (<35, got {current_rsi:.1f})")
+                        return None
+                    if current_rsi > 65:
+                        print(f"❌ BLOCKED: {pair} | MID SHORT | RSI too high (>65, got {current_rsi:.1f})")
+                        return None
             
             elif mode == 'QUICK':
-                # ✅ QUICK mode SMART filters
                 if trend == "LONG" and current_rsi > 60:
                     print(f"❌ BLOCKED: {pair} | QUICK LONG | RSI too high (need ≤60, got {current_rsi:.1f})")
                     return None
                 if trend == "SHORT" and current_rsi < 40:
                     print(f"❌ BLOCKED: {pair} | QUICK SHORT | RSI too low (need ≥40, got {current_rsi:.1f})")
                     return None
-                
-                # Block QUICK if ADX too strong (trending market, not scalp)
                 if current_adx > 35:
                     print(f"❌ BLOCKED: {pair} | QUICK | ADX too strong (need <35, got {current_adx:.1f})")
                     return None
             
-            else:  # SCALP mode - keep original logic
+            else:  # SCALP mode
                 if trend == "LONG" and current_rsi > config.RSI_OVERBOUGHT:
-                    print(f"❌ BLOCKED: {pair} | {mode} | RSI overbought")
+                    print(f"❌ BLOCKED: {pair} | SCALP LONG | RSI overbought")
                     return None
                 if trend == "SHORT" and current_rsi < config.RSI_OVERSOLD:
-                    print(f"❌ BLOCKED: {pair} | {mode} | RSI oversold")
+                    print(f"❌ BLOCKED: {pair} | SCALP SHORT | RSI oversold")
                     return None
 
             if current_adx < min_adx:
@@ -573,7 +576,7 @@ class SignalGenerator:
                 print(f"❌ BLOCKED: {pair} | {mode} | Invalid SL/TP")
                 return None
 
-            # ✅ FIX 3: Post-rounding TP sanity check (MID mode)
+            # ✅ FIX 3: Post-rounding TP sanity check
             if mode == 'MID':
                 tp1_distance_pct = abs(levels['tp1'] - levels['entry']) / levels['entry'] * 100
                 if tp1_distance_pct < 0.4:
@@ -601,18 +604,28 @@ class SignalGenerator:
             except Exception as e:
                 mtf_trend = "UNKNOWN"
 
-            # ✅ FIX 5: TREND counter-trend SHORT confirmation (simplified)
+            # ✅ FIX 4: BALANCED TREND counter-trend protection
             if mode == 'TREND':
                 if mtf_trend not in ['STRONG_UP', 'STRONG_DOWN']:
                     print(f"❌ BLOCKED: {pair} | TREND requires STRONG MTF (got {mtf_trend})")
                     return None
+                
+                # ✅ NEW: LONG vs STRONG_DOWN (counter-trend LONG)
+                if mtf_trend == 'STRONG_DOWN' and trend == "LONG":
+                    if current_rsi <= 50:
+                        print(f"❌ BLOCKED: {pair} | TREND LONG vs STRONG_DOWN | RSI not bullish ({current_rsi:.1f})")
+                        return None
+                    if len(candles) >= 2:
+                        recent_lows = candles['low'].tail(2).values
+                        if recent_lows[1] <= recent_lows[0]:
+                            print(f"❌ BLOCKED: {pair} | TREND LONG vs STRONG_DOWN | No higher low confirmation")
+                            return None
                 
                 # Counter-trend SHORT: require RSI bearish + latest lower high
                 if mtf_trend == 'STRONG_UP' and trend == "SHORT":
                     if current_rsi >= 50:
                         print(f"❌ BLOCKED: {pair} | TREND SHORT vs STRONG_UP | RSI not bearish ({current_rsi:.1f})")
                         return None
-                    # Check only latest candle for lower high
                     if len(candles) >= 2:
                         recent_highs = candles['high'].tail(2).values
                         if recent_highs[1] >= recent_highs[0]:
