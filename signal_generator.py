@@ -533,7 +533,7 @@ class SignalGenerator:
                     if current_rsi > config.RSI_OVERBOUGHT:
                         print(f"❌ BLOCKED: {pair} | MID LONG | RSI overbought (>{config.RSI_OVERBOUGHT})")
                         return None
-                    if current_rsi < 35:
+                    if current_rsi < 38:
                         print(f"❌ BLOCKED: {pair} | MID LONG | RSI too low (<35, got {current_rsi:.1f})")
                         return None
                 
