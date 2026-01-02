@@ -206,7 +206,7 @@ class SignalGenerator:
             if tp2 - tp1 < min_tp_distance * 0.5:
                 tp2 = round(tp1 + min_tp_distance * 0.5, decimal_places)
         else:
-if sl - entry < min_sl_distance:
+            if sl - entry < min_sl_distance:
                 sl = round(entry + min_sl_distance, decimal_places)
             if entry - tp1 < min_tp_distance:
                 tp1 = round(entry - min_tp_distance, decimal_places)
@@ -712,4 +712,284 @@ if sl - entry < min_sl_distance:
                 print(f"❌ BLOCKED: {pair} | {mode} | No clear trend")
                 return None
 
-            # ==============================
+            # ============================================================
+            # PHASE 5: FETCH HTF & MTF DATA
+            # ============================================================
+            
+            try:
+                candles_1h = CoinDCXAPI.get_candles(pair, '1h', 50)
+                if candles_1h.empty:
+                    print(f"❌ BLOCKED: {pair} | {mode} | 1H fetch fail")
+                    return None
+            except Exception as e:
+                print(f"❌ BLOCKED: {pair} | {mode} | HTF error: {e}")
+                return None
+
+            try:
+                candles_5m = CoinDCXAPI.get_candles(pair, '5m', 50)
+                candles_15m = CoinDCXAPI.get_candles(pair, '15m', 50)
+                if not candles_5m.empty and not candles_15m.empty and not candles_1h.empty:
+                    mtf_trend = Indicators.mtf_trend(candles_5m['close'], candles_15m['close'], candles_1h['close'])
+                else:
+                    mtf_trend = "UNKNOWN"
+            except Exception as e:
+                mtf_trend = "UNKNOWN"
+
+            # ============================================================
+            # PHASE 6: MARKET REGIME & SMART SIGNALS
+            # ============================================================
+            
+            regime = "NORMAL"
+            try:
+                candles_daily = CoinDCXAPI.get_candles(pair, '1d', 30)
+                if not candles_daily.empty:
+                    regime = Indicators.detect_market_regime(candles_daily)
+            except Exception as e:
+                pass
+
+            has_fvg = False
+            fvg_info = {}
+            try:
+                has_fvg, fvg_info = Indicators.detect_fvg(candles, trend)
+                if has_fvg:
+                    in_fvg = Indicators.is_price_in_fvg(current_price, fvg_info)
+                    if not in_fvg:
+                        has_fvg = False
+            except Exception as e:
+                pass
+
+            near_key_level = False
+            key_level_info = ""
+            try:
+                candles_daily = CoinDCXAPI.get_candles(pair, '1d', 30)
+                if not candles_daily.empty:
+                    key_levels = Indicators.get_daily_key_levels(candles_daily)
+                    near_key_level, key_level_info = Indicators.check_key_level_proximity(current_price, key_levels, trend)
+            except Exception as e:
+                pass
+
+            sweep_detected = False
+            sweep_info = {}
+            try:
+                sweep_detected, sweep_info = Indicators.detect_liquidity_sweep(candles, trend)
+            except Exception as e:
+                pass
+
+            near_ob = False
+            ob_info = {}
+            try:
+                candles_4h_ob = CoinDCXAPI.get_candles(pair, '4h', 100)
+                if not candles_4h_ob.empty:
+                    order_blocks = Indicators.find_order_blocks(candles_4h_ob, trend)
+                    near_ob, ob_info = Indicators.is_near_order_block(current_price, order_blocks)
+            except Exception as e:
+                pass
+
+            # ============================================================
+            # PHASE 7: CALCULATE BASE SCORE & APPLY PENALTIES
+            # ============================================================
+            
+            # Start with base score
+            score = self._calculate_base_score(current_rsi, current_adx, current_macd_hist, prev_macd_hist)
+            penalties = []
+            
+            print(f"\n🔍 {pair} {mode} {trend} - Base Score: {score}/100")
+            
+            # Apply volume penalty
+            score, vol_reason = self._apply_volume_penalty(score, current_volume_surge, mode)
+            if vol_reason:
+                penalties.append(vol_reason)
+                print(f"   📉 Volume: {vol_reason}")
+            
+            # Apply MTF penalty
+            score, mtf_reason = self._apply_mtf_penalty(score, mtf_trend, mode)
+            if mtf_reason:
+                penalties.append(mtf_reason)
+                print(f"   📉 MTF: {mtf_reason}")
+            
+            # Apply RSI/ADX penalty (can be HARD BLOCK)
+            score, rsi_adx_reason = self._apply_rsi_adx_penalty(score, current_rsi, current_adx, trend, mode)
+            if score == 0:
+                print(f"❌ BLOCKED: {pair} | {mode} | {rsi_adx_reason}")
+                return None
+            if rsi_adx_reason:
+                penalties.append(rsi_adx_reason)
+                print(f"   📉 RSI/ADX: {rsi_adx_reason}")
+            
+            # Apply HTF penalty
+            score, htf_reason = self._apply_htf_penalty(score, trend, mode, candles_1h)
+            if htf_reason and "conflict" in htf_reason:
+                penalties.append(htf_reason)
+                print(f"   📉 HTF: {htf_reason}")
+            
+            # Apply counter-trend penalty
+            score, ct_reason = self._apply_counter_trend_penalty(score, mtf_trend, trend, current_rsi, mode)
+            if ct_reason:
+                penalties.append(ct_reason)
+                print(f"   📉 Counter-trend: {ct_reason}")
+            
+            # Apply smart signals bonus
+            score = self._apply_smart_signals_bonus(score, sweep_detected, near_ob, has_fvg, near_key_level)
+            
+            print(f"   ✅ Final Score: {score}/100 (min: {min_score})")
+            
+            # Check minimum score threshold
+            if score < min_score:
+                print(f"❌ BLOCKED: {pair} | {mode} | Score: {score}/{min_score}")
+                return None
+
+            # ============================================================
+            # PHASE 8: CALCULATE SL/TP & SAFETY CHECKS (HARD BLOCKS)
+            # ============================================================
+            
+            levels = self._calculate_entry_sl_tp(trend, current_price, current_atr, mode_config)
+            if levels is None:
+                print(f"❌ BLOCKED: {pair} | {mode} | Invalid SL/TP")
+                return None
+
+            # Post-rounding TP sanity check (MID mode)
+            if mode == 'MID':
+                tp1_distance_pct = abs(levels['tp1'] - levels['entry']) / levels['entry'] * 100
+                if tp1_distance_pct < 0.3:
+                    print(f"❌ BLOCKED: {pair} | MID | TP1 too close to entry ({tp1_distance_pct:.2f}%)")
+                    return None
+
+            is_safe, sl_distance_pct = self._check_liquidation_safety(levels['entry'], levels['sl'])
+            if not is_safe:
+                print(f"❌ BLOCKED: {pair} | {mode} | Liquidation risk")
+                return None
+
+            rr_valid, rr_value = self._check_minimum_rr(levels['entry'], levels['sl'], levels['tp1'], mode)
+            if not rr_valid:
+                print(f"❌ BLOCKED: {pair} | {mode} | RR too low ({rr_value:.2f})")
+                return None
+
+            # ============================================================
+            # PHASE 9: ACTIVE TREND CHECK (TREND mode only)
+            # ============================================================
+            
+            if mode == 'TREND':
+                if not self._check_active_trend(pair, trend, mode, current_price, current_ema_fast, current_ema_slow, current_macd_hist):
+                    return None
+
+            # ============================================================
+            # PHASE 10: BUILD SIGNAL OBJECT
+            # ============================================================
+            
+            signal = {
+                'pair': pair,
+                'direction': trend,
+                'entry': levels['entry'],
+                'sl': levels['sl'],
+                'tp1': levels['tp1'],
+                'tp2': levels['tp2'],
+                'leverage': mode_config['leverage'],
+                'score': score,
+                'rsi': round(current_rsi, 1),
+                'adx': round(current_adx, 1),
+                'mtf_trend': mtf_trend,
+                'mode': mode,
+                'timeframe': mode_config['timeframe'],
+                'volume_surge': round(current_volume_surge, 2),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'market_regime': regime,
+                'liquidity_sweep': sweep_detected,
+                'near_order_block': near_ob,
+                'fvg_fill': has_fvg,
+                'near_key_level': near_key_level,
+                'sweep_info': sweep_info if sweep_detected else {},
+                'ob_info': ob_info if near_ob else {},
+                'fvg_info': fvg_info if has_fvg else {},
+                'key_level_info': key_level_info if near_key_level else "",
+                'ema_fast_period': mode_config['ema_fast'],
+                'ema_slow_period': mode_config['ema_slow'],
+                'penalties': penalties  # Track what reduced the score
+            }
+
+            print(f"\n{'='*60}")
+            print(f"📊 Rule-based PASSED: {pair} {trend}")
+            print(f"{'='*60}")
+
+            # ============================================================
+            # PHASE 11: CHATGPT FINAL DECISION LAYER
+            # ============================================================
+            
+            chatgpt_approved = self.chatgpt_advisor.final_trade_decision(signal, candles)
+            if not chatgpt_approved:
+                self.chatgpt_rejected += 1
+                print(f"❌ ChatGPT Safety check failed")
+                return None
+
+            self.chatgpt_approved += 1
+            print(f"✅ {mode}: {pair} APPROVED!")
+            print(f"   Score: {score}/100 | RR: {rr_value:.2f}R | Vol: {current_volume_surge:.2f}x")
+            print(f"   Entry: ₹{levels['entry']:,.6f}")
+            print(f"   SL: ₹{levels['sl']:,.6f}")
+            print(f"   TP1: ₹{levels['tp1']:,.6f}")
+            print(f"   TP2: ₹{levels['tp2']:,.6f}")
+            if sweep_detected:
+                print(f"   💎 Liquidity Swept")
+            if near_ob:
+                print(f"   🎯 Near OB")
+            if has_fvg:
+                print(f"   💎 FVG Fill")
+            if near_key_level:
+                print(f"   🎯 {key_level_info}")
+            if penalties:
+                print(f"   ⚠️  Penalties: {', '.join(penalties)}")
+            print(f"{'='*60}\n")
+
+            # ============================================================
+            # PHASE 12: SEND NOTIFICATIONS & LOG
+            # ============================================================
+            
+            try:
+                explainer_result = SignalExplainer.explain_signal(signal, candles)
+                if explainer_result['chart_path']:
+                    TelegramNotifier.send_chart(explainer_result['chart_path'])
+                if explainer_result['explanation']:
+                    TelegramNotifier.send_explanation(explainer_result['explanation'])
+            except Exception as e:
+                print(f"⚠️ Explainer failed (non-critical): {e}")
+
+            self._log_signal_performance(signal)
+            
+            # ============================================================
+            # PHASE 13: UPDATE COUNTERS & TRACKING
+            # ============================================================
+            
+            self.signal_count += 1
+            self.mode_signal_count[mode] += 1
+
+            coin = pair.split('USDT')[0]
+            if coin not in self.coin_signal_count:
+                self.coin_signal_count[coin] = 0
+            self.coin_signal_count[coin] += 1
+
+            coin_mode_key = f"{coin}_{mode}"
+            if coin_mode_key not in self.coin_mode_signal_count:
+                self.coin_mode_signal_count[coin_mode_key] = 0
+            self.coin_mode_signal_count[coin_mode_key] += 1
+
+            # Mode-aware last signal tracking
+            self.last_signal_time[f"{pair}_{mode}"] = datetime.now()
+            price_key = f"{pair}_{mode}"
+            self.last_signal_price[price_key] = current_price
+
+            # Mode-aware active trend tracking
+            if mode == 'TREND':
+                trend_key = f"{pair}_{mode}_{trend}"
+                self.active_trends[trend_key] = {
+                    'started': datetime.now(),
+                    'entry_price': current_price,
+                    'direction': trend
+                }
+
+            self.signals_today.append(signal)
+            return signal
+
+        except Exception as e:
+            print(f"❌ ERROR analyzing {pair}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
