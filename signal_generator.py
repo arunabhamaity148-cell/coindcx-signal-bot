@@ -200,7 +200,7 @@ class SignalGenerator:
             score += 18
         elif 30 < rsi < 70:
             score += 14
-else:
+        else:
             score += 8
         
         if adx > 40:
