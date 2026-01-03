@@ -4,13 +4,10 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     """
-    Multi-Mode Bot Configuration: QUICK + MID + TREND Together
-    
-    ✅ OPTIMIZED: 14 pairs + 90s interval for balanced coverage
-    ✅ ChatGPT as Final Trade Judge
+    Multi-Mode Bot Configuration with Enhanced Risk Management
     """
 
-    # API Keys (Railway environment variables)
+    # API Keys
     COINDCX_API_KEY = os.getenv('COINDCX_API_KEY')
     COINDCX_SECRET = os.getenv('COINDCX_SECRET')
     CHATGPT_API_KEY = os.getenv('CHATGPT_API_KEY')
@@ -21,43 +18,24 @@ class Config:
     # Bot Settings
     AUTO_TRADE = os.getenv('AUTO_TRADE', 'false').lower() == 'true'
 
-    # ✅ MULTI-MODE: All 3 timeframes active
+    # Multi-Mode
     MULTI_MODE_ENABLED = True
     ACTIVE_MODES = ['QUICK', 'MID', 'TREND']
 
-    MODE = 'QUICK'  # Default (for backward compatibility)
-    MAX_SIGNALS_PER_DAY = 24  # ✅ INCREASED: 8 per mode (3 modes × 8 = 24 total)
+    MODE = 'QUICK'
+    MAX_SIGNALS_PER_DAY = 24
     MAX_LEVERAGE = 15
 
-    # ✅ OPTIMIZED: 14 high-quality pairs (9 → 14)
-    # Added: MATIC, LINK, ATOM, LTC, TRX (all high volume)
+    # Trading Pairs
     PAIRS = [
-        # Original 9 (kept)
-        'BTCUSDT',
-        'ETHUSDT',
-        'SOLUSDT',
-        'XRPUSDT',
-        'ADAUSDT',
-        'DOGEUSDT',
-        'BNBUSDT',
-        'BCHUSDT',
-        'SUIUSDT',
-        
-        # ✅ NEW: 5 high-volume additions
-        'ZECUSDT',  # Good for scalping, consistent volume
-        'LINKUSDT',   # Strong trends, DeFi leader
-        'ATOMUSDT',   # Good volatility, cosmos ecosystem
-        'LTCUSDT',    # Established, very liquid
-        'TRXUSDT',    # Highest volume, stable moves
+        'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT',
+        'DOGEUSDT', 'BNBUSDT', 'BCHUSDT', 'SUIUSDT', 'MATICUSDT',
+        'LINKUSDT', 'ATOMUSDT', 'LTCUSDT', 'TRXUSDT'
     ]
 
-    # ✅ SCAN INTERVAL: Increased for 14 pairs (60s → 90s)
-    # 14 pairs × 3 modes = 42 scans
-    # ~2-3s per scan = ~90-120s total
-    # 90s interval = perfect timing
-    SCAN_INTERVAL_SECONDS = 90  # ✅ NEW: Was 60, now 90
+    SCAN_INTERVAL_SECONDS = 90
 
-    # ✅ FINAL TUNED: Compact SL-TP + High Quality
+    # ✅ UPDATED: Realistic TP Multipliers
     MODE_CONFIG = {
         'QUICK': {
             'timeframe': '5m',
@@ -65,8 +43,8 @@ class Config:
             'ema_slow': 21,
             'leverage': 5,
             'atr_sl_multiplier': 1.8,
-            'atr_tp1_multiplier': 3.6,   # 2:1 R:R
-            'atr_tp2_multiplier': 5.4,   # 3:1 R:R
+            'atr_tp1_multiplier': 2.7,   # Reduced from 3.6
+            'atr_tp2_multiplier': 3.6,   # Reduced from 5.4
             'min_score': 55,
             'min_adx': 25
         },
@@ -76,8 +54,8 @@ class Config:
             'ema_slow': 26,
             'leverage': 7,
             'atr_sl_multiplier': 2.0,
-            'atr_tp1_multiplier': 4.0,
-            'atr_tp2_multiplier': 6.0,
+            'atr_tp1_multiplier': 3.0,   # Reduced from 4.0
+            'atr_tp2_multiplier': 4.5,   # Reduced from 6.0
             'min_score': 60,
             'min_adx': 22
         },
@@ -87,45 +65,94 @@ class Config:
             'ema_slow': 50,
             'leverage': 10,
             'atr_sl_multiplier': 2.2,
-            'atr_tp1_multiplier': 4.4,
-            'atr_tp2_multiplier': 6.6,
+            'atr_tp1_multiplier': 3.5,   # Reduced from 4.4
+            'atr_tp2_multiplier': 5.5,   # Reduced from 6.6
             'min_score': 65,
             'min_adx': 25
         }
     }
 
-    # Risk Management - TIGHTENED
-    LIQUIDATION_BUFFER = 0.012   # 1.2%
-    MIN_ADX_STRENGTH = 20
-    COOLDOWN_MINUTES = 8  # Legacy - kept for compatibility
+    # ✅ NEW: Partial Profit Booking Configuration
+    PARTIAL_BOOKING = {
+        'TREND': {
+            'tp1': (0.8, 50),   # 0.8% profit = book 50%
+            'tp2': (1.5, 30),   # 1.5% profit = book 30%
+            'tp3': (2.5, 20)    # 2.5% profit = book 20%
+        },
+        'MID': {
+            'tp1': (0.5, 50),
+            'tp2': (1.0, 30),
+            'tp3': (1.8, 20)
+        },
+        'QUICK': {
+            'tp1': (0.3, 70),
+            'tp2': (0.6, 20),
+            'tp3': (1.0, 10)
+        },
+        'SCALP': {
+            'tp1': (0.2, 80),
+            'tp2': (0.4, 15),
+            'tp3': (0.7, 5)
+        }
+    }
 
-    # ⏸️ SAME-PAIR COOLDOWN (prevents signal spam)
-    SAME_PAIR_COOLDOWN_MINUTES = 30  # 30 minutes per (PAIR + MODE)
+    # ✅ NEW: Trailing Stop Configuration
+    TRAILING_CONFIG = {
+        'breakeven_profit': 0.4,        # Move to breakeven at 0.4%
+        'lock_50_profit': 0.8,          # Lock 50% profit at 0.8%
+        'lock_70_profit': 2.0,          # Lock 70% profit at 2.0%
+        'trail_atr_multiplier': {
+            'TREND': 2.0,
+            'MID': 1.5,
+            'QUICK': 1.2,
+            'SCALP': 1.0
+        }
+    }
+
+    # ✅ NEW: Time-Based Exit Limits (hours)
+    TIME_BASED_EXIT = {
+        'TREND': 16,
+        'MID': 8,
+        'QUICK': 4,
+        'SCALP': 2
+    }
+
+    # ✅ NEW: Risk Limits
+    RISK_LIMITS = {
+        'daily_loss_percent': 3.0,      # Kill switch at 3% daily loss
+        'max_positions': 5,             # Max positions per day
+        'capital_per_trade': 2.0,       # 2% risk per trade
+        'max_position_size_pct': 20.0   # Never use > 20% capital
+    }
+
+    # Risk Management
+    LIQUIDATION_BUFFER = 0.012
+    MIN_ADX_STRENGTH = 20
+    COOLDOWN_MINUTES = 8
+    SAME_PAIR_COOLDOWN_MINUTES = 30
 
     # Position sizing
     POSITION_SIZE_PERCENT = 1.5
     MAX_CONCURRENT_TRADES = 6
 
-    # Trap Detection - Balanced
+    # Trap Detection
     LIQUIDITY_WICK_RATIO = 2.5
-    NEWS_SPIKE_THRESHOLD = 0.05  # 5%
-    MAX_SPREAD_PERCENT = 0.8     # 0.8%
+    NEWS_SPIKE_THRESHOLD = 0.05
+    MAX_SPREAD_PERCENT = 0.8
 
-    # ✅ TIGHTENED RSI Thresholds
+    # RSI Thresholds
     RSI_OVERBOUGHT = 72
     RSI_OVERSOLD = 28
 
     # Score
     MIN_SIGNAL_SCORE = 35
+    MIN_TP_DISTANCE_PERCENT = 0.8
 
-    # ✅ Minimum TP distance protection for low-price coins
-    MIN_TP_DISTANCE_PERCENT = 0.8  # 0.8% minimum TP distance from entry
-
-    # ✅ Dynamic decimal precision based on price
+    # Dynamic decimal precision
     PRICE_DECIMAL_RULES = {
-        'low': (1.0, 4),      # Price < $1: 4 decimals (e.g., 0.1234)
-        'mid': (100.0, 2),    # $1-$100: 2 decimals (e.g., 12.34)
-        'high': (float('inf'), 2)  # > $100: 2 decimals (e.g., 12345.67)
+        'low': (1.0, 4),
+        'mid': (100.0, 2),
+        'high': (float('inf'), 2)
     }
 
     # Power Hours
@@ -141,50 +168,19 @@ class Config:
     TRACK_PERFORMANCE = True
     PERFORMANCE_LOG_FILE = "signal_performance.csv"
 
-    # ================================
-    # 🤖 CHATGPT FINAL JUDGE SETTINGS
-    # ================================
-
-    # ChatGPT as Final Trade Judge (MANDATORY)
-    CHATGPT_FINAL_JUDGE_ENABLED = True  # Set to False to disable ChatGPT review
-
-    # Timeout settings (safety first)
-    CHATGPT_TIMEOUT = 8  # seconds per API call
-    CHATGPT_MAX_RETRIES = 2  # retry attempts before giving up
-
-    # Fallback behavior on ChatGPT failure
-    # If True: timeout/error = approve signal (risky)
-    # If False: timeout/error = reject signal (safe) ✅ RECOMMENDED
+    # ChatGPT Final Judge
+    CHATGPT_FINAL_JUDGE_ENABLED = True
+    CHATGPT_TIMEOUT = 8
+    CHATGPT_MAX_RETRIES = 2
     CHATGPT_FALLBACK_APPROVE = False
-
-    # Temperature for consistency (0.0-1.0)
-    CHATGPT_TEMPERATURE = 0.2  # Low = more consistent decisions
-
-    # Max tokens for response (keep low for JSON-only)
+    CHATGPT_TEMPERATURE = 0.2
     CHATGPT_MAX_TOKENS = 100
-
-    # ChatGPT Evaluation Criteria (informational only)
-    CHATGPT_REJECTION_CRITERIA = [
-        "Late entries (momentum exhausted)",
-        "Low volume trend continuation",
-        "Exhausted RSI + high ADX",
-        "Poor risk/reward ratio (< 1.5)",
-        "No pullback confirmation",
-        "Chasing price action"
-    ]
-
-    # Minimum approval confidence (if ChatGPT provides it)
-    CHATGPT_MIN_CONFIDENCE = 70  # 0-100 scale
-
-    # ================================
-    # LEGACY CHATGPT SETTINGS (kept for trap validation)
-    # ================================
-    CHATGPT_FALLBACK_ENABLED = True  # For trap detection fallback
-
+    CHATGPT_MIN_CONFIDENCE = 70
+    CHATGPT_FALLBACK_ENABLED = True
 
     @classmethod
     def validate(cls):
-        """Validate all required environment variables"""
+        """Validate configuration"""
         required = [
             'COINDCX_API_KEY',
             'COINDCX_SECRET',
@@ -192,7 +188,6 @@ class Config:
             'TELEGRAM_CHAT_ID'
         ]
 
-        # ChatGPT API key required if final judge is enabled
         if cls.CHATGPT_FINAL_JUDGE_ENABLED:
             required.append('CHATGPT_API_KEY')
 
@@ -202,40 +197,31 @@ class Config:
 
         print("✅ Configuration validated")
 
-        # Multi-mode info
         if cls.MULTI_MODE_ENABLED:
             print(f"🎯 Multi-Mode: {', '.join(cls.ACTIVE_MODES)}")
         else:
             print(f"📊 Mode: {cls.MODE}")
 
-        # ✅ NEW: Display optimized settings
         print(f"📊 Tracking: {len(cls.PAIRS)} pairs")
         print(f"⏱️  Scan interval: {cls.SCAN_INTERVAL_SECONDS}s")
-        print(f"📈 Max signals: {cls.MAX_SIGNALS_PER_DAY}/day ({cls.MAX_SIGNALS_PER_DAY // len(cls.ACTIVE_MODES)} per mode)")
+        print(f"📈 Max signals: {cls.MAX_SIGNALS_PER_DAY}/day")
+        
+        # NEW: Display risk limits
+        print(f"\n🛡️ RISK MANAGEMENT:")
+        print(f"   Daily loss limit: {cls.RISK_LIMITS['daily_loss_percent']}%")
+        print(f"   Max positions/day: {cls.RISK_LIMITS['max_positions']}")
+        print(f"   Risk per trade: {cls.RISK_LIMITS['capital_per_trade']}%")
 
-        # Risk parameters
-        print(f"⚡ Min ADX: {cls.MIN_ADX_STRENGTH}")
-        print(f"🛡️ Liquidation buffer: {cls.LIQUIDATION_BUFFER*100}%")
-        print(f"⏸️  Same-pair cooldown: {cls.SAME_PAIR_COOLDOWN_MINUTES} minutes")
-        print(f"🎯 Min TP distance: {cls.MIN_TP_DISTANCE_PERCENT}%")
-
-        # 🤖 ChatGPT Final Judge status
         print(f"\n{'='*50}")
         if cls.CHATGPT_FINAL_JUDGE_ENABLED:
             print(f"🤖 ChatGPT Final Judge: ENABLED")
             print(f"   Model: {cls.CHATGPT_MODEL}")
             print(f"   Timeout: {cls.CHATGPT_TIMEOUT}s")
-            print(f"   Max Retries: {cls.CHATGPT_MAX_RETRIES}")
-            print(f"   Fallback on error: {'APPROVE' if cls.CHATGPT_FALLBACK_APPROVE else 'REJECT ✅'}")
-            print(f"\n   ⚠️  EVERY signal will be reviewed by ChatGPT")
-            print(f"   ⚠️  Rejected signals will be SILENTLY dropped")
         else:
             print(f"⚠️  ChatGPT Final Judge: DISABLED")
-            print(f"   Signals will be sent based on rules only")
         print(f"{'='*50}\n")
 
         return True
-
 
     @classmethod
     def get_min_score(cls, mode=None):
@@ -244,33 +230,12 @@ class Config:
             return cls.MODE_CONFIG[mode].get('min_score', cls.MIN_SIGNAL_SCORE)
         return cls.MIN_SIGNAL_SCORE
 
-
     @classmethod
     def get_decimal_places(cls, price: float) -> int:
-        """
-        Get appropriate decimal places based on price
-        ✅ Prevents rounding errors for low-price coins
-        """
+        """Get appropriate decimal places based on price"""
         for rule_name, (threshold, decimals) in cls.PRICE_DECIMAL_RULES.items():
             if price < threshold:
                 return decimals
-        return 2  # Default
-
-
-    @classmethod
-    def get_chatgpt_stats_display(cls) -> str:
-        """Get formatted ChatGPT configuration for display"""
-        if not cls.CHATGPT_FINAL_JUDGE_ENABLED:
-            return "ChatGPT Final Judge: DISABLED"
-
-        return f"""
-🤖 ChatGPT Final Judge Configuration:
-   ├─ Model: {cls.CHATGPT_MODEL}
-   ├─ Timeout: {cls.CHATGPT_TIMEOUT}s (with {cls.CHATGPT_MAX_RETRIES} retries)
-   ├─ Temperature: {cls.CHATGPT_TEMPERATURE}
-   ├─ Error Handling: {'Approve' if cls.CHATGPT_FALLBACK_APPROVE else 'Reject (Safe)'}
-   └─ Status: ACTIVE (Every signal reviewed)
-        """.strip()
-
+        return 2
 
 config = Config()
