@@ -44,7 +44,7 @@ class Config:
         'SUIUSDT',
         
         # ✅ NEW: 5 high-volume additions
-        'MATICUSDT',  # Good for scalping, consistent volume
+        '1000PEPEUSDT',  # Good for scalping, consistent volume
         'LINKUSDT',   # Strong trends, DeFi leader
         'ATOMUSDT',   # Good volatility, cosmos ecosystem
         'LTCUSDT',    # Established, very liquid
