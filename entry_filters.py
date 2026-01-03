@@ -2,7 +2,7 @@
 entry_filters.py - Entry Timing Filters & Multi-Confirmation System
 """
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 import pandas as pd
 from indicators import Indicators
 from coindcx_api import CoinDCXAPI
